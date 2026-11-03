@@ -1,0 +1,62 @@
+# =============================================================================
+# Dossiers de Build & CMake / Ninja
+# =============================================================================
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.md
+*.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+_deps/
+
+# =============================================================================
+# Binaires et artefacts de compilation (Linux & Windows)
+# =============================================================================
+EnvEngine
+EnvEngine.exe
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.pdb
+*.ilk
+*.exp
+
+# =============================================================================
+# Fichiers générés par le moteur à l'exécution (ImGui & Captures)
+# =============================================================================
+imgui.ini
+envengine_layout.ini
+*.ppm
+*.png
+*.log
+
+# =============================================================================
+# Environnements de développement (VS Code, CLion, Visual Studio, Clangd)
+# =============================================================================
+.vscode/
+.idea/
+.vs/
+.cache/
+.clangd/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# =============================================================================
+# Fichiers système (Linux / Windows / macOS)
+# =============================================================================
+.DS_Store
+Thumbs.db
+*~
