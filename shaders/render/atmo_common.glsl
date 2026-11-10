@@ -21,9 +21,23 @@ layout(std140, binding = UBO_AtmosphereParams) uniform AtmosphereParamsBlock {
     vec4 uMieScatteringAndExt;  // xyz = beta_M_sca, w = beta_M_ext
     vec4 uOzoneAbsorption;      // xyz = beta_O3, w = ozoneEnabled
     vec4 uGroundAlbedoAndTurb;  // xyz = groundAlbedo, w = turbidity
+    vec4 uNightSky;             // x = intensité du fond de ciel nocturne (voir NightSkyColor), yzw = 0
 } uAtmo;
 
 const float PI = 3.14159265358979323846;
+
+// --- Direction artistique de la nuit ("nuit cinématique jouable") ---------------------------------
+// Clair de lune bleu-argenté froid, normalisé en luminance (0.7255) : l'éclairement en lux est conservé,
+// seule la teinte change (au lieu de la couleur chaude du soleil réfléchi).
+const vec3 MOONLIGHT_TINT = vec3(0.55, 0.75, 1.0) / 0.7255;
+
+// Fond de ciel nocturne (étoiles diffuses + airglow) : bleu nuit profond au zénith, bleu acier doux à
+// l'horizon. intensity = uAtmo.uNightSky.x (luminance zénithale ≈ 0.176 × intensity cd/m²).
+vec3 NightSkyColor(vec3 dir, float intensity) {
+    const vec3 kZenith  = vec3(0.08, 0.18, 0.42);
+    const vec3 kHorizon = vec3(0.15, 0.28, 0.50);
+    return mix(kHorizon, kZenith, sqrt(clamp(dir.y, 0.0, 1.0))) * intensity;
+}
 
 // Décalage (km) qui évite l'auto-intersection avec le sol (Hillaire : PLANET_RADIUS_OFFSET).
 const float PLANET_RADIUS_OFFSET = 0.01;
@@ -51,12 +65,25 @@ float RaySphereIntersectNearest(vec3 p, vec3 d, float R) {
     return (t1 >= 0.0) ? t1 : -1.0;
 }
 
-// Ombre de la planète vue depuis pos dans la direction lightDir : 0 = à l'ombre, 1 = éclairé.
+// Fraction visible d'un astre de rayon angulaire angR au-dessus de l'horizon géométrique de la
+// planète, vu depuis l'altitude hKm (mu = cos de l'angle zénithal de l'astre). 0 = couché, 1 = levé.
 // La transmittance LUT ne couvre que les directions au-dessus de l'horizon : ce test est
-// indispensable pour qu'un astre couché n'éclaire plus l'atmosphère.
+// indispensable pour qu'un astre couché n'éclaire plus ni l'atmosphère ni le sol.
+//  * Test analytique (mu comparé au cosinus de l'horizon) plutôt qu'une intersection rayon/sphère :
+//    sqrt(h (2 Rb + h)) évite l'annulation catastrophique de r² - Rb² en float près du sol
+//    (r ≈ 6360 km n'a qu'une précision de ~0,8 m).
+//  * Transition douce sur le diamètre apparent de l'astre : le disque se couche progressivement.
+float PlanetShadowAlt(float hKm, float mu, float Rb, float angR) {
+    float h = max(hKm, 0.0);
+    float horizonMu = -sqrt(h * (2.0 * Rb + h)) / (Rb + h);
+    float w = max(sin(angR), 1e-4);
+    return smoothstep(horizonMu - w, horizonMu + w, mu);
+}
+
+// Variante pour un point du raymarching (repère local planète, km).
 float PlanetShadow(vec3 pos, vec3 lightDir, float Rb) {
-    vec3 up = normalize(pos);
-    return RaySphereIntersectNearest(pos - PLANET_RADIUS_OFFSET * up, lightDir, Rb) >= 0.0 ? 0.0 : 1.0;
+    float r = length(pos);
+    return PlanetShadowAlt(r - Rb, dot(pos / r, lightDir), Rb, 0.0);
 }
 
 // Rayon (km, depuis le centre de la planète) du point de vue courant.
@@ -109,16 +136,28 @@ float SubUVToUnit(float u, float res) { return (u * res - 0.5) / (res - 1.0); }
 // -----------------------------------------------------------------------------
 // Transmittance LUT (Bruneton 2017 / Hillaire 2020) : uv <-> (r, mu)
 // -----------------------------------------------------------------------------
-vec2 TransmittanceParamsToUV(float r, float mu, float Rb, float Rt) {
-    float H = sqrt(max(0.0, Rt * Rt - Rb * Rb));
-    float rho = sqrt(max(0.0, r * r - Rb * Rb));
-    float dMin = Rt - r;
+// Version par altitude hKm, numériquement stable près du sol (utilisée pour l'éclairage des surfaces).
+vec2 TransmittanceParamsToUVAlt(float hKm, float mu, float Rb, float Rt) {
+    float h    = clamp(hKm, 0.0, Rt - Rb);
+    float r    = Rb + h;
+    float H2   = (Rt - Rb) * (Rt + Rb);         // Rt² - Rb²
+    float rho2 = h * (2.0 * Rb + h);            // r² - Rb²
+    float H    = sqrt(H2);
+    float rho  = sqrt(rho2);
+    float dMin = (Rt - Rb) - h;
     float dMax = rho + H;
-    float disc = r * r * (mu * mu - 1.0) + Rt * Rt;
-    float d = max(0.0, -r * mu + sqrt(max(0.0, disc)));
+    // Distance au sommet de l'atmosphère : d = -r mu + sqrt(r² mu² + Rt² - r²)
+    float X = H2 - rho2;                        // Rt² - r² >= 0
+    float s = sqrt(max(0.0, r * r * mu * mu + X));
+    float d = mu >= 0.0 ? X / max(s + r * mu, 1e-6)   // forme sans annulation
+                        : s - r * mu;
     float u = (d - dMin) / max(1e-5, dMax - dMin);
     float v = rho / max(1e-5, H);
     return vec2(clamp(u, 0.0, 1.0), clamp(v, 0.0, 1.0));
+}
+
+vec2 TransmittanceParamsToUV(float r, float mu, float Rb, float Rt) {
+    return TransmittanceParamsToUVAlt(r - Rb, mu, Rb, Rt);
 }
 
 void UVToTransmittanceParams(vec2 uv, float Rb, float Rt, out float r, out float mu) {

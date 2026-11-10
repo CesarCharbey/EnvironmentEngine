@@ -20,6 +20,8 @@
 // =============================================================================
 #include <imgui.h>
 #include <glad/glad.h>
+#include <glm/glm.hpp>
+#include <entt/entt.hpp>
 
 #include <string_view>
 
@@ -62,6 +64,22 @@ public:
         cloudShadowAvailable_  = bb.IsPublished(env::bb::CloudShadowMap);
         // Valeurs physiques (ciel ~1e4 cd/m²) : sans passe de tonemap, scene.color saturerait en blanc.
         applyFallbackExposure_ = !bb.IsPublished(env::bb::SceneDisplay);
+
+        // Ombres du relief : la carte world.focus.heightNormal ne dit pas QUEL chunk elle couvre.
+        // On retrouve l'entité chunk qui porte la même texture pour connaître son origine exacte
+        // (fonctionne pour le mock comme pour les vrais chunks de Dev 1).
+        focusAvailable_ = false;
+        if (bb.IsPublished(env::bb::WorldFocusHeightNormal)) {
+            const GLuint focusId = bb.GetTexture(env::bb::WorldFocusHeightNormal).id;
+            auto view = ctx.registry.view<const ChunkCoordComponent, const ChunkStateComponent, const ChunkGpuResources>();
+            for (const entt::entity e : view) {
+                const auto& [coord, state, res] = view.get(e);
+                if (state.state == ChunkState::Evicting || res.heightNormalTex != focusId) continue;
+                focusChunkOrigin_ = ChunkOriginRelative(coord.coord, ctx.renderOriginChunk);
+                focusAvailable_   = true;
+                break;
+            }
+        }
     }
 
     void Render(EngineContext& ctx) override {
@@ -82,6 +100,8 @@ public:
         bb.BindTexture(env::bb::IblPrefiltered,         tex::IblPrefiltered);
         bb.BindTexture(env::bb::IblBrdfLUT,             tex::IblBrdfLut);
         bb.BindTexture(env::bb::CloudShadowMap,         tex::CloudShadow);
+        // Lecture seule de la carte de hauteur du chunk focus (slot Dev 1 existant) : ombres du relief.
+        bb.BindTexture(env::bb::WorldFocusHeightNormal, tex::HeightNormal);
 
         const gpu::ShaderProgram& p = *program_;
         p.Set("uGBufferAvailable",      gbufferAvailable_);
@@ -95,6 +115,14 @@ public:
         p.Set("uIblScale",              iblScale_);
         p.Set("uDebugView",             debugView_);
         p.Set("uExposureCompensation",  exposureCompensationEv_);
+        p.Set("uNightAdaptation",       nightAdaptation_);
+        p.Set("uMoonlightShift",        moonlightShift_);
+        p.Set("uStarIntensity",         starIntensity_);
+        p.Set("uTerrainShadows",        terrainShadows_);
+        p.Set("uContactShadows",        contactShadows_);
+        p.Set("uFocusAvailable",        focusAvailable_);
+        p.Set("uFocusChunkOrigin",      focusChunkOrigin_);
+        p.Set("uShadowPenumbra",        glm::radians(shadowPenumbraDeg_));
         p.Set("uFogHeightFalloff",      fogHeightFalloff_);
         p.Set("uCloudLayerAltitude",    cloudLayerAltitude_);
         p.Set("uCloudShadowExtent",     cloudShadowExtent_);
@@ -130,6 +158,7 @@ public:
         StatusLine("Atmosphere (LUTs)", atmoAvailable_, "ciel noir");
         StatusLine("IBL", iblAvailable_, "repli sur la sky-view");
         StatusLine("Ombre des nuages", cloudShadowAvailable_, "pas d'ombre");
+        StatusLine("Chunk focus (ombres du relief)", focusAvailable_, "pas d'ombre du relief");
         StatusLine("scene.display (tonemap)", !applyFallbackExposure_, "exposition + ACES provisoires");
 
         ImGui::SeparatorText("Eclairage");
@@ -137,8 +166,21 @@ public:
         ImGui::SliderFloat("Intensite lune", &moonScale_, 0.0f, 4.0f);
         ImGui::SliderFloat("Intensite IBL", &iblScale_, 0.0f, 4.0f);
         ImGui::Checkbox("Occlusion speculaire", &specularOcclusion_);
-        static const char* kViews[] = {"Lit", "Albedo", "Normal", "Roughness", "Metal", "AO", "Depth", "IBL only", "Sun only"};
+        static const char* kViews[] = {"Lit", "Albedo", "Normal", "Roughness", "Metal", "AO", "Depth", "IBL only",
+                                       "Sun only", "Shadows"};
         ImGui::Combo("Vue de debug", &debugView_, kViews, IM_ARRAYSIZE(kViews));
+
+        ImGui::SeparatorText("Ombres portees");
+        ImGui::Checkbox("Relief (heightfield)", &terrainShadows_);
+        ImGui::SameLine();
+        ImGui::Checkbox("Contact (ecran)", &contactShadows_);
+        ImGui::SliderFloat("Penombre du relief", &shadowPenumbraDeg_, 0.1f, 5.0f, "%.2f deg");
+        ImGui::SetItemTooltip("Demi-angle de la penombre. Soleil reel : 0,27 deg (ombres nettes).");
+
+        ImGui::SeparatorText("Nuit");
+        ImGui::SliderFloat("Etoiles", &starIntensity_, 0.0f, 4.0f);
+        ImGui::Checkbox("Virage Moonlight", &moonlightShift_);
+        ImGui::SetItemTooltip("Basse lumiere : leger virage bleu-argente (garde >= 75 %% de la saturation).");
 
         ImGui::SeparatorText("Brouillard de hauteur");
         ImGui::TextDisabled("Densite au sol : panneau Celestial (Brouillard)");
@@ -153,6 +195,9 @@ public:
         ImGui::BeginDisabled(!applyFallbackExposure_);
         ImGui::SeparatorText("Exposition provisoire");
         ImGui::SliderFloat("Compensation", &exposureCompensationEv_, -4.0f, 4.0f, "%+.1f EV");
+        ImGui::SliderFloat("Adaptation a l'obscurite", &nightAdaptation_, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("Part de l'obscurite compensee par l'exposition (sous EV 0).\n"
+                              "0 = nuit noire, 1 = nuit ramenee au gris moyen (jour bleute).");
         ImGui::EndDisabled();
     }
 
@@ -166,6 +211,8 @@ private:
     bool iblAvailable_          = false;
     bool cloudShadowAvailable_  = false;
     bool applyFallbackExposure_ = true;
+    bool      focusAvailable_   = false;
+    glm::vec3 focusChunkOrigin_{0.0f};
 
     // Paramètres (OnGui)
     float sunScale_               = 1.0f;
@@ -174,6 +221,12 @@ private:
     bool  specularOcclusion_      = true;
     int   debugView_              = 0;
     float exposureCompensationEv_ = 1.0f;
+    float nightAdaptation_        = 0.6f;
+    bool  moonlightShift_         = true;
+    float starIntensity_          = 1.0f;
+    bool  terrainShadows_         = true;
+    bool  contactShadows_         = true;
+    float shadowPenumbraDeg_      = 1.0f;
     float fogHeightFalloff_       = 0.005f;   // hauteur d'échelle 200 m
     float cloudLayerAltitude_     = 2000.0f;
     float cloudShadowExtent_      = 10000.0f;

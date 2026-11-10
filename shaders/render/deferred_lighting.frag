@@ -26,6 +26,7 @@ layout(binding = TEX_IblIrradiance)     uniform samplerCube uIblIrradiance;   //
 layout(binding = TEX_IblPrefiltered)    uniform samplerCube uIblPrefiltered;  // mip = rugosité perceptuelle
 layout(binding = TEX_IblBrdfLut)        uniform sampler2D   uIblBrdfLut;      // (NoV, rugosité) -> (scale, bias)
 layout(binding = TEX_CloudShadow)       uniform sampler2D   uCloudShadow;     // transmittance des nuages
+layout(binding = TEX_HeightNormal)      uniform sampler2D   uFocusHeight;     // world.focus.heightNormal (R = hauteur)
 
 uniform bool  uGBufferAvailable;
 uniform bool  uAtmoAvailable;
@@ -36,8 +37,17 @@ uniform bool  uSpecularOcclusion;
 uniform float uSunScale;
 uniform float uMoonScale;
 uniform float uIblScale;
-uniform int   uDebugView;              // 0 Lit, 1 Albedo, 2 Normal, 3 Roughness, 4 Metal, 5 AO, 6 Depth, 7 IBL only, 8 Sun only
+uniform int   uDebugView;              // 0 Lit, 1 Albedo, 2 Normal, 3 Roughness, 4 Metal, 5 AO, 6 Depth, 7 IBL only, 8 Sun only, 9 Shadows
 uniform float uExposureCompensation;   // EV ajoutés à l'exposition automatique provisoire
+uniform float uNightAdaptation;        // [0, 1] part de l'obscurité compensée par l'exposition (EV < 0)
+uniform bool  uMoonlightShift;         // léger virage bleu-argenté en basse lumière (garde >= 75 % de saturation)
+uniform float uStarIntensity;          // multiplicateur des étoiles procédurales
+// Ombres portées
+uniform bool  uTerrainShadows;         // heightfield du chunk focus
+uniform bool  uContactShadows;         // espace écran (gbuffer.depth)
+uniform bool  uFocusAvailable;         // world.focus.heightNormal publié ET chunk retrouvé dans l'ECS
+uniform vec3  uFocusChunkOrigin;       // coin du chunk focus relatif à l'origine de rendu (m)
+uniform float uShadowPenumbra;         // demi-angle (rad) de la pénombre des ombres du relief
 uniform float uFogHeightFalloff;       // 1/m : décroissance verticale du brouillard
 uniform float uCloudLayerAltitude;     // m : plan de projection de l'ombre des nuages
 uniform float uCloudShadowExtent;      // m : emprise de clouds.shadowMap, centrée sur la caméra
@@ -82,20 +92,24 @@ vec3 SkyLuminanceAbove(vec3 dir) {
     return SkyLuminance(normalize(dir));
 }
 
-// Transmittance atmosphère × ombre de la planète, d'un point d'altitude altM (m) vers un astre.
-vec3 LightTransmittance(float altM, vec3 lightDir) {
+// Transmittance atmosphère × ombre de la planète, d'un point d'altitude altM (m) vers un astre de
+// rayon angulaire angR (rad). Repère local planète : +Y = zénith, donc mu = lightDir.y.
+// Calculs par altitude (et non par rayon r ≈ 6360 km) : stables au mètre près.
+vec3 LightTransmittance(float altM, vec3 lightDir, float angR) {
     if (!AtmoValid()) return vec3(smoothstep(-0.02, 0.02, lightDir.y));
-    float Rb = uAtmo.uRadiiAndScaleHeights.x;
-    float Rt = uAtmo.uRadiiAndScaleHeights.y;
-    float r  = clamp(Rb + max(altM * 0.001, PLANET_RADIUS_OFFSET), Rb, Rt);
-    vec3 pos = vec3(0.0, r, 0.0);  // repère local planète : +Y = zénith
-    return texture(uTransmittanceLUT, TransmittanceParamsToUV(r, lightDir.y, Rb, Rt)).rgb
-         * PlanetShadow(pos, lightDir, Rb);
+    float Rb  = uAtmo.uRadiiAndScaleHeights.x;
+    float Rt  = uAtmo.uRadiiAndScaleHeights.y;
+    float hKm = clamp(altM * 0.001, 0.0, Rt - Rb);
+    return texture(uTransmittanceLUT, TransmittanceParamsToUVAlt(hKm, lightDir.y, Rb, Rt)).rgb
+         * PlanetShadowAlt(hKm, lightDir.y, Rb, angR);
 }
 
-// Éclairements au sommet de l'atmosphère (lux). La lune renvoie la lumière du soleil.
+float SunAngularRadius()  { return uEnv.sunColorAngular.a; }
+float MoonAngularRadius() { return uEnv.moonParams.y; }
+
+// Éclairements au sommet de l'atmosphère (lux). Clair de lune : teinte bleu-argenté (luminance conservée).
 vec3 SunIlluminanceTOA()  { return uEnv.sunColorAngular.rgb * uEnv.sunDirIlluminance.w; }
-vec3 MoonIlluminanceTOA() { return uEnv.sunColorAngular.rgb * uEnv.moonParams.x; }
+vec3 MoonIlluminanceTOA() { return MOONLIGHT_TINT * uEnv.moonParams.x; }
 
 // =============================================================================
 // Disques des astres
@@ -115,15 +129,17 @@ vec3 SunDisk(vec3 rayDir) {
     float limb = (1.0 - u * (1.0 - mu)) / (1.0 - u / 3.0);
     float omega = 2.0 * PI * (1.0 - cos(angR));
 
+    // Transmittance évaluée dans la direction du pixel : l'horizon découpe le disque au pixel près.
     return SunIlluminanceTOA() / omega * limb * coverage
-         * LightTransmittance(envCameraPosition().y, s);
+         * LightTransmittance(envCameraPosition().y, rayDir, 0.0);
 }
 
 // Lune : sphère lambertienne. La direction du soleil vue depuis la lune est reconstruite à partir
 // de la phase (élongation ψ = 2π·phase : 0 = nouvelle lune, π = pleine lune), dans le plan
 // lune-soleil réel : le terminateur est donc orienté vers le vrai soleil ET respecte la phase,
 // même quand les sliders azimut / phase sont réglés indépendamment.
-vec3 MoonDisk(vec3 rayDir) {
+vec3 MoonDisk(vec3 rayDir, out float outPeakLuminance) {
+    outPeakLuminance = 0.0;
     vec3  m    = normalize(envMoonDirection());
     float angR = max(uEnv.moonParams.y, 1e-4);
     float x    = AngleBetween(rayDir, m) / angR;
@@ -155,12 +171,71 @@ vec3 MoonDisk(vec3 rayDir) {
     float omega = 2.0 * PI * (1.0 - cos(angR));
     float shade = ndl * 1.5 + uEnv.moonParams.z;
 
-    return uEnv.sunColorAngular.rgb * (eFull / omega) * shade * coverage
-         * LightTransmittance(envCameraPosition().y, m);
+    // Disque argenté : moitié moins teinté que la lumière qu'il diffuse (reste lisible comme "blanc lunaire").
+    vec3 diskTint = mix(vec3(1.0), MOONLIGHT_TINT, 0.5);
+    vec3 radianceScale = diskTint * (eFull / omega)
+                       * LightTransmittance(envCameraPosition().y, rayDir, 0.0);
+    outPeakLuminance = Luminance(radianceScale) * 1.5;  // partie éclairée la plus brillante
+    return radianceScale * shade * coverage;
+}
+
+// Contribution du disque lunaire du pixel courant, gardée à part pour l'exposition provisoire.
+vec3  gMoonDisk = vec3(0.0);
+float gMoonPeak = 0.0;
+
+// --- Étoiles procédurales -------------------------------------------------------------------------
+// Grille 3D de cellules sur la direction monde (dir × kCells) : la sphère unité traverse les cellules,
+// chaque cellule tirée au sort porte une étoile à une position fixe. Uniquement fonction de rayDir :
+// le champ d'étoiles est parfaitement stable (seul un scintillement de ±10 % est animé).
+float Hash13(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.zyx + 31.32);
+    return fract((p.x + p.y) * p.z);
+}
+
+vec3 Hash33(vec3 p) {
+    p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+    p += dot(p, p.yxz + 33.33);
+    return fract((p.xxy + p.yxx) * p.zyx);
+}
+
+vec3 StarField(vec3 dir) {
+    const float kCells   = 220.0;  // ~0,26° par cellule
+    const float kDensity = 0.012;  // fraction des cellules qui portent une étoile
+    vec3  sp   = dir * kCells;
+    vec3  base = floor(sp - 0.5);
+    float size = max(PixelAngle() * 0.75, 2e-4);  // étoile ≈ 1 pixel, sans crénelage
+    vec3  acc  = vec3(0.0);
+    for (int i = 0; i < 8; ++i) {  // 2 × 2 × 2 cellules voisines : pas d'étoile coupée en bord de cellule
+        vec3 c = base + vec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        if (Hash13(c) > kDensity) continue;
+        vec3  h       = Hash33(c + 17.0);
+        vec3  starDir = normalize(c + 0.15 + 0.7 * h);
+        float ang     = AngleBetween(dir, starDir);
+        // Distribution en loi de puissance : beaucoup d'étoiles faibles, quelques brillantes (cd/m² au pic).
+        float peak    = 0.004 + 0.12 * pow(h.x, 10.0);
+        float twinkle = 0.9 + 0.1 * sin(envTime() * (2.0 + 4.0 * h.y) + h.z * 60.0);
+        vec3  tint    = mix(vec3(0.75, 0.85, 1.15), vec3(1.15, 0.95, 0.75), h.z);  // bleutées -> orangées
+        acc += tint * peak * twinkle * exp(-(ang * ang) / (size * size));
+    }
+    return acc;
 }
 
 vec3 ShadeSky(vec3 rayDir) {
-    return SkyLuminance(rayDir) + SunDisk(rayDir) * uSunScale + MoonDisk(rayDir) * uMoonScale;
+    gMoonDisk = MoonDisk(rayDir, gMoonPeak) * uMoonScale;
+    gMoonPeak *= uMoonScale;
+    vec3 sun  = SunDisk(rayDir) * uSunScale;
+    vec3 sky  = SkyLuminance(rayDir) + sun + gMoonDisk;
+
+    // Étoiles : apparaissent quand le soleil passe sous -4° (pleinement sous -10°), hors disques,
+    // atténuées par l'atmosphère (plus ternes vers l'horizon, absentes sous l'horizon).
+    float sunY     = normalize(envSunDirection()).y;
+    float starFade = 1.0 - smoothstep(-0.1736, -0.0698, sunY);  // sin(-10°), sin(-4°)
+    if (starFade > 0.0 && uStarIntensity > 0.0 && Luminance(gMoonDisk + sun) <= 0.0) {
+        sky += StarField(rayDir) * uStarIntensity * starFade
+             * LightTransmittance(envCameraPosition().y, rayDir, 0.0);
+    }
+    return sky;
 }
 
 // =============================================================================
@@ -230,6 +305,86 @@ float CloudShadow(vec3 P, vec3 L) {
     return texture(uCloudShadow, uv).r;
 }
 
+// =============================================================================
+// Ombres portées : relief (heightfield du chunk focus) + contact (espace écran)
+// =============================================================================
+// Bruit par pixel stable (Jimenez 2014) : décale les pas de marche pour casser les bandes.
+float InterleavedGradientNoise(vec2 pixel) {
+    return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+// a) Ombre douce du relief : marche le long de L dans la carte de hauteur du chunk focus
+//    (world.focus.heightNormal, R = hauteur absolue). À chaque pas, la "hauteur libre" du rayon
+//    au-dessus du terrain divisée par la distance donne l'angle sous lequel le relief masque l'astre ;
+//    un smoothstep sur ±uShadowPenumbra produit la pénombre. Hors du chunk : on ne sait pas -> éclairé.
+float HeightfieldShadow(vec3 P, vec3 L, float noise) {
+    if (!uFocusAvailable || !uTerrainShadows || L.y <= 0.0) return 1.0;
+    const int   kSteps   = 20;
+    const float kMaxDist = 400.0;   // m (diagonale d'un chunk ≈ 362 m)
+    const float kBias    = 0.35;    // m : écart grille rendue / carte bilinéaire
+    float vis = 1.0;
+    for (int i = 0; i < kSteps; ++i) {
+        float f  = (float(i) + noise) / float(kSteps);
+        float t  = 1.0 + kMaxDist * f * f;                 // pas resserrés près du point (contact)
+        vec3  p  = P + L * t;
+        vec2  uv = (p.xz - uFocusChunkOrigin.xz) / CHUNK_SIZE_METERS;
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) break;
+        float h  = textureLod(uFocusHeight, uv, 0.0).r;
+        float clearance = (p.y + kBias - h) / t;           // tangente de l'angle libre
+        vis = min(vis, smoothstep(-uShadowPenumbra, uShadowPenumbra, clearance));
+        if (vis <= 0.001) break;
+    }
+    return vis;
+}
+
+// b) Ombre de contact : 8 pas courts en espace écran contre gbuffer.depth (petits reliefs, pied de la
+//    végétation, objets non présents dans la carte de hauteur). Longueur et épaisseur croissent avec
+//    la distance pour rester à l'échelle de quelques pixels.
+float ContactShadow(vec3 P, vec3 N, vec3 L, float dist, float noise) {
+    if (!uGBufferAvailable || !uContactShadows) return 1.0;
+    const int kSteps = 8;
+    float len       = clamp(dist * 0.02, 0.4, 6.0);
+    float thickness = clamp(dist * 0.01, 0.25, 3.0);
+    // Anti-acné : le maillage rendu (grille de 2 m) et la normale lisse de la carte de hauteur divergent
+    // de quelques cm, et un pixel couvre plus de terrain avec la distance -> départ décalé le long de la
+    // normale et seuil de détection proportionnels à la distance.
+    float bias = 0.05 + 0.004 * dist;
+    vec3  start = P + N * bias;
+    for (int i = 0; i < kSteps; ++i) {
+        float t    = len * (float(i) + 0.5 + 0.5 * noise) / float(kSteps);
+        vec4  clip = uEnv.viewProj * vec4(start + L * t, 1.0);
+        if (clip.w <= 0.0) break;
+        vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) break;
+        float sceneDepth = textureLod(uGDepth, uv, 0.0).r;
+        if (envIsSky(sceneDepth)) continue;
+        float diff = clip.w - envLinearDepth(sceneDepth);  // > 0 : la géométrie est devant le rayon
+        if (diff > bias && diff < thickness) {
+            vec2 edge = min(uv, 1.0 - uv);                  // fondu près des bords de l'écran
+            return 1.0 - smoothstep(0.0, 0.05, min(edge.x, edge.y));
+        }
+    }
+    return 1.0;
+}
+
+// worldPos : position reconstruite du G-Buffer ; normal : normale monde (décalages anti-acné).
+float ComputeTerrainAndContactShadow(vec3 worldPos, vec3 normal, vec3 lightDir, vec2 screenUv) {
+    float noise = InterleavedGradientNoise(screenUv * uEnv.viewportSize.xy);
+    float dist  = length(envCameraPosition() - worldPos);
+    return min(HeightfieldShadow(worldPos + normal * 0.15, lightDir, noise),
+               ContactShadow(worldPos, normal, lightDir, dist, noise));
+}
+
+// Ciel moyen (cd/m²) : zénith + 4 directions à 15° d'élévation (cos 0.966, sin 0.259).
+vec3 SkyAverage() {
+    vec3 ring = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        float az = (float(i) + 0.5) * 0.5 * PI;
+        ring += SkyLuminance(vec3(0.966 * sin(az), 0.259, -0.966 * cos(az)));
+    }
+    return 0.5 * SkyLuminance(vec3(0.0, 1.0, 0.0)) + 0.125 * ring;
+}
+
 // Éclairage ambiant : radiance diffuse (E/π) et radiance spéculaire déjà pondérée par la BRDF.
 void Ambient(Surface s, vec3 V, out vec3 diffuse, out vec3 specular) {
     float NoV = max(dot(s.N, V), 1e-4);
@@ -245,14 +400,18 @@ void Ambient(Surface s, vec3 V, out vec3 diffuse, out vec3 specular) {
         specular = prefiltered * (s.f0 * brdf.x + brdf.y);
     } else {
         // Repli physique sur la sky-view (mêmes unités cd/m² que le ciel affiché).
-        // Diffus : ciel vu par la normale (direction entre N et le zénith ≈ moyenne pondérée par cos)
-        // + rebond du sol (albédo de l'atmosphère) pour la partie de l'hémisphère tournée vers le bas.
-        vec3  up     = vec3(0.0, 1.0, 0.0);
-        float skyVis = 0.5 + 0.5 * s.N.y;
-        vec3  skyL   = SkyLuminanceAbove(normalize(s.N + up));
-        vec3  sunDir = normalize(envSunDirection());
-        vec3  groundE = SunIlluminanceTOA() * LightTransmittance(0.0, sunDir) * max(sunDir.y, 0.0) * uSunScale
-                      + PI * SkyLuminanceAbove(up);
+        // Ambiant hémisphérique doux : ciel (moyenne + direction de la normale) au-dessus, rebond du sol
+        // (albédo de l'atmosphère éclairé par le soleil, la lune et le ciel) en dessous, mélangés par N.y.
+        // C'est lui qui détaille les zones à l'ombre, de jour comme sous la lune.
+        vec3  up      = vec3(0.0, 1.0, 0.0);
+        float skyVis  = 0.5 + 0.5 * s.N.y;
+        vec3  skyAvg  = SkyAverage();
+        vec3  skyL    = 0.5 * (SkyLuminanceAbove(normalize(s.N + up)) + skyAvg);
+        vec3  sunDir  = normalize(envSunDirection());
+        vec3  moonDir = normalize(envMoonDirection());
+        vec3  groundE = SunIlluminanceTOA()  * LightTransmittance(0.0, sunDir,  SunAngularRadius())  * max(sunDir.y, 0.0)  * uSunScale
+                      + MoonIlluminanceTOA() * LightTransmittance(0.0, moonDir, MoonAngularRadius()) * max(moonDir.y, 0.0) * uMoonScale
+                      + PI * skyAvg;
         vec3  groundL = AtmoValid() ? uAtmo.uGroundAlbedoAndTurb.xyz * groundE / PI : vec3(0.0);
         vec3  diffuseRadiance = skyL * skyVis + groundL * (1.0 - skyVis);
 
@@ -273,6 +432,27 @@ void Ambient(Surface s, vec3 V, out vec3 diffuse, out vec3 specular) {
     }
 }
 
+float PhaseHenyeyGreenstein(float cosTheta, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(max(1e-4, 1.0 + g2 - 2.0 * g * cosTheta), 1.5));
+}
+
+// Luminance diffusée par le brouillard lui-même (milieu optiquement épais, albédo de diffusion ≈ 1) :
+// soleil et lune atténués (phase de Henyey-Greenstein, gouttelettes -> diffusion vers l'avant)
+// + ciel moyen en ambiant isotrope. Surtout PAS la luminance du ciel à l'horizon : elle intègre des
+// centaines de km d'atmosphère et la lueur crépusculaire, ce qui délavait tout le terrain.
+vec3 FogInscatter(vec3 P, vec3 rayDir) {
+    const float g = 0.6;
+    vec3 sunDir  = normalize(envSunDirection());
+    vec3 moonDir = normalize(envMoonDirection());
+    vec3 direct  = SunIlluminanceTOA() * LightTransmittance(P.y, sunDir, SunAngularRadius())
+                 * PhaseHenyeyGreenstein(dot(rayDir, sunDir), g) * uSunScale
+                 + MoonIlluminanceTOA() * LightTransmittance(P.y, moonDir, MoonAngularRadius())
+                 * PhaseHenyeyGreenstein(dot(rayDir, moonDir), g) * uMoonScale;
+
+    return direct + SkyAverage();
+}
+
 // Brouillard de hauteur : densité σ(y) = σ0 exp(-k y), intégrée analytiquement le long du rayon.
 vec3 ApplyHeightFog(vec3 color, vec3 P, vec3 rayDir, float dist) {
     float sigma0 = uEnv.weatherExtra.z;  // 1/m au niveau y = 0
@@ -283,24 +463,65 @@ vec3 ApplyHeightFog(vec3 color, vec3 P, vec3 rayDir, float dist) {
     float shape = abs(kd) > 1e-4 ? (1.0 - exp(-kd)) / kd : 1.0;
     float opticalDepth = sigma0 * exp(clamp(-k * camY, -80.0, 80.0)) * dist * shape;
     float fog = 1.0 - exp(-max(opticalDepth, 0.0));
-    return mix(color, SkyLuminanceAbove(rayDir), fog);
+    return mix(color, FogInscatter(P, rayDir), fog);
 }
 
 // =============================================================================
 // Exposition provisoire (tant que scene.display n'existe pas)
 // =============================================================================
-float FallbackExposure() {
-    // Luminance moyenne estimée sur le ciel : zénith + 4 directions à 20° d'élévation.
-    vec3 acc = SkyLuminance(vec3(0.0, 1.0, 0.0));
-    const float ce = 0.9397, se = 0.3420;  // cos / sin 20°
-    for (int i = 0; i < 4; ++i) {
-        float az = (float(i) + 0.5) * 0.5 * PI;
-        acc += SkyLuminance(vec3(ce * sin(az), se, -ce * cos(az)));
+// Éclairement (lux) d'une surface horizontale à l'altitude de la caméra : soleil + lune directs
+// + ciel intégré sur l'hémisphère (quadrature : zénith + 2 couronnes de 6 directions, pondérées
+// par angle solide × cosinus). C'est ce qui éclaire réellement le terrain : l'exposition suit donc
+// le crépuscule de façon continue, y compris quand seule la lueur de l'horizon reste.
+void HorizontalIlluminance(out vec3 eDirect, out vec3 eSky) {
+    float camAlt  = envCameraPosition().y;
+    vec3  sunDir  = normalize(envSunDirection());
+    vec3  moonDir = normalize(envMoonDirection());
+    eDirect = SunIlluminanceTOA()  * LightTransmittance(camAlt, sunDir,  SunAngularRadius())  * max(sunDir.y, 0.0)  * uSunScale
+            + MoonIlluminanceTOA() * LightTransmittance(camAlt, moonDir, MoonAngularRadius()) * max(moonDir.y, 0.0) * uMoonScale;
+
+    // Bandes : [0°, 30°] de zénith (Ω = 0.84 sr), [30°, 65°] (2.79 sr), [65°, 90°] (2.66 sr)
+    const float wCap = 0.84 * 1.0;
+    const float w45  = 2.79 / 6.0 * 0.707;
+    const float w12  = 2.66 / 6.0 * 0.208;
+    vec3  sky  = SkyLuminance(vec3(0.0, 1.0, 0.0)) * wCap;
+    for (int i = 0; i < 6; ++i) {
+        float az = (float(i) + 0.5) * (2.0 * PI / 6.0);
+        vec2  h  = vec2(sin(az), -cos(az));
+        sky += SkyLuminance(vec3(0.707 * h.x, 0.707, 0.707 * h.y)) * w45;
+        sky += SkyLuminance(vec3(0.978 * h.x, 0.208, 0.978 * h.y)) * w12;
     }
-    float lAvg = Luminance(acc / 5.0);
-    // EV100 (S = 100, K = 12.5), borné : nuit ≈ -2, plein soleil ≈ 15.
-    float ev100 = clamp(log2(max(lAvg, 1e-6) * 100.0 / 12.5), -2.0, 16.0) - uExposureCompensation;
+    eSky = PI * sky / (wCap + 6.0 * w45 + 6.0 * w12);
+}
+
+const float kSkyKeyWeight = 0.5;
+
+float FallbackExposure() {
+    // Luminance de référence = la plus forte entre :
+    //  * une surface grise à 18 % sous l'éclairement total (de jour, le soleil domine) ;
+    //  * la luminance moyenne du ciel (au crépuscule et la nuit, c'est le ciel qui remplit l'image).
+    // Les deux termes sont continus : pas de saut d'exposition au coucher ni au lever.
+    vec3 eDirect, eSky;
+    HorizontalIlluminance(eDirect, eSky);
+    // Le ciel ne compte qu'à moitié : la nuit, on expose pour le paysage (et non pour le ciel), ce qui
+    // laisse le ciel bleu nuit plus lumineux que le sol au lieu de tout ramener au même gris.
+    float lAvg = max(0.18 * Luminance(eDirect + eSky) / PI, kSkyKeyWeight * Luminance(eSky) / PI);
+    // EV100 (S = 100, K = 12.5). Sous EV 0 (crépuscule avancé, nuit), l'œil ne s'adapte que
+    // partiellement : on ne compense qu'une fraction uNightAdaptation de l'obscurité. Le reste
+    // de l'obscurité est conservé -> contraste et noirs réels, sans voile gris.
+    float ev100 = log2(max(lAvg, 1e-8) * 100.0 / 12.5);
+    if (ev100 < 0.0) ev100 *= uNightAdaptation;
+    ev100 = clamp(ev100, -10.0, 16.0) - uExposureCompensation;
     return 1.0 / (1.2 * exp2(ev100));
+}
+
+// Virage "Moonlight" (remplace l'effet Purkinje complet, trop gris) : en basse lumière, on tire au plus
+// 25 % de la couleur vers sa propre luminance teintée bleu-argenté. Herbe, roche et arbres gardent au
+// moins 75 % de leur saturation et restent distinguables la nuit.
+vec3 MoonlightShift(vec3 c) {
+    float Y     = Luminance(c);
+    float night = 0.04 / (0.04 + Y);  // 0 de jour, -> 1 sous ~0,04 cd/m²
+    return mix(c, Y * MOONLIGHT_TINT, 0.25 * night);
 }
 
 vec3 AcesFilmic(vec3 x) {  // Narkowicz 2015
@@ -308,9 +529,21 @@ vec3 AcesFilmic(vec3 x) {  // Narkowicz 2015
 }
 
 // =============================================================================
+// Anti-aliasing spéculaire géométrique (Tokuyoshi & Kaplanyan 2019) : élargit α² selon la variation
+// de la normale entre pixels voisins. Sans lui, une surface quasi miroir (eau, sol mouillé, α ≈ 0.0025)
+// fait scintiller le reflet du soleil dès que la normale ou l'astre bouge d'un rien.
+const float kSpecAaSigma2 = 0.15915494;  // 1 / (2π)
+const float kSpecAaKappa  = 0.18;
+
 void main() {
     float depth = uGBufferAvailable ? texture(uGDepth, vUv).r : 0.0;
-    bool  isDataView = uDebugView >= 1 && uDebugView <= 6;
+
+    // Dérivées en flux de contrôle uniforme (avant toute branche) : triangle plein écran.
+    vec3  gNormalRaw   = texture(uGNormal, vUv).xyz;
+    vec3  dndx         = dFdx(gNormalRaw);
+    vec3  dndy         = dFdy(gNormalRaw);
+    float kernelAlpha2 = min(2.0 * kSpecAaSigma2 * (dot(dndx, dndx) + dot(dndy, dndy)), kSpecAaKappa);
+    bool  isDataView = (uDebugView >= 1 && uDebugView <= 6) || uDebugView == 9;
     vec3  rayDir = envViewRayWorld(vUv);
     vec3  color;
 
@@ -326,7 +559,7 @@ void main() {
         Surface s;
         s.albedo    = gA.rgb;
         s.ao        = gA.a;
-        s.N         = normalize(texture(uGNormal, vUv).xyz);
+        s.N         = normalize(gNormalRaw);
         s.roughness = gM.r;
         s.metal     = gM.g;
 
@@ -341,7 +574,8 @@ void main() {
         s.metal      = mix(s.metal, 0.0, snow);
 
         s.roughness    = clamp(s.roughness, 0.045, 1.0);
-        s.alpha        = s.roughness * s.roughness;
+        s.alpha        = sqrt(clamp(s.roughness * s.roughness * s.roughness * s.roughness + kernelAlpha2, 0.0, 1.0));
+        s.roughness    = sqrt(s.alpha);  // rugosité perceptuelle filtrée (mip IBL, LUT BRDF)
         s.diffuseColor = s.albedo * (1.0 - s.metal);
         s.f0           = mix(vec3(0.04), s.albedo, s.metal);
         s.f0           = mix(s.f0, vec3(0.02), wet * porous);  // F0 de l'eau
@@ -349,9 +583,13 @@ void main() {
         // --- Lumières directes ---
         vec3 sunDir  = normalize(envSunDirection());
         vec3 moonDir = normalize(envMoonDirection());
-        float cloud  = CloudShadow(P, sunDir);
-        vec3 sunE  = SunIlluminanceTOA()  * LightTransmittance(P.y, sunDir)  * cloud * uSunScale;
-        vec3 moonE = MoonIlluminanceTOA() * LightTransmittance(P.y, moonDir) * CloudShadow(P, moonDir) * uMoonScale;
+        // Ombres portées (relief + contact), évaluées seulement si l'astre est au-dessus de l'horizon.
+        float sunShadow  = sunDir.y  > -0.01 ? ComputeTerrainAndContactShadow(P, s.N, sunDir,  vUv) : 0.0;
+        float moonShadow = moonDir.y > -0.01 ? ComputeTerrainAndContactShadow(P, s.N, moonDir, vUv) : 0.0;
+        vec3 sunE  = SunIlluminanceTOA()  * LightTransmittance(P.y, sunDir, SunAngularRadius())
+                   * CloudShadow(P, sunDir) * sunShadow * uSunScale;
+        vec3 moonE = MoonIlluminanceTOA() * LightTransmittance(P.y, moonDir, MoonAngularRadius())
+                   * CloudShadow(P, moonDir) * moonShadow * uMoonScale;
         vec3 sunL  = DirectLight(s, V, sunDir, sunE);
         vec3 moonL = DirectLight(s, V, moonDir, moonE);
 
@@ -370,6 +608,7 @@ void main() {
             case 6:  color = envTurbo(envLinearDepth(depth) / 1000.0); break;
             case 7:  color = ambient; break;
             case 8:  color = sunL; break;
+            case 9:  color = vec3(sunShadow, moonShadow, sunShadow); break;  // blanc = éclairé, vert = lune seule
             default: color = ApplyHeightFog(sunL + moonL + ambient, P, rayDir, dist); break;
         }
     }
@@ -378,7 +617,16 @@ void main() {
         // Données brutes : pas d'exposition. Encodées pour le Viewport s'il affiche scene.color tel quel.
         oColor = vec4(uApplyFallbackExposure ? LinearToSrgb(color) : color, 1.0);
     } else if (uApplyFallbackExposure) {
-        oColor = vec4(LinearToSrgb(AcesFilmic(color * FallbackExposure())), 1.0);
+        float exposure = FallbackExposure();
+        vec3  moon = gMoonDisk;
+        vec3  rest = color - moon;
+        if (uMoonlightShift) rest = MoonlightShift(rest);
+        // Adaptation locale quand l'œil regarde la lune : le disque (~4000 cd/m²) et la lumière cendrée
+        // sont des milliers de fois plus lumineux que le paysage nocturne ; avec l'exposition globale ils
+        // saturent tous deux en blanc et la phase disparaît. On plafonne donc l'exposition du disque pour
+        // que sa partie éclairée reste juste sous le blanc. De jour (exposition faible) rien ne change.
+        float moonExposure = min(exposure, 0.8 / max(gMoonPeak, 1e-6));
+        oColor = vec4(LinearToSrgb(AcesFilmic(rest * exposure + moon * moonExposure)), 1.0);
     } else {
         oColor = vec4(min(color, vec3(kHalfMax)), 1.0);  // le disque solaire dépasse le RGBA16F
     }

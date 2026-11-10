@@ -45,11 +45,11 @@ void main() {
     float phaseR_Moon = PhaseRayleigh(cosMoon);
     float phaseM_Moon = PhaseCornetteShanksMie(cosMoon, mieG);
 
-    // Éclairements au sommet de l'atmosphère (lux). La lune renvoie la lumière du soleil :
-    // même couleur, intensité moonParams.x (phase déjà incluse côté CPU). La lumière cendrée
-    // (moonParams.z) n'éclaire que le disque lunaire, pas l'atmosphère terrestre.
+    // Éclairements au sommet de l'atmosphère (lux). Lune : intensité moonParams.x (phase déjà incluse
+    // côté CPU), teinte bleu-argenté MOONLIGHT_TINT (choix artistique, luminance conservée). La lumière
+    // cendrée (moonParams.z) n'éclaire que le disque lunaire, pas l'atmosphère terrestre.
     vec3 sunIlluminance  = uEnv.sunColorAngular.rgb * uEnv.sunDirIlluminance.w;
-    vec3 moonIlluminance = uEnv.sunColorAngular.rgb * uEnv.moonParams.x;
+    vec3 moonIlluminance = MOONLIGHT_TINT * uEnv.moonParams.x;  // diffusion lunaire bleu-argenté
 
     float dt = tMax / float(kSteps);
     vec3 L = vec3(0.0);
@@ -84,6 +84,14 @@ void main() {
 
         L += throughput * (inScatSun * sunIlluminance + inScatMoon * moonIlluminance) * sint;
         throughput *= sampleTrans;
+    }
+
+    // Fond de ciel nocturne (étoiles diffuses + airglow, dégradé bleu nuit). L'airglow est émis DANS
+    // l'atmosphère (~90 km) : on n'applique qu'une atténuation partielle et non spectrale (sinon
+    // l'extinction de Rayleigh rougit l'horizon en une bande brune). Absent si le rayon touche le sol.
+    if (tGround <= 0.0) {
+        float dimming = mix(1.0, dot(throughput, vec3(0.2126, 0.7152, 0.0722)), 0.5);
+        L += NightSkyColor(rayDir, uAtmo.uNightSky.x) * dimming;
     }
 
     imageStore(outSkyView, pix, vec4(min(L, vec3(kHalfMax)), 1.0));

@@ -39,6 +39,7 @@ struct alignas(16) AtmosphereParamsUBO {
     glm::vec4 mieScatteringAndExt;  // xyz = beta_M_sca (1/km), w = beta_M_ext (1/km)
     glm::vec4 ozoneAbsorption;      // xyz = beta_O3 (1/km), w = ozoneEnabled (0 ou 1)
     glm::vec4 groundAlbedoAndTurb;  // xyz = groundAlbedo, w = turbidityFactor (météo)
+    glm::vec4 nightSky;             // x = intensité du fond de ciel nocturne (étoiles + airglow), yzw = 0
 };
 static_assert(sizeof(AtmosphereParamsUBO) % 16 == 0, "AtmosphereParamsUBO must be std140 aligned");
 
@@ -69,6 +70,13 @@ void TodoBanner(const char* scope) {
 }
 
 constexpr std::string_view kProducer = "CelestialAtmosphereSystem";
+
+const char* MoonPhaseName(float phase) {
+    static const char* kNames[8] = {"nouvelle lune", "premier croissant", "premier quartier", "gibbeuse croissante",
+                                    "pleine lune",   "gibbeuse decroissante", "dernier quartier", "dernier croissant"};
+    const int index = static_cast<int>(std::floor(phase * 8.0f + 0.5f)) % 8;
+    return kNames[index];
+}
 
 class CelestialAtmosphereSystem final : public ISystemModule {
 public:
@@ -143,8 +151,11 @@ public:
             const glm::vec3 sunDir = glm::normalize(glm::vec3(dirX, sinEl, dirZ));
             DirToAzimuthElevation(sunDir, sunAzimuth_, sunElevation_);
 
-            // Cycle lunaire synodique (29.53 jours)
-            moonPhase_ = std::fmod((static_cast<float>(dayOfYear_) + timeOfDayHours_ / 24.0f) / 29.53059f, 1.0f);
+            // Cycle lunaire synodique (29.53 jours). lunarAgeOffsetDays_ = âge de la lune au jour 0
+            // (époque arbitraire) : sans lui, le jour 172 tombait sur un dernier croissant, levé avec le
+            // soleil et donc invisible la nuit.
+            moonPhase_ = std::fmod((static_cast<float>(dayOfYear_) + timeOfDayHours_ / 24.0f + lunarAgeOffsetDays_)
+                                       / 29.53059f, 1.0f);
             const float moonHourAngle = hourAngleRad - moonPhase_ * 2.0f * glm::pi<float>();
             const float moonDecl      = declRad * std::cos(moonPhase_ * 2.0f * glm::pi<float>())
                                       + glm::radians(5.14f) * std::sin(moonPhase_ * 2.0f * glm::pi<float>());
@@ -219,6 +230,8 @@ public:
                                                0.004440f * weatherTurbidity);
         params.ozoneAbsorption     = glm::vec4(0.000650f, 0.001881f, 0.000085f, ozone_ ? 1.0f : 0.0f);
         params.groundAlbedoAndTurb = glm::vec4(groundAlbedo_[0], groundAlbedo_[1], groundAlbedo_[2], weatherTurbidity);
+        // Intensité du fond de ciel nocturne ; la teinte (dégradé bleu nuit) est dans NightSkyColor (GLSL).
+        params.nightSky = glm::vec4(nightSkyIntensity_, 0.0f, 0.0f, 0.0f);
 
         atmoUbo_.UploadObject(params);
         atmoUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::AtmosphereParams);
@@ -297,6 +310,12 @@ public:
         ImGui::SliderFloat("Azimut lune", &moonAzimuth_, 0.0f, 360.0f, "%.1f deg");
         ImGui::SliderFloat("Elevation lune", &moonElevation_, -20.0f, 90.0f, "%.1f deg");
         ImGui::SliderFloat("Phase", &moonPhase_, 0.0f, 0.999f, "%.3f");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", MoonPhaseName(moonPhase_));
+        ImGui::SliderFloat("Age de la lune au jour 0", &lunarAgeOffsetDays_, 0.0f, 29.53f, "%.1f j");
+        ImGui::SetItemTooltip("Modele astronomique : fixe le cycle lunaire (29,53 j).\n"
+                              "Pleine lune (phase 0,5) = visible toute la nuit ;\n"
+                              "proche de la nouvelle lune = levee avec le soleil, visible de jour.");
         ImGui::SliderFloat("Eclairement lune", &moonIlluminance_, 0.0f, 1.0f, "%.3f lux");
         ImGui::SliderFloat("Rayon angulaire lune", &moonAngularRadiusDeg_, 0.05f, 5.0f, "%.3f deg");
         ImGui::SliderFloat("Lumiere cendree", &earthshine_, 0.0f, 0.2f, "%.3f");
@@ -330,6 +349,10 @@ public:
         ImGui::SliderFloat("Anisotropie Mie (g)", &mieAnisotropy_, 0.0f, 0.99f);
         atmoParamsDirty_ |= ImGui::Checkbox("Ozone", &ozone_);
         atmoParamsDirty_ |= ImGui::ColorEdit3("Albedo du sol", groundAlbedo_);
+        ImGui::SliderFloat("Ciel nocturne", &nightSkyIntensity_, 0.0f, 0.3f, "%.4f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SetItemTooltip("Fond de ciel : etoiles + airglow (+ pollution lumineuse), degrade bleu nuit.\n"
+                              "Luminance au zenith = 0,176 x intensite (cd/m2).\n"
+                              "Site tres sombre ~0,001 ; peri-urbain ~0,02 ; ville ~0,1.");
     }
 
 private:
@@ -364,6 +387,8 @@ private:
     float moonIlluminance_       = 0.25f;
     float moonAngularRadiusDeg_  = 0.259f;
     float earthshine_            = 0.02f;
+    float lunarAgeOffsetDays_    = 19.3f;    // jour 172 (défaut) ≈ pleine lune
+    float nightSkyIntensity_     = 0.02f;    // ciel péri-urbain : zénith ≈ 0,0035 cd/m²
     float windDirectionDeg_      = 106.7f;
     float windSpeed_             = 4.0f;
     float windTurbulence_        = 0.3f;
