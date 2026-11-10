@@ -1,0 +1,104 @@
+#version 460 core
+//  shaders/render/atmo_multiscattering.comp                            [DEV 2]
+//  LUT de multi-diffusion Ψms (Hillaire 2020, section 5.5).
+//  Texel : u = cos(zénith soleil) remappé, v = altitude. Résultat pour un éclairement unitaire.
+//
+//  Pour chaque point, on lance N = 64 rayons répartis UNIFORMÉMENT sur la sphère et on intègre
+//  avec une fonction de phase isotrope :
+//    L2ndOrder = (1/N) Σ ∫ T(x, y) σs(y) p_u T_sol(y) dt  + rebond sur le sol (albédo lambertien)
+//    fms       = (1/N) Σ ∫ T(x, y) σs(y) dt                 (transfert "d'un ordre au suivant")
+//    Ψms       = L2ndOrder / (1 - fms)                       (somme géométrique des ordres)
+#include "common/global_ubo.glsl"
+#include "render/atmo_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = TEX_AtmoTransmittance) uniform sampler2D uTransmittanceLUT;
+layout(rgba16f, binding = IMG_AtmoLutOut) writeonly uniform image2D outMultiScat;
+
+const int   kSqrtDirs     = 8;                      // 8 x 8 = 64 directions (Hillaire)
+const int   kDirs         = kSqrtDirs * kSqrtDirs;
+const int   kSteps        = 20;
+const float kUniformPhase = 1.0 / (4.0 * PI);
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outMultiScat);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    float Rb = uAtmo.uRadiiAndScaleHeights.x;
+    float Rt = uAtmo.uRadiiAndScaleHeights.y;
+    vec3 groundAlbedo = uAtmo.uGroundAlbedoAndTurb.xyz;
+
+    // Inverse exact de MultiScatteringParamsToUV (sub-UV)
+    vec2 uv = (vec2(pix) + 0.5) / vec2(size);
+    uv = vec2(SubUVToUnit(uv.x, MULTISCAT_LUT_RES.x), SubUVToUnit(uv.y, MULTISCAT_LUT_RES.y));
+
+    float cosSunZenith = uv.x * 2.0 - 1.0;
+    float r = max(Rb + clamp(uv.y, 0.0, 1.0) * (Rt - Rb), Rb + PLANET_RADIUS_OFFSET);
+
+    vec3 p = vec3(0.0, r, 0.0);
+    vec3 sunDir = vec3(sqrt(max(0.0, 1.0 - cosSunZenith * cosSunZenith)), cosSunZenith, 0.0);
+
+    vec3 L2ndOrder = vec3(0.0);
+    vec3 fms       = vec3(0.0);
+
+    for (int dIdx = 0; dIdx < kDirs; ++dIdx) {
+        // Répartition uniforme sur la sphère : azimut uniforme, cos(zénith) uniforme
+        float a = (float(dIdx / kSqrtDirs) + 0.5) / float(kSqrtDirs);
+        float b = (float(dIdx % kSqrtDirs) + 0.5) / float(kSqrtDirs);
+        float theta  = 2.0 * PI * a;
+        float cosPhi = 1.0 - 2.0 * b;
+        float sinPhi = sqrt(max(0.0, 1.0 - cosPhi * cosPhi));
+        vec3 rayDir = vec3(cos(theta) * sinPhi, cosPhi, sin(theta) * sinPhi);
+
+        float tAtmo   = RaySphereIntersectNearest(p, rayDir, Rt);
+        float tGround = RaySphereIntersectNearest(p, rayDir, Rb);
+        bool  hitsGround = tGround > 0.0;
+        float tMax    = hitsGround ? min(tAtmo, tGround) : tAtmo;
+        float dt      = tMax / float(kSteps);
+
+        vec3 throughput = vec3(1.0);
+        vec3 dirL  = vec3(0.0);
+        vec3 dirFm = vec3(0.0);
+
+        for (int i = 0; i < kSteps; ++i) {
+            vec3 pos = p + rayDir * ((float(i) + 0.5) * dt);
+            float posR = length(pos);
+            vec3 scaR, scaM, ext;
+            SampleMediumKm(posR - Rb, scaR, scaM, ext);
+
+            vec3 sampleTrans = exp(-ext * dt);
+            vec3 scaTotal = scaR + scaM;
+            // Intégration analytique sur le pas : ∫ exp(-ext t) dt = (1 - exp(-ext dt)) / ext
+            vec3 sint = (vec3(1.0) - sampleTrans) / max(ext, vec3(1e-6));
+
+            float muS = dot(pos / posR, sunDir);
+            vec3 transToSun = texture(uTransmittanceLUT, TransmittanceParamsToUV(posR, muS, Rb, Rt)).rgb
+                            * PlanetShadow(pos, sunDir, Rb);
+
+            dirL  += throughput * scaTotal * kUniformPhase * transToSun * sint;
+            dirFm += throughput * scaTotal * sint;
+            throughput *= sampleTrans;
+        }
+
+        // Rebond sur le sol : surface lambertienne d'albédo groundAlbedo (BRDF = albedo / π)
+        if (hitsGround && tGround <= tAtmo) {
+            vec3 gPos = p + rayDir * tGround;
+            float gR = length(gPos);
+            vec3 gUp = gPos / gR;
+            float NdotL = clamp(dot(gUp, sunDir), 0.0, 1.0);
+            vec3 transToSun = texture(uTransmittanceLUT, TransmittanceParamsToUV(gR, NdotL, Rb, Rt)).rgb;
+            dirL += throughput * transToSun * NdotL * groundAlbedo / PI;
+        }
+
+        L2ndOrder += dirL;
+        fms       += dirFm;
+    }
+
+    // Moyenne sur la sphère : (4π / N) pour l'angle solide, × 1/(4π) pour la phase isotrope
+    L2ndOrder /= float(kDirs);
+    fms       /= float(kDirs);
+
+    vec3 psiMs = L2ndOrder / max(vec3(1e-4), vec3(1.0) - fms);
+    imageStore(outMultiScat, pix, vec4(psiMs, 1.0));
+}
