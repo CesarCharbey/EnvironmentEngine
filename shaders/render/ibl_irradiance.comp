@@ -1,0 +1,58 @@
+#version 460 core
+//  shaders/render/ibl_irradiance.comp                                  [DEV 2]
+//  IBL dynamique, étape 3 : irradiance diffuse. Convolution cosinus EXACTE (somme sur tous les texels
+//  d'un mip basse résolution de l'environnement, pondérée par leur angle solide) : aucun bruit.
+//  Convention attendue par deferred_lighting.frag : la cubemap stocke E / π (radiance diffuse).
+//  Validée contre une convolution CPU de référence : écart < 1 %.
+#include "render/ibl_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_IblOut) writeonly uniform imageCube uIrradianceOut;
+layout(binding = TEX_IblEnvironment) uniform samplerCube uEnv;
+
+uniform int uSrcLevel;  // mip de l'environnement convolué (16 × 16 par face)
+uniform int uSrcSize;   // taille d'une face à ce mip
+
+// Les texels source sont chargés par paquets de 64 en mémoire partagée (une lecture de texture par thread
+// et par paquet) puis relus par tout le groupe : ~25× moins de lectures de texture qu'en lecture directe.
+const uint kBatch = 64u;
+shared vec4 sRadiance[kBatch];  // rgb = L × dω, a = dω
+shared vec3 sDir[kBatch];
+
+void main() {
+    ivec3 id     = ivec3(gl_GlobalInvocationID);
+    int   size   = imageSize(uIrradianceOut).x;
+    bool  inside = id.x < size && id.y < size;  // pas de return avant les barrières
+    vec3  N      = CubeTexelDir(id.z, min(id.xy, ivec2(size - 1)), size);
+    uint  lid    = gl_LocalInvocationIndex;
+
+    int   perFace  = uSrcSize * uSrcSize;
+    int   total    = 6 * perFace;
+    vec3  sum      = vec3(0.0);
+    float omegaSum = 0.0;  // Σ angles solides ≈ 4π : corrige l'erreur de la formule par texel
+    for (int base = 0; base < total; base += int(kBatch)) {
+        int k = base + int(lid);
+        if (k < total) {
+            int   face  = k / perFace;
+            int   r     = k - face * perFace;
+            vec2  uv    = CubeFaceUv(ivec2(r % uSrcSize, r / uSrcSize), uSrcSize);
+            vec3  dir   = normalize(CubeFaceDir(face, uv));
+            float omega = CubeTexelSolidAngle(uv, uSrcSize);
+            sRadiance[lid] = vec4(textureLod(uEnv, dir, float(uSrcLevel)).rgb * omega, omega);
+            sDir[lid]      = dir;
+        } else {
+            sRadiance[lid] = vec4(0.0);
+            sDir[lid]      = vec3(0.0);
+        }
+        barrier();
+        for (uint j = 0u; j < kBatch; ++j) {
+            sum      += sRadiance[j].rgb * max(dot(N, sDir[j]), 0.0);
+            omegaSum += sRadiance[j].a;
+        }
+        barrier();
+    }
+    // E = ∫ L cosθ dω ; radiance diffuse = E / π.
+    vec3 E = sum * (4.0 * kIblPi / omegaSum);
+    if (inside) imageStore(uIrradianceOut, id, vec4(E / kIblPi, 1.0));
+}

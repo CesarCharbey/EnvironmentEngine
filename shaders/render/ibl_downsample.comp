@@ -1,0 +1,22 @@
+#version 460 core
+//  shaders/render/ibl_downsample.comp                                  [DEV 2]
+//  IBL dynamique, étape 2 : chaîne de mips de la cubemap d'environnement (un dispatch par niveau),
+//  nécessaire au préfiltrage par échantillonnage d'importance FILTRÉ (Křivánek & Colbert 2008).
+//  Le centre d'un texel du niveau N tombe exactement au coin de 2 × 2 texels du niveau N-1 : un
+//  échantillon bilinéaire y vaut leur moyenne (filtre boîte), coutures gérées par
+//  GL_TEXTURE_CUBE_MAP_SEAMLESS. Pas de glGenerateTextureMipmap (chemins lents selon les pilotes).
+#include "render/ibl_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_IblOut) writeonly uniform imageCube uDst;  // niveau N
+layout(binding = TEX_IblEnvironment) uniform samplerCube uSrc;          // même texture, niveau N-1
+
+uniform int uSrcLevel;
+
+void main() {
+    ivec3 id   = ivec3(gl_GlobalInvocationID);
+    int   size = imageSize(uDst).x;
+    if (id.x >= size || id.y >= size) return;
+    imageStore(uDst, id, textureLod(uSrc, CubeTexelDir(id.z, id.xy, size), float(uSrcLevel)));
+}

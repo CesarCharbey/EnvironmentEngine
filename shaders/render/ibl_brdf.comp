@@ -1,0 +1,46 @@
+#version 460 core
+//  shaders/render/ibl_brdf.comp                                        [DEV 2]
+//  LUT BRDF du split-sum (Karis 2013), calculée une seule fois : u = N·V, v = rugosité perceptuelle,
+//  sortie (A, B) telle que spéculaire = préfiltré × (F0 · A + B). Même BRDF que la lumière directe de
+//  deferred_lighting.frag : GGX + visibilité de Smith corrélée en hauteur (Heitz 2014, Filament).
+#include "render/ibl_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rg16f, binding = IMG_IblOut) writeonly uniform image2D uLutOut;
+
+const uint kSampleCount = 1024u;
+
+float V_SmithGGXCorrelatedLut(float NoV, float NoL, float a) {
+    float a2   = a * a;
+    float GGXL = NoV * sqrt((-NoL * a2 + NoL) * NoL + a2);
+    float GGXV = NoL * sqrt((-NoV * a2 + NoV) * NoV + a2);
+    return 0.5 / (GGXV + GGXL);
+}
+
+void main() {
+    ivec2 p    = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uLutOut);
+    if (any(greaterThanEqual(p, size))) return;
+
+    float NoV       = (float(p.x) + 0.5) / float(size.x);
+    float roughness = (float(p.y) + 0.5) / float(size.y);
+    float a         = roughness * roughness;
+    vec3  V         = vec3(sqrt(1.0 - NoV * NoV), 0.0, NoV);
+    vec3  N         = vec3(0.0, 0.0, 1.0);
+
+    vec2 r = vec2(0.0);
+    for (uint i = 0u; i < kSampleCount; ++i) {
+        vec3  H   = ImportanceSampleGGX(Hammersley(i, kSampleCount), a, N);
+        vec3  L   = 2.0 * dot(V, H) * H - V;
+        float NoL = clamp(L.z, 0.0, 1.0);
+        float NoH = clamp(H.z, 0.0, 1.0);
+        float VoH = clamp(dot(V, H), 0.0, 1.0);
+        if (NoL <= 0.0) continue;
+        // Estimateur : f · NoL / pdf, avec pdf = D · NoH / (4 · VoH) et f = D · Vis · F.
+        float Gv = V_SmithGGXCorrelatedLut(NoV, NoL, a) * 4.0 * NoL * VoH / max(NoH, 1e-6);
+        float Fc = pow(1.0 - VoH, 5.0);
+        r += vec2(Gv * (1.0 - Fc), Gv * Fc);
+    }
+    imageStore(uLutOut, p, vec4(r / float(kSampleCount), 0.0, 0.0));
+}

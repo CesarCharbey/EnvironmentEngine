@@ -1,0 +1,54 @@
+#version 460 core
+//  shaders/render/ibl_capture.comp                                     [DEV 2]
+//  IBL dynamique, étape 1 : capture du ciel dans le niveau 0 de la cubemap d'environnement
+//  (6 faces en un seul dispatch : aucune couture entre faces capturées à des instants différents).
+//
+//  * Au-dessus de l'horizon : la sky-view (Hillaire 2020, fond de ciel nocturne compris), exactement le
+//    ciel affiché. SANS les disques du soleil et de la lune : leur reflet spéculaire est déjà calculé
+//    analytiquement par la résolution différée (GGX) ; les inclure le compterait deux fois.
+//  * Sous l'horizon : la sky-view ne contient que l'air entre la caméra et le sol. On y ajoute le sol
+//    lui-même (albédo de l'atmosphère éclairé par le soleil, la lune et le ciel), atténué par l'air
+//    traversé : sans lui, l'hémisphère bas serait noir (faces tournées vers le bas, reflets rasants).
+#include "common/global_ubo.glsl"
+#include "render/atmo_common.glsl"
+#include "render/sky_lighting.glsl"
+#include "render/ibl_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_IblOut) writeonly uniform imageCube uEnvOut;
+
+uniform bool uIncludeGround;
+
+const float kHalfMax = 60000.0;  // borne du RGBA16F
+
+// Éclairement (lux) d'un sol horizontal : soleil + lune (transmittance au niveau du sol) + ciel.
+vec3 GroundIlluminance() {
+    vec3 sunDir  = normalize(envSunDirection());
+    vec3 moonDir = normalize(envMoonDirection());
+    return SunIlluminanceTOA()  * LightTransmittance(0.0, sunDir,  SunAngularRadius())  * max(sunDir.y, 0.0)
+         + MoonIlluminanceTOA() * LightTransmittance(0.0, moonDir, MoonAngularRadius()) * max(moonDir.y, 0.0)
+         + PI * SkyAverage();
+}
+
+// Luminance du sol vu dans la direction dir (dir.y < 0), atténuée par l'air jusqu'au point visé.
+vec3 GroundRadiance(vec3 dir, vec3 groundE) {
+    float Rb  = uAtmo.uRadiiAndScaleHeights.x;
+    float hKm = max(uEnv.cameraPosition.y * 0.001, PLANET_RADIUS_OFFSET);
+    // Distance au sol : plan horizontal, bornée par la distance de l'horizon géométrique.
+    float dKm = min(hKm / max(-dir.y, 1e-4), sqrt(2.0 * Rb * hKm + hKm * hKm));
+    vec3 scaR, scaM, ext;
+    SampleMediumKm(0.5 * hKm, scaR, scaM, ext);  // densité moyenne entre la caméra et le sol
+    return uAtmo.uGroundAlbedoAndTurb.xyz * groundE / PI * exp(-ext * dKm);
+}
+
+void main() {
+    ivec3 id   = ivec3(gl_GlobalInvocationID);
+    int   size = imageSize(uEnvOut).x;
+    if (id.x >= size || id.y >= size) return;
+
+    vec3 dir = CubeTexelDir(id.z, id.xy, size);
+    vec3 L   = SkyLuminance(dir);
+    if (uIncludeGround && dir.y < 0.0 && AtmoValid()) L += GroundRadiance(dir, GroundIlluminance());
+    imageStore(uEnvOut, id, vec4(min(L, vec3(kHalfMax)), 1.0));
+}

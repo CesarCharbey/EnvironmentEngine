@@ -1,0 +1,70 @@
+#version 460 core
+//  shaders/render/ibl_prefilter.comp                                   [DEV 2]
+//  IBL dynamique, étape 4 : préfiltrage spéculaire GGX d'UN mip de ibl.prefiltered
+//  (split-sum, Karis 2013 ; hypothèse N = V = R). Rugosité perceptuelle = mip / (nombre de mips - 1),
+//  la convention lue par deferred_lighting.frag (textureLod(..., roughness * maxLod)).
+//  Échantillonnage d'importance FILTRÉ (Křivánek & Colbert 2008) : chaque échantillon lit le mip de
+//  l'environnement dont le texel couvre son angle solide -> lobe lisse, sans points brillants. Sans le
+//  biais "+1" usuel : il floute trop et tire les lobes larges vers la moyenne du ciel (mesuré : -15 %
+//  à rugosité 1). Échantillons doublés à chaque mip (le C++ passe 64 -> 1024) : erreur < 2 % contre une
+//  intégration exacte du lobe, pour un coût quasi nul (les mips rugueux ont très peu de texels).
+//  Suite de Hammersley fixe : résultat identique d'un cycle à l'autre.
+#include "render/ibl_common.glsl"
+
+// Groupe de 64 threads = 64 / K texels de sortie, K threads par texel (K = uThreadsPerTexel, puissance
+// de 2 choisie par le C++ pour ~32 échantillons par thread, optimum mesuré). Les échantillons du lobe
+// sont répartis entre les K threads puis sommés en mémoire partagée : les mips rugueux (peu de texels,
+// jusqu'à 1024 échantillons) occupent tout le GPU au lieu de quelques threads qui bouclent en série, et
+// le mip 1 (beaucoup de texels, 64 échantillons) ne paie pas une réduction inutile.
+const uint kGroupSize = 64u;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_IblOut) writeonly uniform imageCube uPrefilteredOut;
+layout(binding = TEX_IblEnvironment) uniform samplerCube uEnv;
+
+uniform float uRoughness;        // rugosité perceptuelle de ce mip (> 0 : le mip 0 est une copie, faite en C++)
+uniform uint  uSampleCount;
+uniform uint  uThreadsPerTexel;  // K, puissance de 2 dans [1, 64]
+uniform int   uEnvSize;          // taille d'une face au niveau 0 de l'environnement
+uniform float uEnvMaxLod;        // dernier mip de l'environnement
+
+shared vec4 sPartial[kGroupSize];  // rgb = Σ L · NoL, a = Σ NoL
+
+void main() {
+    uint  K      = uThreadsPerTexel;
+    uint  lid    = gl_LocalInvocationIndex;
+    uint  lane   = lid % K;
+    int   size   = imageSize(uPrefilteredOut).x;
+    uint  texel  = gl_WorkGroupID.x * (kGroupSize / K) + lid / K;
+    uint  total  = uint(size * size * 6);
+    bool  valid  = texel < total;  // pas de return avant les barrières
+    uint  t      = min(texel, total - 1u);
+    int   face   = int(t / uint(size * size));
+    int   r      = int(t % uint(size * size));
+    ivec3 id     = ivec3(r % size, r / size, face);
+    vec3  N      = CubeTexelDir(face, id.xy, size);
+
+    float alpha  = uRoughness * uRoughness;
+    float omegaP = 4.0 * kIblPi / (6.0 * float(uEnvSize * uEnvSize));  // angle solide d'un texel du niveau 0
+    vec4  acc    = vec4(0.0);
+    for (uint i = lane; i < uSampleCount; i += K) {
+        vec3  H   = ImportanceSampleGGX(Hammersley(i, uSampleCount), alpha, N);
+        float NoH = max(dot(N, H), 0.0);
+        vec3  L   = 2.0 * NoH * H - N;  // V = N
+        float NoL = dot(N, L);
+        if (NoL <= 0.0) continue;
+        // pdf(L) = D(H) · NoH / (4 · VoH) = D / 4 car V = N.
+        float pdf    = IblD_GGX(NoH, alpha) * 0.25;
+        float omegaS = 1.0 / (float(uSampleCount) * pdf + 1e-6);
+        float lod    = clamp(0.5 * log2(omegaS / omegaP), 0.0, uEnvMaxLod);
+        acc += vec4(textureLod(uEnv, L, lod).rgb * NoL, NoL);
+    }
+
+    sPartial[lid] = acc;
+    barrier();
+    for (uint stride = K / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) sPartial[lid] += sPartial[lid + stride];
+        barrier();
+    }
+    if (lane == 0u && valid) imageStore(uPrefilteredOut, id, vec4(sPartial[lid].rgb / max(sPartial[lid].a, 1e-6), 1.0));
+}

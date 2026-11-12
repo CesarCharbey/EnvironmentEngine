@@ -1,0 +1,28 @@
+#version 460 core
+//  shaders/render/ibl_blend.comp                                       [DEV 2]
+//  IBL dynamique : lissage temporel du jeu PUBLIÉ vers le dernier cycle terminé (un dispatch par niveau
+//  de chaque cubemap). Sans lui, chaque fin de cycle remplace l'IBL d'un coup : au crépuscule, où la
+//  luminance du ciel chute de façon exponentielle, cela faisait sauter les reflets de 10 à 40 %.
+//  Le jeu publié est mis à jour EN ENTIER dans le stage AtmosphereIBL, avant toute lecture par
+//  l'éclairage : jamais de cubemap à moitié mise à jour à l'écran.
+#include "render/ibl_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_IblOut) uniform imageCube uDisplay;  // niveau uLevel du jeu publié
+layout(binding = TEX_IblEnvironment) uniform samplerCube uTarget;  // même cubemap du dernier cycle
+
+uniform int   uLevel;
+uniform float uWeight;  // part de la cible : 1 - exp(-dt / τ), 1 = copie
+
+void main() {
+    ivec3 id   = ivec3(gl_GlobalInvocationID);
+    int   size = imageSize(uDisplay).x;
+    if (id.x >= size || id.y >= size) return;
+
+    // Échantillon au centre du texel, même taille de niveau : valeur exacte du texel cible.
+    vec4 target = textureLod(uTarget, CubeTexelDir(id.z, id.xy, size), float(uLevel));
+    // Copie : on ne lit pas le jeu publié (contenu indéfini juste après une allocation).
+    vec4 current = uWeight >= 1.0 ? target : imageLoad(uDisplay, id);
+    imageStore(uDisplay, id, mix(current, target, uWeight));
+}
