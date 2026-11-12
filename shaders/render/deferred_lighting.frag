@@ -12,6 +12,8 @@
 //    automatique provisoire + ACES encode directement scene.color pour le Viewport.
 #include "common/global_ubo.glsl"
 #include "render/atmo_common.glsl"
+#include "render/sky_lighting.glsl"   // ciel, transmittance, éclairements (partagés avec la voxélisation)
+#include "render/voxel_common.glsl"   // VXGI : placement de voxel.grid + cone tracing (ADR-008)
 
 in vec2 vUv;
 layout(location = 0) out vec4 oColor;
@@ -20,8 +22,6 @@ layout(binding = TEX_GBufferAlbedo)     uniform sampler2D   uGAlbedo;    // SRGB
 layout(binding = TEX_GBufferNormal)     uniform sampler2D   uGNormal;    // RGBA16F : xyz normale monde
 layout(binding = TEX_GBufferMaterial)   uniform sampler2D   uGMaterial;  // RGBA8 : r rugosité, g métal, b humidité, a id
 layout(binding = TEX_GBufferDepth)      uniform sampler2D   uGDepth;     // DEPTH32F reverse-Z
-layout(binding = TEX_AtmoTransmittance) uniform sampler2D   uTransmittanceLUT;
-layout(binding = TEX_AtmoSkyView)       uniform sampler2D   uSkyViewLUT;
 layout(binding = TEX_IblIrradiance)     uniform samplerCube uIblIrradiance;   // convention : radiance diffuse (E / π)
 layout(binding = TEX_IblPrefiltered)    uniform samplerCube uIblPrefiltered;  // mip = rugosité perceptuelle
 layout(binding = TEX_IblBrdfLut)        uniform sampler2D   uIblBrdfLut;      // (NoV, rugosité) -> (scale, bias)
@@ -29,7 +29,6 @@ layout(binding = TEX_CloudShadow)       uniform sampler2D   uCloudShadow;     //
 layout(binding = TEX_HeightNormal)      uniform sampler2D   uFocusHeight;     // world.focus.heightNormal (R = hauteur)
 
 uniform bool  uGBufferAvailable;
-uniform bool  uAtmoAvailable;
 uniform bool  uIblAvailable;
 uniform bool  uCloudShadowAvailable;
 uniform bool  uApplyFallbackExposure;
@@ -37,7 +36,14 @@ uniform bool  uSpecularOcclusion;
 uniform float uSunScale;
 uniform float uMoonScale;
 uniform float uIblScale;
-uniform int   uDebugView;              // 0 Lit, 1 Albedo, 2 Normal, 3 Roughness, 4 Metal, 5 AO, 6 Depth, 7 IBL only, 8 Sun only, 9 Shadows
+uniform int   uDebugView;              // 0 Lit, 1 Albedo, 2 Normal, 3 Roughness, 4 Metal, 5 AO, 6 Depth, 7 IBL only,
+                                       // 8 Sun only, 9 Shadows, 10 VXAO, 11 VXGI (indirect)
+// VXGI (ADR-008)
+uniform bool  uVoxelAvailable;         // voxel.grid publiée (VoxelIlluminationSystem)
+uniform bool  uVoxelShadows;           // ombre lointaine par cône vers le soleil / la lune
+uniform bool  uVoxelGI;                // VXAO + rebond diffus (5 cônes)
+uniform float uGiIntensity;            // multiplicateur de la lumière indirecte des voxels
+uniform float uVoxelShadowSoftness;    // tangente du demi-angle du cône d'ombre (pénombre)
 uniform float uExposureCompensation;   // EV ajoutés à l'exposition automatique provisoire
 uniform float uNightAdaptation;        // [0, 1] part de l'obscurité compensée par l'exposition (EV < 0)
 uniform bool  uMoonlightShift;         // léger virage bleu-argenté en basse lumière (garde >= 75 % de saturation)
@@ -69,47 +75,6 @@ float AngleBetween(vec3 a, vec3 b) { return 2.0 * asin(clamp(length(a - b) * 0.5
 
 // Taille angulaire d'un pixel (rad) : sert d'anticrénelage aux bords des disques, sans dérivées.
 float PixelAngle() { return 2.0 * uEnv.cameraParams.z * uEnv.viewportSize.w; }
-
-// =============================================================================
-// Atmosphère
-// =============================================================================
-bool AtmoValid() {
-    // L'UBO AtmosphereParams est lié par CelestialAtmosphereSystem : on vérifie qu'il est cohérent.
-    return uAtmoAvailable && uAtmo.uRadiiAndScaleHeights.x > 0.0
-        && uAtmo.uRadiiAndScaleHeights.y > uAtmo.uRadiiAndScaleHeights.x;
-}
-
-// Luminance du ciel (cd/m², sans les disques) dans la direction dir.
-vec3 SkyLuminance(vec3 dir) {
-    if (!AtmoValid()) return vec3(0.0);
-    return texture(uSkyViewLUT, SkyViewDirToUV(dir, AtmoViewRadiusKm(), uAtmo.uRadiiAndScaleHeights.x)).rgb;
-}
-
-// Idem, direction remontée au-dessus de l'horizon : sous l'horizon la LUT ne contient que l'air
-// entre la caméra et le sol, pas le sol lui-même. Utilisé pour l'ambiant et le brouillard.
-vec3 SkyLuminanceAbove(vec3 dir) {
-    dir.y = max(dir.y, 0.03);
-    return SkyLuminance(normalize(dir));
-}
-
-// Transmittance atmosphère × ombre de la planète, d'un point d'altitude altM (m) vers un astre de
-// rayon angulaire angR (rad). Repère local planète : +Y = zénith, donc mu = lightDir.y.
-// Calculs par altitude (et non par rayon r ≈ 6360 km) : stables au mètre près.
-vec3 LightTransmittance(float altM, vec3 lightDir, float angR) {
-    if (!AtmoValid()) return vec3(smoothstep(-0.02, 0.02, lightDir.y));
-    float Rb  = uAtmo.uRadiiAndScaleHeights.x;
-    float Rt  = uAtmo.uRadiiAndScaleHeights.y;
-    float hKm = clamp(altM * 0.001, 0.0, Rt - Rb);
-    return texture(uTransmittanceLUT, TransmittanceParamsToUVAlt(hKm, lightDir.y, Rb, Rt)).rgb
-         * PlanetShadowAlt(hKm, lightDir.y, Rb, angR);
-}
-
-float SunAngularRadius()  { return uEnv.sunColorAngular.a; }
-float MoonAngularRadius() { return uEnv.moonParams.y; }
-
-// Éclairements au sommet de l'atmosphère (lux). Clair de lune : teinte bleu-argenté (luminance conservée).
-vec3 SunIlluminanceTOA()  { return uEnv.sunColorAngular.rgb * uEnv.sunDirIlluminance.w; }
-vec3 MoonIlluminanceTOA() { return MOONLIGHT_TINT * uEnv.moonParams.x; }
 
 // =============================================================================
 // Disques des astres
@@ -375,20 +340,63 @@ float ComputeTerrainAndContactShadow(vec3 worldPos, vec3 normal, vec3 lightDir, 
                ContactShadow(worldPos, normal, lightDir, dist, noise));
 }
 
-// Ciel moyen (cd/m²) : zénith + 4 directions à 15° d'élévation (cos 0.966, sin 0.259).
-vec3 SkyAverage() {
-    vec3 ring = vec3(0.0);
-    for (int i = 0; i < 4; ++i) {
-        float az = (float(i) + 0.5) * 0.5 * PI;
-        ring += SkyLuminance(vec3(0.966 * sin(az), 0.259, -0.966 * cos(az)));
+// =============================================================================
+// VXGI (ADR-008) : cone tracing dans voxel.grid
+// =============================================================================
+bool VoxelGridUsable(vec3 P) {
+    return uVoxelAvailable && uVoxel.uGridExtent.w > 0.5 && VoxelUvwInside(VoxelUvw(P, uVoxel.uGridMin.xyz));
+}
+
+// Ombre LOINTAINE : cône fin vers l'astre, à partir d'un voxel et demi (en deçà, la grille de 8 m
+// s'auto-occulterait ; l'ombre proche est assurée par le heightfield + le contact écran).
+float VoxelShadow(vec3 P, vec3 N, vec3 L) {
+    if (!uVoxelShadows || !VoxelGridUsable(P)) return 1.0;
+    float voxel = VoxelSize();
+    return VoxelConeVisibility(uVoxel.uGridMin.xyz, P + N * (0.5 * voxel), L, uVoxelShadowSoftness,
+                               1.5 * voxel, 2000.0, 40);
+}
+
+// VXAO + rebond diffus : 5 cônes (normale + 4 inclinés de 60°, ouverture 60° -> tan 30° = 0.577),
+// pondérés par le cosinus. Chaque cône ramène la lumière des voxels rencontrés ; la part non occultée
+// voit le ciel. Résultat : radiance diffuse entrante moyenne (E/π) et visibilité du ciel (VXAO).
+vec3  gVxgiRadiance = vec3(0.0);
+float gVxao         = 1.0;
+
+bool VoxelDiffuse(vec3 P, vec3 N, out vec3 radiance, out float visibility) {
+    radiance   = vec3(0.0);
+    visibility = 1.0;
+    if (!uVoxelGI || !VoxelGridUsable(P)) return false;
+
+    vec3 T = normalize(cross(abs(N.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0), N));
+    vec3 B = cross(N, T);
+    const float kTanHalf = 0.577;
+    const float kSinTilt = 0.866, kCosTilt = 0.5;  // 60°
+    vec3  dirs[5]    = vec3[5](N, N * kCosTilt + T * kSinTilt, N * kCosTilt - T * kSinTilt,
+                               N * kCosTilt + B * kSinTilt, N * kCosTilt - B * kSinTilt);
+    const float w[5] = float[5](1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0);  // ∝ cos, somme = 1
+
+    float voxel  = VoxelSize();
+    vec3  origin = P + N * voxel;  // hors du voxel de surface (sinon auto-occlusion)
+    visibility = 0.0;
+    for (int i = 0; i < 5; ++i) {
+        vec4 c = VoxelConeRadiance(uVoxel.uGridMin.xyz, origin, dirs[i], kTanHalf, 0.5 * voxel, 256.0, 8);
+        radiance   += w[i] * (c.rgb * uGiIntensity + (1.0 - c.a) * SkyLuminanceAbove(dirs[i]));
+        visibility += w[i] * (1.0 - c.a);
     }
-    return 0.5 * SkyLuminance(vec3(0.0, 1.0, 0.0)) + 0.125 * ring;
+    return true;
 }
 
 // Éclairage ambiant : radiance diffuse (E/π) et radiance spéculaire déjà pondérée par la BRDF.
-void Ambient(Surface s, vec3 V, out vec3 diffuse, out vec3 specular) {
+void Ambient(Surface s, vec3 P, vec3 V, out vec3 diffuse, out vec3 specular) {
     float NoV = max(dot(s.N, V), 1e-4);
     vec3  R   = reflect(-V, s.N);
+
+    // VXGI disponible : il remplace le diffus (IBL ou repli sky-view) et occulte le spéculaire.
+    vec3  vxRadiance;
+    float vxVisibility;
+    bool  hasVoxelGI = VoxelDiffuse(P, s.N, vxRadiance, vxVisibility);
+    gVxgiRadiance = vxRadiance;
+    gVxao         = vxVisibility;
 
     if (uIblAvailable) {
         // Split-sum (Karis 2013)
@@ -396,8 +404,15 @@ void Ambient(Surface s, vec3 V, out vec3 diffuse, out vec3 specular) {
         float maxLod = float(textureQueryLevels(uIblPrefiltered) - 1);
         vec3 prefiltered = textureLod(uIblPrefiltered, R, s.roughness * maxLod).rgb;
         vec2 brdf = texture(uIblBrdfLut, vec2(NoV, s.roughness)).rg;
-        diffuse  = irradiance * s.diffuseColor;
-        specular = prefiltered * (s.f0 * brdf.x + brdf.y);
+        diffuse  = (hasVoxelGI ? vxRadiance : irradiance) * s.diffuseColor;
+        specular = prefiltered * (s.f0 * brdf.x + brdf.y) * (hasVoxelGI ? vxVisibility : 1.0);
+    } else if (hasVoxelGI) {
+        // VXGI : rebond coloré des voxels + ciel non occulté ; le spéculaire (ciel réfléchi) est occulté
+        // par la visibilité du ciel (VXAO), faute de cône de réflexion dédié.
+        vec3 specL = mix(SkyLuminanceAbove(R) * vxVisibility, vxRadiance, s.alpha);
+        vec2 ab = EnvBrdfApprox(NoV, s.roughness);
+        diffuse  = vxRadiance * s.diffuseColor;
+        specular = specL * (s.f0 * ab.x + ab.y);
     } else {
         // Repli physique sur la sky-view (mêmes unités cd/m² que le ciel affiché).
         // Ambiant hémisphérique doux : ciel (moyenne + direction de la normale) au-dessus, rebond du sol
@@ -543,7 +558,7 @@ void main() {
     vec3  dndx         = dFdx(gNormalRaw);
     vec3  dndy         = dFdy(gNormalRaw);
     float kernelAlpha2 = min(2.0 * kSpecAaSigma2 * (dot(dndx, dndx) + dot(dndy, dndy)), kSpecAaKappa);
-    bool  isDataView = (uDebugView >= 1 && uDebugView <= 6) || uDebugView == 9;
+    bool  isDataView = (uDebugView >= 1 && uDebugView <= 6) || uDebugView == 9 || uDebugView == 10;
     vec3  rayDir = envViewRayWorld(vUv);
     vec3  color;
 
@@ -583,9 +598,17 @@ void main() {
         // --- Lumières directes ---
         vec3 sunDir  = normalize(envSunDirection());
         vec3 moonDir = normalize(envMoonDirection());
-        // Ombres portées (relief + contact), évaluées seulement si l'astre est au-dessus de l'horizon.
-        float sunShadow  = sunDir.y  > -0.01 ? ComputeTerrainAndContactShadow(P, s.N, sunDir,  vUv) : 0.0;
-        float moonShadow = moonDir.y > -0.01 ? ComputeTerrainAndContactShadow(P, s.N, moonDir, vUv) : 0.0;
+        // Ombres portées = min(proche, lointaine) :
+        //  * proche : heightfield 1 m du chunk focus + contact écran (arbres, petits reliefs) ;
+        //  * lointaine : cône dans voxel.grid (ADR-008), tous chunks confondus, jusqu'à ~1 km.
+        // Évaluées seulement si l'astre est levé ET éclaire la face (N·L > 0) : sinon la lumière directe
+        // est nulle de toute façon. La lune n'a son cône voxel que la nuit (de jour, elle est négligeable).
+        bool  sunLit     = sunDir.y  > -0.01 && dot(s.N, sunDir)  > 0.0;
+        bool  moonLit    = moonDir.y > -0.01 && dot(s.N, moonDir) > 0.0;
+        float sunShadow  = sunLit  ? min(ComputeTerrainAndContactShadow(P, s.N, sunDir, vUv),
+                                         VoxelShadow(P, s.N, sunDir)) : 0.0;
+        float moonShadow = moonLit ? ComputeTerrainAndContactShadow(P, s.N, moonDir, vUv) : 0.0;
+        if (moonLit && sunDir.y < 0.05) moonShadow = min(moonShadow, VoxelShadow(P, s.N, moonDir));
         vec3 sunE  = SunIlluminanceTOA()  * LightTransmittance(P.y, sunDir, SunAngularRadius())
                    * CloudShadow(P, sunDir) * sunShadow * uSunScale;
         vec3 moonE = MoonIlluminanceTOA() * LightTransmittance(P.y, moonDir, MoonAngularRadius())
@@ -595,7 +618,7 @@ void main() {
 
         // --- Ambiant ---
         vec3 ambD, ambS;
-        Ambient(s, V, ambD, ambS);
+        Ambient(s, P, V, ambD, ambS);
         vec3 ambient = (ambD + ambS) * uIblScale;
 
         float dist = length(envCameraPosition() - P);
@@ -609,6 +632,8 @@ void main() {
             case 7:  color = ambient; break;
             case 8:  color = sunL; break;
             case 9:  color = vec3(sunShadow, moonShadow, sunShadow); break;  // blanc = éclairé, vert = lune seule
+            case 10: color = vec3(gVxao); break;                             // VXAO : 1 = ciel entièrement visible
+            case 11: color = gVxgiRadiance; break;                           // lumière indirecte reçue (E/π)
             default: color = ApplyHeightFog(sunL + moonL + ambient, P, rayDir, dist); break;
         }
     }

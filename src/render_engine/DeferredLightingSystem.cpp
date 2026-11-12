@@ -23,6 +23,7 @@
 #include <glm/glm.hpp>
 #include <entt/entt.hpp>
 
+#include <cmath>
 #include <string_view>
 
 #include "contracts/ISystemModule.hpp"
@@ -62,6 +63,7 @@ public:
         iblAvailable_  = bb.IsPublished(env::bb::IblIrradiance) && bb.IsPublished(env::bb::IblPrefiltered) &&
                          bb.IsPublished(env::bb::IblBrdfLUT);
         cloudShadowAvailable_  = bb.IsPublished(env::bb::CloudShadowMap);
+        voxelAvailable_        = bb.IsPublished(env::bb::VoxelGrid);  // VoxelIlluminationSystem (ADR-008)
         // Valeurs physiques (ciel ~1e4 cd/m²) : sans passe de tonemap, scene.color saturerait en blanc.
         applyFallbackExposure_ = !bb.IsPublished(env::bb::SceneDisplay);
 
@@ -102,6 +104,8 @@ public:
         bb.BindTexture(env::bb::CloudShadowMap,         tex::CloudShadow);
         // Lecture seule de la carte de hauteur du chunk focus (slot Dev 1 existant) : ombres du relief.
         bb.BindTexture(env::bb::WorldFocusHeightNormal, tex::HeightNormal);
+        // VXGI : grille publiée ce frame ; son placement est dans UBO_VoxelParams (lié par le producteur).
+        bb.BindTexture(env::bb::VoxelGrid, tex::VoxelGrid);
 
         const gpu::ShaderProgram& p = *program_;
         p.Set("uGBufferAvailable",      gbufferAvailable_);
@@ -114,6 +118,11 @@ public:
         p.Set("uMoonScale",             moonScale_);
         p.Set("uIblScale",              iblScale_);
         p.Set("uDebugView",             debugView_);
+        p.Set("uVoxelAvailable",        voxelAvailable_);
+        p.Set("uVoxelShadows",          voxelShadows_);
+        p.Set("uVoxelGI",               voxelGI_);
+        p.Set("uGiIntensity",           giIntensity_);
+        p.Set("uVoxelShadowSoftness",   std::tan(glm::radians(voxelShadowSoftnessDeg_)));
         p.Set("uExposureCompensation",  exposureCompensationEv_);
         p.Set("uNightAdaptation",       nightAdaptation_);
         p.Set("uMoonlightShift",        moonlightShift_);
@@ -159,6 +168,7 @@ public:
         StatusLine("IBL", iblAvailable_, "repli sur la sky-view");
         StatusLine("Ombre des nuages", cloudShadowAvailable_, "pas d'ombre");
         StatusLine("Chunk focus (ombres du relief)", focusAvailable_, "pas d'ombre du relief");
+        StatusLine("Grille VXGI (voxel.grid)", voxelAvailable_, "ni ombre lointaine ni GI");
         StatusLine("scene.display (tonemap)", !applyFallbackExposure_, "exposition + ACES provisoires");
 
         ImGui::SeparatorText("Eclairage");
@@ -167,8 +177,17 @@ public:
         ImGui::SliderFloat("Intensite IBL", &iblScale_, 0.0f, 4.0f);
         ImGui::Checkbox("Occlusion speculaire", &specularOcclusion_);
         static const char* kViews[] = {"Lit", "Albedo", "Normal", "Roughness", "Metal", "AO", "Depth", "IBL only",
-                                       "Sun only", "Shadows"};
+                                       "Sun only", "Shadows", "VXAO", "VXGI (indirect)"};
         ImGui::Combo("Vue de debug", &debugView_, kViews, IM_ARRAYSIZE(kViews));
+
+        ImGui::SeparatorText("VXGI (ADR-008)");
+        ImGui::Checkbox("Ombres lointaines (cone)", &voxelShadows_);
+        ImGui::SameLine();
+        ImGui::Checkbox("VXAO + GI", &voxelGI_);
+        ImGui::SliderFloat("Intensite GI", &giIntensity_, 0.0f, 4.0f);
+        ImGui::SetItemTooltip("Multiplicateur du rebond de lumiere des voxels (1 = physique).");
+        ImGui::SliderFloat("Penombre lointaine", &voxelShadowSoftnessDeg_, 0.5f, 10.0f, "%.1f deg");
+        ImGui::SetItemTooltip("Demi-angle du cone d'ombre : la penombre s'elargit avec la distance a l'occultant.");
 
         ImGui::SeparatorText("Ombres portees");
         ImGui::Checkbox("Relief (heightfield)", &terrainShadows_);
@@ -210,6 +229,7 @@ private:
     bool atmoAvailable_         = false;
     bool iblAvailable_          = false;
     bool cloudShadowAvailable_  = false;
+    bool voxelAvailable_        = false;
     bool applyFallbackExposure_ = true;
     bool      focusAvailable_   = false;
     glm::vec3 focusChunkOrigin_{0.0f};
@@ -227,6 +247,10 @@ private:
     bool  terrainShadows_         = true;
     bool  contactShadows_         = true;
     float shadowPenumbraDeg_      = 1.0f;
+    bool  voxelShadows_           = true;
+    bool  voxelGI_                = true;
+    float giIntensity_            = 1.0f;
+    float voxelShadowSoftnessDeg_ = 2.3f;   // tan ≈ 0,04
     float fogHeightFalloff_       = 0.005f;   // hauteur d'échelle 200 m
     float cloudLayerAltitude_     = 2000.0f;
     float cloudShadowExtent_      = 10000.0f;

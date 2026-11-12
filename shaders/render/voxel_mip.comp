@@ -1,0 +1,34 @@
+#version 460 core
+//  shaders/render/voxel_mip.comp                                       [DEV 2]
+//  Génération des mips de voxel.grid (ADR-008), un dispatch par niveau.
+//  Remplace glGenerateTextureMipmap : sur NVIDIA, la génération des mips d'une texture 3D RGBA16F
+//  passe par un chemin lent (~30 ms mesurés pour 256 × 64 × 256), contre quelques µs ici.
+//
+//  Moyenne 2 × 2 × 2 du niveau source (radiance PRÉ-MULTIPLIÉE + opacité : la moyenne est correcte).
+//  Quand un axe est épuisé (Y = 64 voxels atteint 1 au niveau 6), seuls les enfants existants comptent.
+//  Lecture du niveau N-1 par texelFetch, écriture du niveau N par image : niveaux distincts, pas de
+//  boucle de rétroaction ; une barrière sépare chaque niveau (côté C++).
+
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(rgba16f, binding = IMG_AtmoLutOut) writeonly uniform image3D uDst;  // niveau N
+layout(binding = TEX_VoxelGrid) uniform sampler3D uSrc;                     // même texture, niveau N-1
+
+uniform int uSrcLevel;
+
+void main() {
+    ivec3 p       = ivec3(gl_GlobalInvocationID);
+    ivec3 dstSize = imageSize(uDst);
+    if (any(greaterThanEqual(p, dstSize))) return;
+
+    ivec3 srcSize = textureSize(uSrc, uSrcLevel);
+    vec4  sum     = vec4(0.0);
+    float count   = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        ivec3 q = 2 * p + ivec3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        if (any(greaterThanEqual(q, srcSize))) continue;
+        sum   += texelFetch(uSrc, q, uSrcLevel);
+        count += 1.0;
+    }
+    imageStore(uDst, p, sum / max(count, 1.0));
+}

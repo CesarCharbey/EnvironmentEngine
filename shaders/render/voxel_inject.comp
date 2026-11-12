@@ -1,0 +1,254 @@
+#version 460 core
+//  shaders/render/voxel_inject.comp                                    [DEV 2]
+//  Voxélisation VXGI (ADR-008) : matière + éclairage direct injectés dans la grille 3D courante.
+//  Dispatché une fois par chunk qui recouvre la grille (VoxelIlluminationSystem).
+//
+//  uPass 0 — terrain : un thread par COLONNE de voxels du chunk (32 × 32 colonnes de 8 m).
+//    * hauteur / normale moyennes de la colonne (boîte de 8 m) ;
+//    * voxels sous la surface pleins (opacité 1, voxel de surface partiel) : aucune fuite de lumière
+//      à travers une pente plus fine qu'un voxel ;
+//    * seule la "peau" (surface + flancs exposés des falaises) porte de la radiance, l'intérieur est noir ;
+//    * éclairage évalué UNE fois par colonne (et non par voxel) : soleil, lune et ciel, ombrés par des
+//      cônes tracés dans la grille de la frame PRÉCÉDENTE (pas de dépendance circulaire).
+//  uPass 1 — végétation, accumulation : un thread par instance ; arbres, buissons et rochers ajoutent
+//    leur épaisseur optique (-ln(1 - opacité)) au voxel, par archétype, en virgule fixe dans un tampon
+//    d'entiers (SSBO_Dev2Scratch). L'addition atomique saturée est commutative : le résultat ne dépend
+//    pas de l'ordre des threads. (Une composition "over" par imageLoad/imageStore perdait des plantes
+//    au hasard des courses entre threads : grille différente à chaque frame -> scintillement des ombres
+//    et du VXAO.) L'herbe est trop fine pour des voxels de 8 m.
+//  uPass 2 — végétation, résolution : un thread par voxel de la tranche Y du chunk ; chaque voxel touché
+//    est éclairé une fois et composé derrière le terrain, puis son entrée du tampon est remise à zéro.
+#include "common/global_ubo.glsl"
+#include "render/atmo_common.glsl"
+#include "render/sky_lighting.glsl"
+#include "render/voxel_common.glsl"
+#include "render/terrain_material.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Grille courante (lecture-écriture : la passe végétation compose sur le terrain).
+layout(rgba16f, binding = IMG_AtmoLutOut) uniform image3D uGridOut;
+
+layout(binding = TEX_HeightNormal) uniform sampler2D uHeightNormal;
+layout(binding = TEX_BiomeHydro)   uniform sampler2D uBiomeHydro;
+
+layout(std430, binding = SSBO_FoliageInstances) readonly buffer FoliageInstanceBuffer {
+    FoliageInstance instances[];
+};
+layout(std430, binding = SSBO_FoliageIndirectCmds) readonly buffer FoliageCommandBuffer {
+    DrawElementsIndirectCommand commands[];
+};
+
+// Épaisseur optique de la végétation par voxel de la grille : 3 champs de 10 bits (arbres, buissons,
+// rochers) en virgule fixe. Index = x + dimX * (y + dimY * z). Remis à zéro par la passe 2.
+layout(std430, binding = SSBO_Dev2Scratch) buffer FoliageAccumBuffer {
+    uint foliageAccum[];
+};
+
+uniform int   uPass;              // 0 = terrain, 1 = végétation (accumulation), 2 = végétation (résolution)
+uniform vec3  uChunkOffset;       // coin du chunk relatif à l'origine de rendu (m)
+uniform uint  uInstanceCapacity;  // taille du SSBO d'instances du chunk
+uniform uint  uCommandCount;      // nombre de commandes indirectes (archétypes)
+uniform float uFoliageDensity;    // multiplicateur d'opacité de la végétation
+uniform ivec2 uFoliageYRange;     // tranche Y (voxels) traitée par les passes 1 ET 2 pour ce chunk
+
+const float kMaxRadiance = 60000.0;  // borne du RGBA16F
+
+const uint  kTauBits  = 10u;
+const uint  kTauMax   = (1u << kTauBits) - 1u;
+const float kTauScale = 64.0;  // 1 LSB = 1/64 d'épaisseur optique ; saturation à 16 (opacité 1 - 1e-7)
+
+// Archétypes voxélisés : albédo, opacité d'UNE plante dans un voxel de 8 m (fraction de la section
+// couverte), hauteur (m, × échelle de l'instance), wrap (feuillage qui diffuse vers l'arrière).
+const vec3 kTreeAlbedo  = vec3(0.04, 0.11, 0.04);
+const vec3 kShrubAlbedo = vec3(0.08, 0.17, 0.05);
+const vec3 kRockAlbedo  = vec3(0.25, 0.24, 0.22);
+const float kPlantWrap  = 0.5;
+
+// Éclairement (lux) reçu en p, de normale n, ombré dans la grille précédente.
+// wrap > 0 : éclairage "enveloppant" (feuillage qui diffuse la lumière vers l'arrière).
+vec3 InjectedIrradiance(vec3 p, vec3 n, float wrap) {
+    float voxel     = VoxelSize();
+    bool  prevValid = uVoxel.uPrevGridMin.w > 0.5;
+    vec3  prevMin   = uVoxel.uPrevGridMin.xyz;
+    vec3  origin    = p + n * (0.75 * voxel);
+    vec3  E         = vec3(0.0);
+
+    vec3  sunDir = normalize(envSunDirection());
+    float sunNdl = (dot(n, sunDir) + wrap) / (1.0 + wrap);
+    if (sunDir.y > -0.02 && sunNdl > 0.0) {
+        float vis = prevValid ? VoxelConeVisibility(prevMin, origin, sunDir, 0.04, 0.75 * voxel, 2000.0, 40) : 1.0;
+        E += SunIlluminanceTOA() * LightTransmittance(p.y, sunDir, SunAngularRadius()) * sunNdl * vis;
+    }
+
+    // La lune ne compte que lorsque le soleil est couché (sinon négligeable : économise un cône).
+    vec3  moonDir = normalize(envMoonDirection());
+    float moonNdl = (dot(n, moonDir) + wrap) / (1.0 + wrap);
+    if (sunDir.y < 0.05 && moonDir.y > -0.02 && moonNdl > 0.0) {
+        float vis = prevValid ? VoxelConeVisibility(prevMin, origin, moonDir, 0.04, 0.75 * voxel, 2000.0, 40) : 1.0;
+        E += MoonIlluminanceTOA() * LightTransmittance(p.y, moonDir, MoonAngularRadius()) * moonNdl * vis;
+    }
+
+    // Ciel : éclairement hémisphérique ≈ π × luminance moyenne, occulté par un cône large vers le haut.
+    vec3  skyDir = normalize(n + vec3(0.0, 1.0, 0.0));
+    float skyVis = prevValid ? VoxelConeVisibility(prevMin, origin, skyDir, 0.577, 0.5 * voxel, 256.0, 8) : 1.0;
+    E += PI * SkyAverage() * skyVis * (0.5 + 0.5 * n.y);
+    return E;
+}
+
+// -----------------------------------------------------------------------------
+// Passe 0 : terrain
+// -----------------------------------------------------------------------------
+void InjectTerrainColumn(uint column) {
+    float voxel   = VoxelSize();
+    int   columns = int(CHUNK_SIZE_METERS / voxel + 0.5);  // 32 colonnes par côté
+    if (column >= uint(columns * columns)) return;
+
+    ivec2 c        = ivec2(int(column) % columns, int(column) / columns);
+    vec2  local    = (vec2(c) + 0.5) * voxel;                   // centre de la colonne dans le chunk (m)
+    vec3  colWorld = uChunkOffset + vec3(local.x, 0.0, local.y);
+    ivec3 dim      = imageSize(uGridOut);
+    ivec2 g        = ivec2(floor((colWorld.xz - uVoxel.uGridMin.xz) / voxel));
+    if (any(lessThan(g, ivec2(0))) || any(greaterThanEqual(g, dim.xz))) return;
+
+    // Hauteur et normale moyennes de la colonne : 4 échantillons bilinéaires à ±voxel/4 ≈ boîte de 8 m.
+    vec2  uv = local / CHUNK_SIZE_METERS;
+    float q  = 0.25 * voxel / CHUNK_SIZE_METERS;
+    vec4  hn = 0.25 * (textureLod(uHeightNormal, uv + vec2(-q, -q), 0.0) + textureLod(uHeightNormal, uv + vec2(q, -q), 0.0)
+                     + textureLod(uHeightNormal, uv + vec2(-q,  q), 0.0) + textureLod(uHeightNormal, uv + vec2(q,  q), 0.0));
+    float h  = hn.r;
+    vec3  N  = normalize(hn.gba);
+
+    // Plus basse surface voisine : les voxels au-dessus sont des flancs exposés (falaises) -> peau.
+    float s = voxel / CHUNK_SIZE_METERS;
+    float hMinNeighbor = min(min(textureLod(uHeightNormal, uv + vec2(s, 0.0), 0.0).r,
+                                 textureLod(uHeightNormal, uv - vec2(s, 0.0), 0.0).r),
+                             min(textureLod(uHeightNormal, uv + vec2(0.0, s), 0.0).r,
+                                 textureLod(uHeightNormal, uv - vec2(0.0, s), 0.0).r));
+    hMinNeighbor = min(hMinNeighbor, h);
+
+    float gridY0 = uVoxel.uGridMin.y;
+    int   yTop   = min(int(floor((h - gridY0) / voxel)), dim.y - 1);
+    if (yTop < 0) return;  // terrain entièrement sous la grille
+    int   ySkin  = int(floor((hMinNeighbor - gridY0) / voxel)) - 1;
+
+    // Matériau identique à la G-pass, + neige de la météo (le reste de la météo est appliqué à l'écran).
+    TerrainMaterial m = EvaluateTerrainMaterial(uBiomeHydro, uv, N, h);
+    vec3  albedo = mix(m.albedo, vec3(0.9), clamp(envSnow() * smoothstep(0.5, 0.9, N.y), 0.0, 1.0));
+    vec3  surf   = vec3(colWorld.x, h, colWorld.z);
+    vec3  radiance = min(albedo / PI * InjectedIrradiance(surf, N, 0.0), vec3(kMaxRadiance));
+
+    for (int y = 0; y <= yTop; ++y) {
+        float y0  = gridY0 + float(y) * voxel;
+        float occ = clamp((h - y0) / voxel, 0.0, 1.0);
+        vec3  rgb = y >= ySkin ? radiance * occ : vec3(0.0);
+        imageStore(uGridOut, ivec3(g.x, y, g.y), vec4(rgb, occ));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Passes 1 et 2 : végétation
+// -----------------------------------------------------------------------------
+uint VoxelIndex(ivec3 v, ivec3 dim) { return uint(v.x + dim.x * (v.y + dim.y * v.z)); }
+
+// Premier voxel (XZ) du chunk dans la grille : coin du chunk et grille sont alignés sur 8 m.
+ivec2 ChunkFirstColumn() { return ivec2(round((uChunkOffset.xz - uVoxel.uGridMin.xz) / VoxelSize())); }
+
+// Ajout saturé dans un champ de 10 bits. min(a + b, max) est commutatif et associatif pour des valeurs
+// positives : la valeur finale est la même quel que soit l'ordre des threads (déterministe).
+void AccumulateTau(uint index, uint field, float tau) {
+    uint delta = uint(tau * kTauScale + 0.5);
+    if (delta == 0u) return;
+    uint shift = field * kTauBits;
+    uint mask  = kTauMax << shift;
+    uint old   = foliageAccum[index];
+    for (int i = 0; i < 256; ++i) {  // borne de sûreté : un essai suffit presque toujours
+        uint cur = (old & mask) >> shift;
+        if (cur == kTauMax) return;  // déjà saturé (opaque)
+        uint desired = (old & ~mask) | (min(cur + delta, kTauMax) << shift);
+        uint seen    = atomicCompSwap(foliageAccum[index], old, desired);
+        if (seen == old) return;
+        old = seen;
+    }
+}
+
+void AccumulateFoliageInstance(uint index) {
+    if (index >= uInstanceCapacity) return;
+    bool valid = false;
+    for (uint c = 0u; c < uCommandCount; ++c) {
+        DrawElementsIndirectCommand cmd = commands[c];
+        if (index >= cmd.baseInstance && index < cmd.baseInstance + cmd.instanceCount) { valid = true; break; }
+    }
+    if (!valid) return;
+
+    FoliageInstance inst = instances[index];
+    int archetype = int(inst.params.y + 0.5);
+    if (archetype == FOLIAGE_GRASS) return;
+
+    uint  field = 0u;  float height = 7.0, opacity = 0.20;                           // arbre
+    if (archetype == FOLIAGE_SHRUB) { field = 1u; height = 1.2; opacity = 0.06; }
+    if (archetype == FOLIAGE_ROCK)  { field = 2u; height = 0.9; opacity = 0.12; }
+    height  *= inst.positionScale.w;
+    opacity  = clamp(opacity * uFoliageDensity, 0.0, 0.999);
+    if (opacity <= 0.0) return;
+
+    // Colonne bornée au chunk : la passe 2 de CE chunk résout exactement ses 32 × 32 colonnes (une entrée
+    // jamais résolue resterait dans le tampon d'une frame à l'autre).
+    float voxel   = VoxelSize();
+    int   columns = int(CHUNK_SIZE_METERS / voxel + 0.5);
+    ivec3 dim     = imageSize(uGridOut);
+    ivec2 local   = clamp(ivec2(floor(inst.positionScale.xz / voxel)), ivec2(0), ivec2(columns - 1));
+    ivec2 g       = ChunkFirstColumn() + local;
+    if (any(lessThan(g, ivec2(0))) || any(greaterThanEqual(g, dim.xz))) return;
+
+    float baseY  = uChunkOffset.y + inst.positionScale.y;
+    float gridY0 = uVoxel.uGridMin.y;
+    int   y0     = max(int(floor((baseY - gridY0) / voxel)), uFoliageYRange.x);
+    int   y1     = min(int(floor((baseY + height - gridY0) / voxel)), uFoliageYRange.y);
+    for (int y = y0; y <= y1; ++y) {
+        float vy0     = gridY0 + float(y) * voxel;
+        float overlap = clamp(min(baseY + height, vy0 + voxel) - max(baseY, vy0), 0.0, voxel) / voxel;
+        AccumulateTau(VoxelIndex(ivec3(g.x, y, g.y), dim), field, -log(1.0 - opacity * overlap));
+    }
+}
+
+void ResolveFoliageVoxel(uint id) {
+    float voxel   = VoxelSize();
+    int   columns = int(CHUNK_SIZE_METERS / voxel + 0.5);
+    int   perY    = columns * columns;
+    int   y       = uFoliageYRange.x + int(id) / perY;
+    ivec3 dim     = imageSize(uGridOut);
+    if (y > uFoliageYRange.y || y < 0 || y >= dim.y) return;
+
+    int   column = int(id) % perY;
+    ivec2 g      = ChunkFirstColumn() + ivec2(column % columns, column / columns);
+    if (any(lessThan(g, ivec2(0))) || any(greaterThanEqual(g, dim.xz))) return;
+
+    ivec3 v    = ivec3(g.x, y, g.y);
+    uint  idx  = VoxelIndex(v, dim);
+    uint  bits = foliageAccum[idx];
+    if (bits == 0u) return;
+    foliageAccum[idx] = 0u;  // le tampon redevient nul pour la frame suivante
+
+    vec3  tau    = vec3(bits & kTauMax, (bits >> kTauBits) & kTauMax, (bits >> (2u * kTauBits)) & kTauMax) / kTauScale;
+    float tauSum = tau.x + tau.y + tau.z;
+    float o      = 1.0 - exp(-tauSum);
+    vec3  albedo = (tau.x * kTreeAlbedo + tau.y * kShrubAlbedo + tau.z * kRockAlbedo) / tauSum;
+    float wrap   = kPlantWrap * (tau.x + tau.y) / tauSum;
+
+    // Éclairage une fois par voxel de végétation (et non par plante).
+    vec2 center   = uVoxel.uGridMin.xz + (vec2(g) + 0.5) * voxel;
+    vec3 p        = vec3(center.x, uVoxel.uGridMin.y + (float(y) + 0.5) * voxel, center.y);
+    vec3 radiance = min(albedo / PI * InjectedIrradiance(p, vec3(0.0, 1.0, 0.0), wrap), vec3(kMaxRadiance));
+
+    // Composition "over" pré-multipliée derrière le terrain déjà écrit (un seul thread par voxel).
+    vec4 cur = imageLoad(uGridOut, v);
+    imageStore(uGridOut, v, vec4(cur.rgb + radiance * o * (1.0 - cur.a), cur.a + o * (1.0 - cur.a)));
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if      (uPass == 0) InjectTerrainColumn(id);
+    else if (uPass == 1) AccumulateFoliageInstance(id);
+    else                 ResolveFoliageVoxel(id);
+}
