@@ -13,8 +13,9 @@
 //  Plages réservées par propriétaire (vérifiées à la compilation) :
 //    UBO      : Core 0-1  | Dev 1 2-7  | Dev 2 8-15
 //    SSBO     : Core 0-1  | Dev 1 2-7  | Dev 2 8-15
-//    Textures : Core 0-5  | Dev 1 6-9  | Dev 2 10-31
+//    Textures : Core 0-5  | Dev 1 6-9  | Dev 2 10-47 (ADR-008 ; <= 32 samplers ACTIFS par étage)
 //    Images   : Dev 1 0-2 | Core 3     | Dev 2 4-7   (GL_MAX_IMAGE_UNITS = 8 sur NVIDIA)
+//               IMG_AtmoLutOut sert aussi à écrire voxel.grid (ADR-008 : passes jamais simultanées)
 //
 //  Une collision de slot ou un slot hors de la plage de son propriétaire est
 //  une ERREUR DE COMPILATION (static_assert en bas de fichier).
@@ -40,7 +41,8 @@
     X(IblParams,         10, Dev2, "Parametres de l'IBL dynamique")                                 \
     X(VolumetricParams,  11, Dev2, "Nuages volumetriques + god rays")                               \
     X(WaterParams,       12, Dev2, "Ocean FFT, rivieres, marais")                                   \
-    X(PostParams,        13, Dev2, "Exposition, tonemapping")
+    X(PostParams,        13, Dev2, "Exposition, tonemapping")                                      \
+    X(VoxelParams,       14, Dev2, "Placement de la grille VXGI (ADR-008)")
 
 #define ENV_SSBO_BINDINGS(X)                                                                        \
     X(CoreDebugLines,       0, Core, "Reserve : lignes de debug")                                   \
@@ -90,7 +92,8 @@
     X(OceanNormal,          28, Dev2, "Normale de l'ocean")                                         \
     X(FoliageAlbedoAtlas,   29, Dev2, "Atlas d'albedo de la vegetation")                            \
     X(TerrainMaterialArray, 30, Dev2, "Texture array des materiaux de terrain")                     \
-    X(BlueNoise,            31, Dev2, "Bruit bleu (jitter temporel)")
+    X(BlueNoise,            31, Dev2, "Bruit bleu (jitter temporel)")                               \
+    X(VoxelGrid,            32, Dev2, "Grille VXGI 3D RGBA16F (ADR-008)")
 
 #define ENV_IMAGE_BINDINGS(X)                                                                       \
     X(HeightNormalOut,  0, Dev1, "Ecriture compute heightNormalTex (rgba32f)")                      \
@@ -148,7 +151,7 @@ inline constexpr SlotInfo kImageTable[]   = { ENV_IMAGE_BINDINGS(ENV_BIND_ROW) }
 
 inline constexpr SlotRange kUboRanges[]     = {{Owner::Core, 0, 1}, {Owner::Dev1, 2, 7}, {Owner::Dev2, 8, 15}};
 inline constexpr SlotRange kSsboRanges[]    = {{Owner::Core, 0, 1}, {Owner::Dev1, 2, 7}, {Owner::Dev2, 8, 15}};
-inline constexpr SlotRange kTextureRanges[] = {{Owner::Core, 0, 5}, {Owner::Dev1, 6, 9}, {Owner::Dev2, 10, 31}};
+inline constexpr SlotRange kTextureRanges[] = {{Owner::Core, 0, 5}, {Owner::Dev1, 6, 9}, {Owner::Dev2, 10, 47}};
 inline constexpr SlotRange kImageRanges[]   = {{Owner::Dev1, 0, 2}, {Owner::Core, 3, 3}, {Owner::Dev2, 4, 7}};
 
 // Préfixes des #define générés côté GLSL.
@@ -201,7 +204,8 @@ static_assert(detail::SlotsInOwnerRanges(kImageTable, kImageRanges), "GpuBinding
 
 // Limites minimales garanties sur le matériel visé (NVIDIA / AMD / Intel récents).
 static_assert(detail::MaxSlot(kImageTable) < 8, "GL_MAX_IMAGE_UNITS vaut 8 sur NVIDIA");
-static_assert(detail::MaxSlot(kTextureTable) < 32, "Garder les unites de texture sous 32");
+// GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS >= 80 en GL 4.6 ; le nombre de samplers ACTIFS par étage reste <= 32.
+static_assert(detail::MaxSlot(kTextureTable) < 48, "Garder les unites de texture sous 48 (ADR-008)");
 static_assert(detail::MaxSlot(kSsboTable) < 16, "Garder les bindings SSBO sous 16");
 static_assert(detail::MaxSlot(kUboTable) < 16, "Garder les bindings UBO sous 16");
 

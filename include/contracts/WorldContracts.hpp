@@ -342,6 +342,7 @@ inline constexpr std::string_view CloudShadowMap         = "clouds.shadowMap";
 inline constexpr std::string_view VolumetricGodRays      = "volumetrics.godRays";
 inline constexpr std::string_view WaterOceanDisplacement = "water.oceanDisplacement";
 inline constexpr std::string_view WaterOceanNormal       = "water.oceanNormal";
+inline constexpr std::string_view VoxelGrid              = "voxel.grid";
 
 inline constexpr KeyInfo kKeys[] = {
     // key                     kind                 fallback                     producer          format                         description
@@ -374,6 +375,7 @@ inline constexpr KeyInfo kKeys[] = {
     {VolumetricGodRays,      Kind::Texture2D, Fallback::Black,             Producer::Dev2, "RGBA16F demi-res",   "God rays"},
     {WaterOceanDisplacement, Kind::Texture2D, Fallback::Black,             Producer::Dev2, "RGBA16F",            "Deplacement FFT de l'ocean"},
     {WaterOceanNormal,       Kind::Texture2D, Fallback::FlatNormalWS,      Producer::Dev2, "RGBA16F",            "Normale monde de l'ocean"},
+    {VoxelGrid,              Kind::Texture3D, Fallback::Black3D,           Producer::Dev2, "RGBA16F 256x64x256", "Grille VXGI (ADR-008) : rgb radiance premultipliee par l'opacite, a opacite"},
 };
 
 constexpr const KeyInfo* FindKey(std::string_view key) noexcept {
