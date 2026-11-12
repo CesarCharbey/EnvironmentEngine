@@ -133,6 +133,7 @@ public:
         p.Set("uFocusChunkOrigin",      focusChunkOrigin_);
         p.Set("uShadowPenumbra",        glm::radians(shadowPenumbraDeg_));
         p.Set("uFogHeightFalloff",      fogHeightFalloff_);
+        p.Set("uFogShadows",            fogShadows_);
         p.Set("uCloudLayerAltitude",    cloudLayerAltitude_);
         p.Set("uCloudShadowExtent",     cloudShadowExtent_);
 
@@ -205,6 +206,9 @@ public:
         ImGui::TextDisabled("Densite au sol : panneau Celestial (Brouillard)");
         ImGui::SliderFloat("Decroissance verticale", &fogHeightFalloff_, 0.0005f, 0.05f, "%.4f /m",
                            ImGuiSliderFlags_Logarithmic);
+        ImGui::Checkbox("Ombre volumetrique", &fogShadows_);
+        ImGui::SetItemTooltip("L'air a l'ombre du relief ne diffuse plus le soleil (grille VXGI) : "
+                              "pas de voile aveuglant devant les montagnes a contre-jour.");
 
         ImGui::SeparatorText("Ombre des nuages (convention provisoire)");
         ImGui::SliderFloat("Altitude de la couche", &cloudLayerAltitude_, 500.0f, 8000.0f, "%.0f m");
@@ -252,6 +256,7 @@ private:
     float giIntensity_            = 1.0f;
     float voxelShadowSoftnessDeg_ = 2.3f;   // tan ≈ 0,04
     float fogHeightFalloff_       = 0.005f;   // hauteur d'échelle 200 m
+    bool  fogShadows_             = true;     // ombre volumétrique du brouillard (VXGI)
     float cloudLayerAltitude_     = 2000.0f;
     float cloudShadowExtent_      = 10000.0f;
 };

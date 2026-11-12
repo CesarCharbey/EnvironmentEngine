@@ -55,6 +55,7 @@ uniform bool  uFocusAvailable;         // world.focus.heightNormal publié ET ch
 uniform vec3  uFocusChunkOrigin;       // coin du chunk focus relatif à l'origine de rendu (m)
 uniform float uShadowPenumbra;         // demi-angle (rad) de la pénombre des ombres du relief
 uniform float uFogHeightFalloff;       // 1/m : décroissance verticale du brouillard
+uniform bool  uFogShadows;             // ombre volumétrique du brouillard (grille VXGI)
 uniform float uCloudLayerAltitude;     // m : plan de projection de l'ombre des nuages
 uniform float uCloudShadowExtent;      // m : emprise de clouds.shadowMap, centrée sur la caméra
 
@@ -453,32 +454,79 @@ float PhaseHenyeyGreenstein(float cosTheta, float g) {
 }
 
 // Luminance diffusée par le brouillard lui-même (milieu optiquement épais, albédo de diffusion ≈ 1) :
-// soleil et lune atténués (phase de Henyey-Greenstein, gouttelettes -> diffusion vers l'avant)
-// + ciel moyen en ambiant isotrope. Surtout PAS la luminance du ciel à l'horizon : elle intègre des
-// centaines de km d'atmosphère et la lueur crépusculaire, ce qui délavait tout le terrain.
-vec3 FogInscatter(vec3 P, vec3 rayDir) {
+// soleil et lune atténués (phase de Henyey-Greenstein, gouttelettes -> diffusion vers l'avant), rendus
+// séparément (sunTerm, moonTerm) pour qu'ApplyHeightFog les multiplie par leur visibilité moyenne le long
+// du rayon (ombre volumétrique) ; retourne le ciel moyen, ambiant isotrope. Surtout PAS la luminance du ciel à l'horizon (sky-view) : elle intègre des centaines de km
+// d'atmosphère et la lueur crépusculaire, ce qui délavait tout le terrain (flash du crépuscule).
+// Jamais les disques du soleil ni de la lune non plus.
+vec3 FogInscatter(vec3 P, vec3 rayDir, out vec3 sunTerm, out vec3 moonTerm) {
     const float g = 0.6;
     vec3 sunDir  = normalize(envSunDirection());
     vec3 moonDir = normalize(envMoonDirection());
-    vec3 direct  = SunIlluminanceTOA() * LightTransmittance(P.y, sunDir, SunAngularRadius())
-                 * PhaseHenyeyGreenstein(dot(rayDir, sunDir), g) * uSunScale
-                 + MoonIlluminanceTOA() * LightTransmittance(P.y, moonDir, MoonAngularRadius())
-                 * PhaseHenyeyGreenstein(dot(rayDir, moonDir), g) * uMoonScale;
+    sunTerm  = SunIlluminanceTOA() * LightTransmittance(P.y, sunDir, SunAngularRadius())
+             * PhaseHenyeyGreenstein(dot(rayDir, sunDir), g) * uSunScale;
+    moonTerm = MoonIlluminanceTOA() * LightTransmittance(P.y, moonDir, MoonAngularRadius())
+             * PhaseHenyeyGreenstein(dot(rayDir, moonDir), g) * uMoonScale;
+    return SkyAverage();
+}
 
-    return direct + SkyAverage();
+// Épaisseur optique du brouillard σ(y) = σ0 exp(-k y), de la caméra jusqu'à la distance t le long du
+// rayon de direction verticale dirY (intégrale analytique).
+float FogOpticalDepth(float t, float dirY) {
+    float sigma0 = uEnv.weatherExtra.z;  // 1/m au niveau y = 0
+    float k      = max(uFogHeightFalloff, 1e-5);
+    float camY   = envCameraPosition().y;
+    float kd     = k * dirY * t;
+    float shape  = abs(kd) > 1e-4 ? (1.0 - exp(-kd)) / kd : 1.0;
+    return sigma0 * exp(clamp(-k * camY, -80.0, 80.0)) * t * shape;
+}
+
+// Ombre VOLUMÉTRIQUE du brouillard : visibilité moyenne de l'astre L le long du rayon caméra -> point
+// visé, chaque tronçon pondéré par ce qu'il apporte à la diffusion (T(début) - T(fin)). Sans elle, l'air
+// situé dans l'ombre d'un relief diffusait le soleil en plein : voile aveuglant devant les montagnes à
+// contre-jour (la phase g = 0,6 concentre la lumière vers l'avant). Cône de demi-ouverture 0,12 rad
+// dans la grille VXGI ; hors grille, l'air est considéré éclairé. 4 points × 20 pas : écart moyen
+// < 0,5/255 contre une référence à 12 points × 48 pas (cône 0,08), pour ~1/10 du coût.
+const int kFogShadowSamples = 4;
+float FogLightVisibility(vec3 rayDir, float dist, vec3 L) {
+    if (!uFogShadows || !uVoxelAvailable || uVoxel.uGridExtent.w < 0.5) return 1.0;
+    vec3  cam   = envCameraPosition();
+    float voxel = VoxelSize();
+    float Tprev = 1.0, acc = 0.0, wsum = 0.0;
+    for (int i = 0; i < kFogShadowSamples; ++i) {
+        float T1 = exp(-FogOpticalDepth(dist * float(i + 1) / float(kFogShadowSamples), rayDir.y));
+        float w  = Tprev - T1;
+        Tprev    = T1;
+        if (w <= 0.0) continue;
+        vec3 p = cam + rayDir * (dist * (float(i) + 0.5) / float(kFogShadowSamples));
+        acc  += w * VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.12, 0.5 * voxel, 1500.0, 20);
+        wsum += w;
+    }
+    return wsum > 0.0 ? acc / wsum : 1.0;
 }
 
 // Brouillard de hauteur : densité σ(y) = σ0 exp(-k y), intégrée analytiquement le long du rayon.
-vec3 ApplyHeightFog(vec3 color, vec3 P, vec3 rayDir, float dist) {
-    float sigma0 = uEnv.weatherExtra.z;  // 1/m au niveau y = 0
-    if (sigma0 <= 0.0) return color;
-    float k    = max(uFogHeightFalloff, 1e-5);
-    float camY = envCameraPosition().y;
-    float kd   = k * (P.y - camY);
-    float shape = abs(kd) > 1e-4 ? (1.0 - exp(-kd)) / kd : 1.0;
-    float opticalDepth = sigma0 * exp(clamp(-k * camY, -80.0, 80.0)) * dist * shape;
-    float fog = 1.0 - exp(-max(opticalDepth, 0.0));
-    return mix(color, FogInscatter(P, rayDir), fog);
+// sunShadow / moonShadow : visibilité de l'astre AU POINT VISÉ (0 si la face lui tourne le dos).
+vec3 ApplyHeightFog(vec3 color, vec3 P, vec3 rayDir, float dist, float sunShadow, float moonShadow) {
+    if (uEnv.weatherExtra.z <= 0.0) return color;
+    float fog = 1.0 - exp(-max(FogOpticalDepth(dist, rayDir.y), 0.0));
+    if (fog < 1e-4) return color;
+
+    vec3 sunTerm, moonTerm;
+    vec3 ambient = FogInscatter(P, rayDir, sunTerm, moonTerm);
+    // Ombre volumétrique pour l'astre dominant (le soleil tant qu'il est levé, sinon la lune). Calculée
+    // seulement si le point visé n'est pas en plein soleil (ombré ou face dos à l'astre) : devant une
+    // surface éclairée, l'air l'est aussi en pratique, et c'est devant les reliefs à l'ombre que le voile
+    // fuyait. Ignorée aussi quand elle ne changerait pas le pixel de plus de 3 %.
+    bool  sunUp      = envSunDirection().y > -0.02;
+    vec3  mainTerm   = sunUp ? sunTerm : moonTerm;
+    float surfShadow = sunUp ? sunShadow : moonShadow;
+    float vis        = 1.0;
+    if (surfShadow < 0.99 && fog > 0.002 &&
+        fog * Luminance(mainTerm) > 0.03 * Luminance(mix(color, ambient, fog)))
+        vis = FogLightVisibility(rayDir, dist, normalize(sunUp ? envSunDirection() : envMoonDirection()));
+    vec3 inscatter = ambient + (sunUp ? sunTerm * vis + moonTerm : sunTerm + moonTerm * vis);
+    return mix(color, inscatter, fog);
 }
 
 // =============================================================================
@@ -634,7 +682,7 @@ void main() {
             case 9:  color = vec3(sunShadow, moonShadow, sunShadow); break;  // blanc = éclairé, vert = lune seule
             case 10: color = vec3(gVxao); break;                             // VXAO : 1 = ciel entièrement visible
             case 11: color = gVxgiRadiance; break;                           // lumière indirecte reçue (E/π)
-            default: color = ApplyHeightFog(sunL + moonL + ambient, P, rayDir, dist); break;
+            default: color = ApplyHeightFog(sunL + moonL + ambient, P, rayDir, dist, sunShadow, moonShadow); break;
         }
     }
 
