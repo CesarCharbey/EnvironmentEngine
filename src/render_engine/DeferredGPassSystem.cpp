@@ -50,6 +50,12 @@ constexpr std::uint32_t    kFoliageIndexCapacity = 1024;
 /// Marge verticale (m) ajoutée à l'AABB d'un chunk pour la végétation (arbres).
 constexpr float            kFoliageHeightMargin = 15.0f;
 
+/// Miroir std140 de MaterialParamsBlock (shaders/render/material_params.glsl), UBO_MaterialParams.
+struct MaterialParamsUbo {
+    glm::vec4 snowLine{0.0f};  ///< x = premières neiges (m), y = neige maximale (m), z = demi-transition (m)
+};
+static_assert(sizeof(MaterialParamsUbo) == 16);
+
 /// Grille de terrain d'un niveau de détail : res x res quads sur [0, kChunkSizeMeters]² + jupes.
 struct TerrainGrid {
     gpu::GpuBuffer   vertices;
@@ -141,6 +147,7 @@ public:
         foliageIndices_.CreateFrom(std::span<const std::uint32_t>(identity), 0, "gpass.foliageIndices");
         foliageVao_.Create("gpass.foliageVao");
         foliageVao_.SetElementBuffer(foliageIndices_);
+        materialUbo_.Create(sizeof(MaterialParamsUbo), GL_DYNAMIC_STORAGE_BIT, nullptr, "gpass.materialParams");
 
         gpu::Framebuffer::Desc desc;
         desc.width  = ScaledSize(ctx.viewportSize.x);
@@ -220,6 +227,13 @@ public:
         const GLuint neutralBiome = ctx.blackboard.FallbackTexture(bb::Fallback::NeutralBiomeHydro).id;
         chunksDrawn_ = 0;
 
+        // Paramètres de matériaux, aussi lus par la voxélisation VXGI (stage LightingWater, plus loin dans
+        // la frame) : le binding indexé persiste.
+        MaterialParamsUbo material;
+        material.snowLine = glm::vec4(snowLineFirst_, snowLineFull_, snowTransition_, 0.0f);
+        materialUbo_.UploadObject(material);
+        materialUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::MaterialParams);
+
         // --- Passe terrain ---
         if (drawTerrain_ && terrainProg_->IsValid()) {
             terrainProg_->Use();
@@ -273,6 +287,7 @@ public:
         for (TerrainGrid& g : terrainGrids_) g = TerrainGrid{};
         foliageVao_.Destroy();
         foliageIndices_.Destroy();
+        materialUbo_.Destroy();
         terrainProg_ = foliageProg_ = nullptr;
     }
 
@@ -291,6 +306,13 @@ public:
         ImGui::SliderFloat("Profondeur des jupes", &skirtDepth_, 0.0f, 50.0f, "%.1f m");
         ImGui::SliderFloat("Distance vegetation", &foliageDrawDistance_, 32.0f, 4096.0f, "%.0f m");
         ImGui::SliderFloat("Force du vent (vegetation)", &windStrength_, 0.0f, 4.0f);
+
+        ImGui::SeparatorText("Neige (quantite : panneau Celestial)");
+        ImGui::DragFloat("Premieres neiges", &snowLineFirst_, 1.0f, -500.0f, 9000.0f, "%.0f m");
+        ImGui::SetItemTooltip("Altitude de la limite des neiges quand il commence a neiger.");
+        ImGui::DragFloat("Neige maximale", &snowLineFull_, 1.0f, -500.0f, 9000.0f, "%.0f m");
+        ImGui::SetItemTooltip("Altitude atteinte par la limite des neiges quand la neige meteo vaut 1.");
+        ImGui::SliderFloat("Transition", &snowTransition_, 0.5f, 100.0f, "%.1f m", ImGuiSliderFlags_Logarithmic);
     }
 
 private:
@@ -334,6 +356,7 @@ private:
     std::array<TerrainGrid, kLodCount>     terrainGrids_;
     gpu::GpuBuffer                         foliageIndices_;
     gpu::VertexArray                       foliageVao_;
+    gpu::GpuBuffer                         materialUbo_;
     std::vector<DrawItem>                  drawList_;
     int                                    builtGridResolution_ = 0;
     int                                    chunksDrawn_         = 0;
@@ -349,6 +372,10 @@ private:
     float skirtDepth_            = 8.0f;
     float foliageDrawDistance_   = 600.0f;
     float windStrength_          = 1.0f;
+    // Neige : valeurs adaptées au mock (sommet de la colline ≈ 72 m) ; à régler pour le terrain de Dev 1.
+    float snowLineFirst_         = 60.0f;
+    float snowLineFull_          = -10.0f;
+    float snowTransition_        = 4.0f;
 };
 
 }  // namespace

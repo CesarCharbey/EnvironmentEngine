@@ -16,6 +16,7 @@ uniform float uWindStrength;  // multiplicateur global de l'ondulation
 
 out VS_OUT {
     vec3 normal;
+    float worldY;          // altitude (m) : neige
     vec4 clipCurr;
     vec4 clipPrev;
     flat int   archetype;
@@ -78,6 +79,7 @@ void main() {
     // ne capture donc que le mouvement de caméra pour la végétation.
 
     vsOut.normal    = n;
+    vsOut.worldY    = pos.y;
     vsOut.archetype = archetype;
     vsOut.variation = inst.params.w;
     vsOut.clipCurr  = uEnv.viewProj * vec4(pos, 1.0);

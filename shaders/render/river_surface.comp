@@ -1,0 +1,119 @@
+#version 460 core
+//  shaders/render/river_surface.comp                                   [DEV 2]
+//  Surface des rivières d'un chunk, dérivée du terrain et de la SDF (ADR-005, échelle micro), calculée
+//  UNE fois par chunk (et à chaque régénération) sur une grille de 129 × 129 sommets espacés de 2 m.
+//  Le contrat ne donne pas la hauteur de l'eau d'une rivière : on la reconstruit à partir des berges.
+//    * uPass 0 : niveau = moyenne pondérée des hauteurs des berges (SDF ∈ [-1, 4] m) sous un noyau
+//      gaussien anisotrope, moins une revanche de 0,3 m. Étroit le long du lit (σ = 3 m : le niveau suit
+//      la pente de la rivière), assez étroit en travers (σ = max(6 m, 1,2 × distance aux berges)) pour
+//      que la surface relie une rive à l'autre : quand les rives diffèrent, l'eau remplit tout le lit
+//      sans déborder de la rive basse (un plan horizontal ne remplirait que le côté profond).
+//    * uPass 1 : écoulement le long du lit (tangente à la SDF), orienté vers l'aval (le niveau descend),
+//      plus rapide au milieu du lit qu'au bord.
+//  Sortie (SSBO_Dev2Scratch, lié par passe) : vec4(niveau rivière ou kNoRiver, hauteur du terrain,
+//  packHalf2x16(SDF rivière, SDF marais), packHalf2x16(vitesse xz relative)) par sommet. La vitesse est
+//  relative (1 = vitesse nominale) : le curseur « Vitesse d'écoulement » s'applique au rendu.
+#include "common/global_ubo.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = TEX_HeightNormal) uniform sampler2D uHeightNormal;
+layout(binding = TEX_BiomeHydro)   uniform sampler2D uBiomeHydro;
+
+layout(std430, binding = SSBO_Dev2Scratch) buffer RiverSurfaceBuffer {
+    vec4 riverData[];
+};
+
+uniform int  uPass;
+uniform uint uSrcBase;   // passe 1 : sommets produits par la passe 0
+uniform uint uDstBase;   // emplacement de sortie (index du premier sommet)
+
+const int   kVerts     = 129;      // sommets par côté (2 m)
+const float kSpacing   = 2.0;      // m
+const float kNoRiver   = -1.0e4;
+const float kFreeboard = 0.3;      // m : l'eau affleure sous le haut de la berge
+const float kSigmaAcrossMin = 6.0; // m : noyau en travers (au moins ; grandit avec la largeur du lit)
+const float kSigmaAlong  = 3.0;    // m : étroit le long du lit (suit la pente de la rivière)
+
+vec2 ChunkUv(vec2 local) { return clamp(local / CHUNK_SIZE_METERS, 0.0, 1.0); }
+float Sdf(vec2 local) { return textureLod(uBiomeHydro, ChunkUv(local), 0.0).g; }
+
+// Direction en travers du lit (au signe près) : vecteur propre principal du tenseur de structure des
+// gradients de la SDF autour du point. Défini aussi sur l'axe du lit, où le gradient change de signe.
+vec2 AcrossDirection(vec2 local) {
+    vec3 T = vec3(0.0);  // (xx, zz, xz)
+    for (int k = 0; k < 5; ++k) {
+        vec2 o = k == 0 ? vec2(0.0) : vec2(k == 1 ? 3.0 : k == 2 ? -3.0 : 0.0, k == 3 ? 3.0 : k == 4 ? -3.0 : 0.0);
+        vec2 p = local + o;
+        vec2 g = vec2(Sdf(p + vec2(1.0, 0.0)) - Sdf(p - vec2(1.0, 0.0)), Sdf(p + vec2(0.0, 1.0)) - Sdf(p - vec2(0.0, 1.0)));
+        T += vec3(g.x * g.x, g.y * g.y, g.x * g.y);
+    }
+    if (T.x + T.y < 1e-6) return vec2(1.0, 0.0);
+    float a = 0.5 * atan(2.0 * T.z, T.x - T.y);
+    return vec2(cos(a), sin(a));
+}
+
+void main() {
+    ivec2 v = ivec2(gl_GlobalInvocationID.xy);
+    if (v.x >= kVerts || v.y >= kVerts) return;
+    uint  idx   = uint(v.y * kVerts + v.x);
+    vec2  local = vec2(v) * kSpacing;
+
+    if (uPass == 0) {
+        vec2  uv = ChunkUv(local);
+        float hv = textureLod(uHeightNormal, uv, 0.0).r;
+        vec4  bh = textureLod(uBiomeHydro, uv, 0.0);
+        float sw = 0.0, sh = 0.0;
+        vec2  across = vec2(1.0, 0.0);
+        if (bh.g < 24.0) {  // loin de toute rivière : rien à chercher
+            across = AcrossDirection(local);
+            vec2 along = vec2(-across.y, across.x);
+            // Noyau anisotrope échantillonné dans le repère du lit : 5 rangées le long (±4 m) × 25 taps en
+            // travers, sur ±2,5 σ. σ en travers suit la distance aux berges : rivières larges comprises.
+            float sigmaC = max(kSigmaAcrossMin, 1.2 * max(-bh.g, 0.0));
+            float stepC  = 2.5 * sigmaC / 12.0;
+            for (int j = -2; j <= 2; ++j) {
+                float da = float(j) * 2.0;
+                float ga = exp(-0.5 * da * da / (kSigmaAlong * kSigmaAlong));
+                for (int i = -12; i <= 12; ++i) {
+                    float dc   = float(i) * stepC;
+                    vec2  uvp  = ChunkUv(local + along * da + across * dc);
+                    float sdf  = textureLod(uBiomeHydro, uvp, 0.0).g;
+                    float bank = smoothstep(-1.0, 0.0, sdf) * (1.0 - smoothstep(2.0, 4.0, sdf));
+                    if (bank <= 0.0) continue;
+                    float w = bank * ga * exp(-0.5 * dc * dc / (sigmaC * sigmaC));
+                    sw += w;
+                    sh += w * textureLod(uHeightNormal, uvp, 0.0).r;
+                }
+            }
+        }
+        float level = sw > 1e-4 ? sh / sw - kFreeboard : kNoRiver;
+        // w (provisoire) : direction en travers, remplacée par l'écoulement en passe 1.
+        riverData[uDstBase + idx] = vec4(level, hv, uintBitsToFloat(packHalf2x16(bh.gb)),
+                                         uintBitsToFloat(packHalf2x16(across)));
+        return;
+    }
+
+    // --- uPass 1 : écoulement ---
+    vec4  c     = riverData[uSrcBase + idx];
+    vec2  sdfs  = unpackHalf2x16(floatBitsToUint(c.z));
+    vec2  flow  = vec2(0.0);
+    if (c.x > kNoRiver * 0.5 && sdfs.x < 2.0) {
+        // Pente du niveau : différences centrées sur ±2 sommets (±4 m), bornées au chunk.
+        ivec2 a = clamp(v - ivec2(2, 0), ivec2(0), ivec2(kVerts - 1)), b = clamp(v + ivec2(2, 0), ivec2(0), ivec2(kVerts - 1));
+        ivec2 e = clamp(v - ivec2(0, 2), ivec2(0), ivec2(kVerts - 1)), f = clamp(v + ivec2(0, 2), ivec2(0), ivec2(kVerts - 1));
+        float la = riverData[uSrcBase + uint(a.y * kVerts + a.x)].x, lb = riverData[uSrcBase + uint(b.y * kVerts + b.x)].x;
+        float le = riverData[uSrcBase + uint(e.y * kVerts + e.x)].x, lf = riverData[uSrcBase + uint(f.y * kVerts + f.x)].x;
+        la = la > kNoRiver * 0.5 ? la : c.x;  lb = lb > kNoRiver * 0.5 ? lb : c.x;
+        le = le > kNoRiver * 0.5 ? le : c.x;  lf = lf > kNoRiver * 0.5 ? lf : c.x;
+        vec2  gLevel = vec2((lb - la) / max(float(b.x - a.x), 1.0), (lf - le) / max(float(f.y - e.y), 1.0)) / kSpacing;
+        vec2  across = unpackHalf2x16(floatBitsToUint(c.w));
+        vec2  tang   = vec2(-across.y, across.x);
+        tang        *= dot(tang, -gLevel) >= 0.0 ? 1.0 : -1.0;   // vers l'aval
+        float slope  = abs(dot(tang, gLevel));
+        float speed  = clamp(0.6 + slope * 20.0, 0.6, 2.0);
+        speed       *= 0.35 + 0.65 * smoothstep(0.0, 4.0, -sdfs.x);  // freiné près des berges
+        flow         = tang * speed;
+    }
+    riverData[uDstBase + idx] = vec4(c.xyz, uintBitsToFloat(packHalf2x16(flow)));
+}

@@ -72,10 +72,11 @@ struct WetSurface {
 // chunk : coordonnée absolue du chunk ; chunkUv : UV dans le chunk ; footprint : m couverts par un
 // pixel (fwidth de la position monde, calculée AVANT tout branchement) ; h : hauteur du point (m).
 // waterSdf : min(SDF rivière, SDF marais) ; les flaques s'arrêtent avant le lit (rendu par l'eau).
+// snow : couverture neigeuse ; la neige recouvre les flaques.
 WetSurface ApplyPuddlesAndRipples(WetSurface s, sampler2D heightNormal, ivec2 chunk, vec2 chunkUv, float h,
-                                  int biome, float waterSdf, float footprint) {
+                                  int biome, float waterSdf, float snow, float footprint) {
     float waterLevel = smoothstep(0.35, 1.0, clamp(uEnv.weatherExtra.w, 0.0, 1.0));
-    float flatness   = smoothstep(0.93, 0.985, s.N.y) * smoothstep(1.0, 3.0, waterSdf);
+    float flatness   = smoothstep(0.93, 0.985, s.N.y) * smoothstep(1.0, 3.0, waterSdf) * (1.0 - snow);
     if (waterLevel <= 0.0 || flatness <= 0.0) return s;
 
     // Cavité : de combien le point est sous la moyenne de son voisinage (> 0 dans un creux).

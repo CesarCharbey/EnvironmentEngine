@@ -8,9 +8,12 @@
 //      CelestialAtmosphereSystem). Réponse dépendant de la porosité (Lagarde 2013) : un sol poreux
 //      boit l'eau (s'assombrit et se sature, reste assez mat), la roche se couvre d'un film brillant.
 //      Les flaques et les ondes de pluie (détail sous le voxel) sont dans terrain_wetness.glsl (G-pass).
+//    * Neige selon l'altitude, la pente et la neige météo (material_params.glsl), par-dessus le reste.
 //  Le shader qui inclut ce fichier doit avoir inclus "common/global_ubo.glsl".
 #ifndef ENV_TERRAIN_MATERIAL_GLSL
 #define ENV_TERRAIN_MATERIAL_GLSL
+
+#include "render/material_params.glsl"
 
 // Porosité du sol nu par biome : 1 = terre qui boit l'eau, faible = surface dure (film d'eau).
 float BiomePorosity(int biome) {
@@ -54,6 +57,7 @@ struct TerrainMaterial {
     float roughness;  // perceptuelle
     float wetness;    // humidité de surface [0, 1] (berges + pluie) ; gbuffer.material.b
     float porosity;   // [0, 1] : 1 = terre, ~0,25 = roche
+    float snow;       // couverture neigeuse [0, 1]
     int   biome;      // id BIOME_* du texel
 };
 
@@ -101,6 +105,12 @@ TerrainMaterial EvaluateTerrainMaterial(sampler2D biomeHydro, vec2 uv, vec3 N, f
     vec3  sat   = max(mix(vec3(TerrainLuminance(m.albedo)), m.albedo, 1.0 + 0.35 * soak), vec3(0.0));
     m.albedo    = sat * mix(1.0, 0.5, soak);
     m.roughness = mix(m.roughness, mix(0.10, 0.38, m.porosity), m.wetness);
+
+    // --- Neige : recouvre le sol (et son humidité), pas le lit des rivières ni des marais ---
+    m.snow      = SnowCoverage(worldY, N.y) * (1.0 - bed);
+    m.albedo    = mix(m.albedo, kSnowAlbedo, m.snow);
+    m.roughness = mix(m.roughness, kSnowRoughness, m.snow);
+    m.wetness  *= 1.0 - m.snow;
     return m;
 }
 

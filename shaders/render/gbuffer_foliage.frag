@@ -2,9 +2,11 @@
 //  shaders/render/gbuffer_foliage.frag                                 [DEV 2]
 //  Matériau de végétation basique -> G-Buffer (mêmes sorties que gbuffer_terrain.frag).
 #include "common/global_ubo.glsl"
+#include "render/material_params.glsl"
 
 in VS_OUT {
     vec3 normal;
+    float worldY;
     vec4 clipCurr;
     vec4 clipPrev;
     flat int   archetype;
@@ -34,6 +36,12 @@ void main() {
     float porosity = fsIn.archetype == FOLIAGE_ROCK ? 0.25 : 0.15;
     albedo   *= mix(1.0, 0.5, wet * porosity);
     roughness = mix(roughness, fsIn.archetype == FOLIAGE_ROCK ? 0.15 : 0.35, wet);
+
+    // Neige : posée sur les faces tournées vers le ciel (normale géométrique), même limite que le sol.
+    float snow = SnowCoverage(fsIn.worldY, normalize(fsIn.normal).y);
+    albedo    = mix(albedo, kSnowAlbedo, snow);
+    roughness = mix(roughness, kSnowRoughness, snow);
+    wet      *= 1.0 - snow;
 
     vec2 ndcCurr = fsIn.clipCurr.xy / fsIn.clipCurr.w;
     vec2 ndcPrev = fsIn.clipPrev.xy / fsIn.clipPrev.w;

@@ -1,0 +1,138 @@
+#version 460 core
+//  shaders/render/ocean_fft.comp                                       [DEV 2]
+//  FFT inverse 2D de l'océan, une ligne (ou colonne) entière par workgroup, en mémoire partagée.
+//    * uPass 0 (lignes)   : évolution temporelle h(k, t) = h0(k) e^{iωt} + conj(h0(-k)) e^{-iωt}, dérivation
+//      spectrale (déplacements horizontaux, pentes, jacobien), 8 champs réels empaquetés en 4 complexes
+//      (A + iB), IFFT de la ligne -> SSBO.
+//    * uPass 1 (colonnes) : IFFT de la colonne, signe (-1)^(x+y) du spectre centré, assemblage des
+//      cartes (déplacement, pentes) et accumulation de l'écume (jacobien < seuil) -> image array.
+//  Radix 2 de Cooley-Tukey en place : lecture en ordre bit-inversé, une barrière par étage.
+//  gl_WorkGroupID.x = ligne / colonne, gl_WorkGroupID.y = cascade ; N / 2 threads utiles (N <= 512).
+#include "common/global_ubo.glsl"
+#include "render/ocean_common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_WaterOut) uniform image2DArray uOceanMaps;
+
+uniform int   uPass;
+uniform float uTime;   // s
+uniform float uDt;     // s
+
+shared vec2 sData[4][512];
+
+vec2 CMul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+vec2 MulI(vec2 a) { return vec2(-a.y, a.x); }  // i * a
+
+int BitReverse(int i) { return int(bitfieldReverse(uint(i)) >> uint(32 - uOceanLogN)); }
+
+void Fft(int t, bool working) {
+    int half_n = uOceanN >> 1;
+    for (int s = 1; s <= uOceanLogN; ++s) {
+        barrier();
+        if (working) {
+            int   m    = 1 << s;
+            int   h    = m >> 1;
+            int   j    = t & (h - 1);
+            int   i0   = (t / h) * m + j;
+            int   i1   = i0 + h;
+            float ang  = 2.0 * PI_OCEAN * float(j) / float(m);  // inverse : e^{+i2πj/m}
+            vec2  w    = vec2(cos(ang), sin(ang));
+            for (int f = 0; f < 4; ++f) {
+                vec2 a = sData[f][i0];
+                vec2 b = CMul(w, sData[f][i1]);
+                sData[f][i0] = a + b;
+                sData[f][i1] = a - b;
+            }
+        }
+    }
+    barrier();
+}
+
+void main() {
+    int  t       = int(gl_LocalInvocationID.x);
+    int  line    = int(gl_WorkGroupID.x);
+    int  c       = int(gl_WorkGroupID.y);
+    int  halfN   = uOceanN >> 1;
+    bool working  = t < halfN;
+
+    if (uPass == 0) {
+        float L = uOceanCascadeSize[c];
+        if (working) {
+            for (int e = 0; e < 2; ++e) {
+                int   x  = t + e * halfN;
+                ivec2 n  = ivec2(x, line);
+                vec4  h0 = spectrum[OceanSpectrumIndex(n, c)];
+                vec2  k  = vec2(n - halfN) * (2.0 * PI_OCEAN / L);
+                float kl = length(k);
+                float w  = sqrt(9.81 * kl);
+                float ph = w * uTime;
+                vec2  ep = vec2(cos(ph), sin(ph));
+                vec2  ht = CMul(h0.xy, ep) + CMul(h0.zw, vec2(ep.x, -ep.y));
+                vec2  kn = kl > 1e-6 ? k / kl : vec2(0.0);
+                float ik = kl > 1e-6 ? 1.0 / kl : 0.0;
+                vec2 dx   = MulI(ht) * kn.x;            // D = i k̂ h : crêtes pointues (λ > 0)
+                vec2 dz   = MulI(ht) * kn.y;
+                vec2 dhdx = MulI(ht) * k.x;
+                vec2 dhdz = MulI(ht) * k.y;
+                vec2 dxdx = -ht * k.x * k.x * ik;
+                vec2 dzdz = -ht * k.y * k.y * ik;
+                vec2 dxdz = -ht * k.x * k.y * ik;
+                int  r = BitReverse(x);
+                sData[0][r] = dx + MulI(dz);
+                sData[1][r] = ht + MulI(dhdx);
+                sData[2][r] = dhdz + MulI(dxdx);
+                sData[3][r] = dzdz + MulI(dxdz);
+            }
+        }
+        Fft(t, working);
+        if (working) {
+            for (int e = 0; e < 2; ++e) {
+                int x = t + e * halfN;
+                int o = OceanRowsIndex(ivec2(x, line), c);
+                spectrum[o]     = vec4(sData[0][x], sData[1][x]);
+                spectrum[o + 1] = vec4(sData[2][x], sData[3][x]);
+            }
+        }
+        return;
+    }
+
+    // --- uPass 1 : colonnes + assemblage ---
+    if (working) {
+        for (int e = 0; e < 2; ++e) {
+            int  y = t + e * halfN;
+            int  o = OceanRowsIndex(ivec2(line, y), c);
+            vec4 a = spectrum[o], b = spectrum[o + 1];
+            int  r = BitReverse(y);
+            sData[0][r] = a.xy;
+            sData[1][r] = a.zw;
+            sData[2][r] = b.xy;
+            sData[3][r] = b.zw;
+        }
+    }
+    Fft(t, working);
+    if (!working) return;
+
+    float lambda    = uWater.oceanMisc.x;
+    float threshold = uWater.oceanMisc.y;
+    float halfLife  = max(uWater.oceanMisc.z, 1e-3);
+    for (int e = 0; e < 2; ++e) {
+        int   y    = t + e * halfN;
+        float sgn  = ((line + y) & 1) == 0 ? 1.0 : -1.0;
+        vec2  p0   = sData[0][y] * sgn, p1 = sData[1][y] * sgn, p2 = sData[2][y] * sgn, p3 = sData[3][y] * sgn;
+        vec3  disp = vec3(lambda * p0.x, p1.x, lambda * p0.y);
+        float jxx  = 1.0 + lambda * p2.y;
+        float jzz  = 1.0 + lambda * p3.x;
+        float jxz  = lambda * p3.y;
+        float jac  = jxx * jzz - jxz * jxz;
+
+        // Écume : apparaît où la surface se replie (jacobien sous le seuil), puis se résorbe (demi-vie).
+        ivec3 tex  = ivec3(line, y, c);
+        float prev = imageLoad(uOceanMaps, tex).w;
+        float born = clamp((threshold - jac) * 2.0, 0.0, 1.0);
+        float foam = max(prev * exp2(-uDt / halfLife), born);
+
+        imageStore(uOceanMaps, tex, vec4(disp, foam));
+        imageStore(uOceanMaps, ivec3(line, y, OCEAN_CASCADES + c), vec4(p1.y, p2.x, lambda * p2.y, lambda * p3.x));
+    }
+}

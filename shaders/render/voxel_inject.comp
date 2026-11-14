@@ -132,9 +132,9 @@ void InjectTerrainColumn(uint column) {
     if (yTop < 0) return;  // terrain entièrement sous la grille
     int   ySkin  = int(floor((hMinNeighbor - gridY0) / voxel)) - 1;
 
-    // Matériau identique à la G-pass, + neige de la météo (le reste de la météo est appliqué à l'écran).
+    // Matériau identique à la G-pass (humidité et neige comprises).
     TerrainMaterial m = EvaluateTerrainMaterial(uBiomeHydro, uv, N, h);
-    vec3  albedo = mix(m.albedo, vec3(0.9), clamp(envSnow() * smoothstep(0.5, 0.9, N.y), 0.0, 1.0));
+    vec3  albedo = m.albedo;
     vec3  surf   = vec3(colWorld.x, h, colWorld.z);
     vec3  radiance = min(albedo / PI * InjectedIrradiance(surf, N, 0.0), vec3(kMaxRadiance));
 
@@ -239,6 +239,7 @@ void ResolveFoliageVoxel(uint id) {
     // Éclairage une fois par voxel de végétation (et non par plante).
     vec2 center   = uVoxel.uGridMin.xz + (vec2(g) + 0.5) * voxel;
     vec3 p        = vec3(center.x, uVoxel.uGridMin.y + (float(y) + 0.5) * voxel, center.y);
+    albedo        = mix(albedo, kSnowAlbedo, 0.5 * SnowCoverage(p.y, 1.0));  // neige sur les houppiers (G-pass : faces du haut)
     vec3 radiance = min(albedo / PI * InjectedIrradiance(p, vec3(0.0, 1.0, 0.0), wrap), vec3(kMaxRadiance));
 
     // Composition "over" pré-multipliée derrière le terrain déjà écrit (un seul thread par voxel).

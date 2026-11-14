@@ -4,6 +4,7 @@
 //    * Albédo de sol par biome, fondu bilinéaire entre texels (l'id se lit avec texelFetch).
 //    * Roche selon la pente (N.y), lits de rivière / marais boueux et mouillés.
 //    * Pluie : sol mouillé (terrain_material.glsl), flaques et impacts de gouttes (terrain_wetness.glsl).
+//    * Neige selon l'altitude et la pente (terrain_material.glsl, paramètres dans UBO_MaterialParams).
 //    * Sorties (contrat gbuffer.*) : 0 albédo sRGB + AO, 1 normale monde, 2 matériau, 3 vitesse NDC.
 #include "common/global_ubo.glsl"
 #include "render/terrain_material.glsl"
@@ -40,7 +41,8 @@ void main() {
     if (uEnv.weatherExtra.w > 0.35) {
         ivec2 chunk = ivec2(round(uChunkOffset.xz / CHUNK_SIZE_METERS)) + uEnv.originChunk.xy;
         vec4 bh = textureLod(uBiomeHydro, fsIn.uv, 0.0);
-        ws = ApplyPuddlesAndRipples(ws, uHeightNormal, chunk, fsIn.uv, hn.r, m.biome, min(bh.g, bh.b), footprint);
+        ws = ApplyPuddlesAndRipples(ws, uHeightNormal, chunk, fsIn.uv, hn.r, m.biome, min(bh.g, bh.b), m.snow,
+                                    footprint);
     }
 
     vec2 ndcCurr = fsIn.clipCurr.xy / fsIn.clipCurr.w;
