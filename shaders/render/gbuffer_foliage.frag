@@ -28,11 +28,18 @@ void main() {
 
     vec3 N = normalize(mix(normalize(fsIn.normal), vec3(0.0, 1.0, 0.0), bendUp));
 
+    // Pluie : feuilles et rochers mouillés. Les feuilles (cuticule cireuse) ne boivent pas l'eau : elles
+    // foncent peu et deviennent brillantes ; le rocher se comporte comme la roche du terrain.
+    float wet      = smoothstep(0.0, 0.45, clamp(uEnv.weatherExtra.w, 0.0, 1.0));
+    float porosity = fsIn.archetype == FOLIAGE_ROCK ? 0.25 : 0.15;
+    albedo   *= mix(1.0, 0.5, wet * porosity);
+    roughness = mix(roughness, fsIn.archetype == FOLIAGE_ROCK ? 0.15 : 0.35, wet);
+
     vec2 ndcCurr = fsIn.clipCurr.xy / fsIn.clipCurr.w;
     vec2 ndcPrev = fsIn.clipPrev.xy / fsIn.clipPrev.w;
 
     oAlbedo   = vec4(albedo, 1.0);
     oNormal   = vec4(N, 0.0);
-    oMaterial = vec4(roughness, 0.0, uEnv.weatherExtra.w, float(16 + fsIn.archetype) / 255.0);
+    oMaterial = vec4(roughness, 0.0, wet, float(16 + fsIn.archetype) / 255.0);
     oVelocity = ndcCurr - ndcPrev;
 }

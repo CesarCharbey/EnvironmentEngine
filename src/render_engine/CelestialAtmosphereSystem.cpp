@@ -169,13 +169,18 @@ public:
             DirToAzimuthElevation(moonDir, moonAzimuth_, moonElevation_);
         }
 
-        // Machine à états Météo : accumulation et séchage de l'humidité au sol
+        // Machine à états Météo : accumulation et séchage de l'humidité au sol, en deux phases.
+        // Sous kPuddleThreshold (même seuil que terrain_wetness.glsl) : film d'eau en surface, qui se
+        // forme et sèche vite. Au-dessus : eau stockée dans les flaques, qui se remplissent
+        // progressivement et s'évaporent lentement (elles survivent au sol déjà sec en surface).
+        constexpr float kPuddleThreshold = 0.35f;
+        const bool      puddlePhase      = surfaceWetness_ > kPuddleThreshold;
         if (rain_ > 0.01f) {
-            surfaceWetness_ = std::min(1.0f, surfaceWetness_ + rain_ * 0.15f * dt);
+            surfaceWetness_ = std::min(1.0f, surfaceWetness_ + rain_ * (puddlePhase ? 0.04f : 0.15f) * dt);
         } else {
             const float sunHeat = std::max(0.0f, std::sin(glm::radians(sunElevation_)));
             const float dryRate = (0.01f + 0.02f * sunHeat + 0.002f * windSpeed_) * (1.0f - humidity_ * 0.7f);
-            surfaceWetness_ = std::max(0.0f, surfaceWetness_ - dryRate * dt);
+            surfaceWetness_ = std::max(0.0f, surfaceWetness_ - dryRate * (puddlePhase ? 0.5f : 1.5f) * dt);
         }
 
         const float effectiveCoverage = std::max(cloudCoverage_, std::max(rain_, snow_) * 0.85f);

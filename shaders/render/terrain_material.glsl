@@ -4,8 +4,20 @@
 //  la couleur du sol rendu.
 //    * Albédo de sol par biome, fondu bilinéaire entre texels (l'id se lit avec texelFetch).
 //    * Roche selon la pente (N.y), lits de rivière / marais boueux et mouillés.
+//    * Humidité de surface : berges (SDF) + pluie (uEnv.weatherExtra.w, accumulée par
+//      CelestialAtmosphereSystem). Réponse dépendant de la porosité (Lagarde 2013) : un sol poreux
+//      boit l'eau (s'assombrit et se sature, reste assez mat), la roche se couvre d'un film brillant.
+//      Les flaques et les ondes de pluie (détail sous le voxel) sont dans terrain_wetness.glsl (G-pass).
+//  Le shader qui inclut ce fichier doit avoir inclus "common/global_ubo.glsl".
 #ifndef ENV_TERRAIN_MATERIAL_GLSL
 #define ENV_TERRAIN_MATERIAL_GLSL
+
+// Porosité du sol nu par biome : 1 = terre qui boit l'eau, faible = surface dure (film d'eau).
+float BiomePorosity(int biome) {
+    if (biome == BIOME_OCEAN || biome == BIOME_BEACH || biome == BIOME_DESERT) return 0.9;  // sable
+    if (biome == BIOME_HIGH_MOUNTAIN) return 0.5;                                            // éboulis
+    return 1.0;
+}
 
 // Albédo linéaire (rgb) et rugosité (a) du sol nu par biome.
 vec4 BiomeGround(int biome) {
@@ -40,9 +52,12 @@ vec4 BlendedGround(sampler2D biomeHydro, vec2 uv) {
 struct TerrainMaterial {
     vec3  albedo;     // linéaire
     float roughness;  // perceptuelle
-    float wetness;    // humidité de surface (lits et berges), lue par l'éclairage
+    float wetness;    // humidité de surface [0, 1] (berges + pluie) ; gbuffer.material.b
+    float porosity;   // [0, 1] : 1 = terre, ~0,25 = roche
     int   biome;      // id BIOME_* du texel
 };
+
+float TerrainLuminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 
 // uv : UV du chunk [0, 1] ; N : normale monde ; worldY : altitude (m), pour les strates de roche.
 TerrainMaterial EvaluateTerrainMaterial(sampler2D biomeHydro, vec2 uv, vec3 N, float worldY) {
@@ -69,8 +84,23 @@ TerrainMaterial EvaluateTerrainMaterial(sampler2D biomeHydro, vec2 uv, vec3 N, f
     // --- Hydrologie : lit boueux et berges mouillées ---
     float waterSdf = min(riverSdf, marshSdf);
     float bed      = 1.0 - smoothstep(-0.5, 1.0, waterSdf);
-    m.wetness      = 1.0 - smoothstep(0.0, 4.0, waterSdf);
     m.albedo       = mix(m.albedo, vec3(0.10, 0.09, 0.07), bed);
+    m.porosity     = mix(mix(BiomePorosity(m.biome), 0.25, rock), 0.6, bed);  // vase : à demi saturée
+
+    // --- Humidité : berges (capillarité) + pluie. La pluie mouille vite la surface (saturée dès 45 %
+    //     de l'humidité météo) ; au-delà, l'eau s'accumule en flaques (terrain_wetness.glsl). ---
+    float bankWet = 1.0 - smoothstep(0.0, 4.0, waterSdf);
+    float rainWet = smoothstep(0.0, 0.45, clamp(uEnv.weatherExtra.w, 0.0, 1.0));
+    m.wetness     = max(bankWet, rainWet);
+
+    // Réponse PBR (Lagarde 2013) : l'eau remplit les pores -> moins de diffusion vers l'extérieur,
+    // albédo assombri (×0,5 pour une terre saturée) et plus saturé ; rugosité vers un film d'eau, d'autant
+    // plus lisse que la surface est dure (une terre poreuse reste satinée). Le F0 de l'eau est appliqué par
+    // l'éclairage (gbuffer.material.b).
+    float soak  = m.wetness * m.porosity;
+    vec3  sat   = max(mix(vec3(TerrainLuminance(m.albedo)), m.albedo, 1.0 + 0.35 * soak), vec3(0.0));
+    m.albedo    = sat * mix(1.0, 0.5, soak);
+    m.roughness = mix(m.roughness, mix(0.10, 0.38, m.porosity), m.wetness);
     return m;
 }
 

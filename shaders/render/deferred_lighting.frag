@@ -627,11 +627,12 @@ void main() {
         s.metal     = gM.g;
 
         // --- Météo de surface ---
+        // L'humidité (albédo assombri, rugosité, flaques, ondes) est déjà dans le G-Buffer : la G-pass la
+        // calcule par matériau (terrain_material.glsl, terrain_wetness.glsl, gbuffer_foliage.frag).
+        // Il ne reste ici que le F0 de l'eau, et la neige posée par-dessus.
         float snow = clamp(envSnow() * smoothstep(0.5, 0.9, s.N.y), 0.0, 1.0);
-        float wet  = clamp(max(gM.b, uEnv.weatherExtra.w), 0.0, 1.0) * (1.0 - snow);
+        float wet  = clamp(gM.b, 0.0, 1.0) * (1.0 - snow);
         float porous = 1.0 - s.metal;
-        s.albedo    *= mix(1.0, 0.55, wet * porous);        // un matériau poreux mouillé s'assombrit
-        s.roughness  = mix(s.roughness, 0.05, wet);         // film d'eau quasi miroir
         s.albedo     = mix(s.albedo, vec3(0.9), snow);
         s.roughness  = mix(s.roughness, 0.6, snow);
         s.metal      = mix(s.metal, 0.0, snow);
