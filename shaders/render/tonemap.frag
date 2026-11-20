@@ -22,6 +22,10 @@ layout(binding = TEX_SceneDepth) uniform sampler2D uSceneDepth;  // opaque + eau
 layout(rgba16f, binding = IMG_VolumetricOut) readonly uniform image2D uClouds;
 
 uniform bool  uCloudsAvailable;
+uniform bool  uGodRaysAvailable;
+// God rays (volumetric_godrays.comp, demi-résolution) : rgb luminance diffusée par le brouillard (géométrie),
+// a facteur des rayons crépusculaires appliqué à la sky-view (ciel seulement ; 1 sur la géométrie).
+layout(binding = TEX_GodRays) uniform sampler2D uGodRays;
 uniform float uCloudBottom;  // m : base de la couche (rejet du relief situé devant les nuages)
 
 uniform bool  uDataView;      // vue de debug « données brutes » : ni exposition ni tonemap
@@ -92,16 +96,46 @@ bool GeometryInFrontOfClouds(vec2 uv) {
     return length(envWorldPosFromDepth(uv, d) - cam) < tIn;
 }
 
+float LinearSceneDepth(vec2 uv) {
+    float d = textureLod(uSceneDepth, uv, 0.0).r;
+    return envIsSky(d) ? 1.0e7 : envLinearDepth(d);
+}
+
+// Suréchantillonnage bilatéral 3 × 3 des god rays : poids spatial × ressemblance de profondeur (pas de
+// halo autour des montagnes), et lissage du jitter IGN de la marche.
+vec4 GodRaysAt(vec2 uv) {
+    ivec2 size = textureSize(uGodRays, 0);
+    vec2  st   = uv * vec2(size) - 0.5;
+    ivec2 c    = ivec2(floor(st + 0.5));
+    float z0   = LinearSceneDepth(uv);
+    vec4  acc  = vec4(0.0);
+    float wsum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q  = clamp(c + ivec2(x, y), ivec2(0), size - 1);
+            vec2  dq = vec2(q) - st;
+            float zq = LinearSceneDepth((vec2(q) + 0.5) / vec2(size));
+            float w  = exp(-dot(dq, dq) * 0.9) * exp(-abs(log(zq / z0)) * 12.0) + 1e-5;
+            acc  += texelFetch(uGodRays, q, 0) * w;
+            wsum += w;
+        }
+    return acc / wsum;
+}
+
 void main() {
     vec3 hdr = texture(uSceneColor, vUv).rgb;
     if (uDataView) {
         oColor = vec4(LinearToSrgb(hdr), 1.0);
         return;
     }
+    bool skyPixel = envIsSky(texture(uSceneDepth, vUv).r);
+    vec4 gr = uGodRaysAvailable ? GodRaysAt(vUv) : vec4(0.0, 0.0, 0.0, 1.0);
+    if (skyPixel) hdr *= gr.a;  // rayons crépusculaires dans la brume (sky-view seule, avant les nuages)
     if (uCloudsAvailable && !GeometryInFrontOfClouds(vUv)) {
         vec4 cl = CloudsAt(vUv);
         hdr = hdr * cl.a + cl.rgb;
     }
+    hdr += gr.rgb;  // soleil diffusé par le brouillard, ombré par les nuages et le relief (géométrie)
     if (uMoonlightShift) hdr = MoonlightShift(hdr);
     vec3 c = hdr * vExposure;
     if      (uTonemapper == 1) c = AgX(c);

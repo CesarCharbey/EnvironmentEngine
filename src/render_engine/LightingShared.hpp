@@ -67,6 +67,9 @@ struct LightingShared {
     glm::ivec2 cloudShadowOriginChunk{0};              ///< origine de rendu de la frame de calcul
     glm::vec3  cloudShadowLight{0.0f, 1.0f, 0.0f};     ///< astre pour lequel la carte a été calculée
 
+    // --- God rays : distance de marche (0 = inactifs), écrite par VolumetricGodRaysSystem (Update) ---
+    float godRayDistance = 0.0f;
+
     // --- Nuages : écrit par VolumetricGodRaysSystem avec la carte météo, lu par la capture de l'IBL ---
     CloudParams clouds;
 
@@ -142,6 +145,7 @@ inline void SetSurfaceLightingUniforms(const gpu::ShaderProgram& p, glm::ivec2 r
     p.Set("uShadowPenumbra",       glm::radians(s.shadowPenumbraDeg));
     p.Set("uFogHeightFalloff",     s.fogHeightFalloff);
     p.Set("uFogShadows",           s.fogShadows);
+    p.Set("uGodRayDistance",       s.godRayDistance);
     p.Set("uCloudLayerAltitude",   s.cloudLayerAltitude);
     p.Set("uCloudShadowExtent",    s.cloudShadowExtent);
     // Origine exprimée dans le repère de rendu de la frame courante (exact : différence entière de chunks).

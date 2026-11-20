@@ -4,8 +4,8 @@
 //  l'historique. Partagé par le raymarching (volumetric_clouds.comp : mélange du pixel frais avec son
 //  historique) et la résolution (cloud_reproject.comp : pixels non raymarchés).
 //
-//  Historique : cible de la frame précédente, lue en bilinéaire sur le slot TEX_GodRays (même système,
-//  demi-résolution, inutilisé tant que les god rays n'existent pas : pas de nouveau slot au contrat).
+//  Historique : cible de la frame précédente, lue en bilinéaire sur le slot TEX_GodRays PENDANT les passes
+//  des nuages seulement (même système ; le tonemap y lie ensuite les god rays) : pas de nouveau slot.
 //  Le shader qui inclut ce fichier doit avoir inclus "common/global_ubo.glsl", "render/atmo_common.glsl"
 //  et "render/cloud_density.glsl".
 #ifndef ENV_CLOUD_TEMPORAL_GLSL

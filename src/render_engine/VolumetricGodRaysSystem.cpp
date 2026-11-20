@@ -25,8 +25,12 @@
 //    * Reprojection temporelle (cloud_temporal.glsl, cloud_reproject.comp) : 1 pixel sur 2×2 (ou 4×4)
 //      raymarché par frame (Bayer), mélangé à son historique ; les autres reprojetés (ping-pong de deux
 //      cibles, prevViewProj_ + décalage d'origine de rendu) et bornés par les pixels frais voisins.
-//      Historique lu sur le slot TEX_GodRays (même système, inutilisé tant que les god rays n'existent pas).
-//  À faire : god rays.
+//      Historique lu sur le slot TEX_GodRays pendant les passes des nuages seulement (le tonemap y lie
+//      ensuite la vraie texture des god rays).
+//    * God rays volumétriques (volumetric_godrays.comp, demi-résolution, publiés sous volumetrics.godRays) :
+//      lumière de l'astre dominant diffusée par le brouillard de hauteur, ombrée par les nuages et le relief
+//      (VXGI) ; composés dans le tonemap (suréchantillonnage bilatéral). L'éclairage leur laisse le premier
+//      tronçon du rayon (LightingShared::godRayDistance) : pas de double compte avec son brouillard.
 //  RÈGLE : ce fichier n'inclut jamais src/world_engine/ (vérifié au build).
 // =============================================================================
 #include <imgui.h>
@@ -77,6 +81,7 @@ public:
         cloudsProg_  = &ctx.shaders.LoadCompute("render.volumetric_clouds", "render/volumetric_clouds.comp");
         shadowProg_  = &ctx.shaders.LoadCompute("render.cloud_shadow", "render/cloud_shadow.comp");
         reprojectProg_ = &ctx.shaders.LoadCompute("render.cloud_reproject", "render/cloud_reproject.comp");
+        godRaysProg_   = &ctx.shaders.LoadCompute("render.volumetric_godrays", "render/volumetric_godrays.comp");
         // Les textures sont allouées au premier Render() (Init n'émet aucune commande GPU).
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : shaders à créer dans shaders/render/ ; slots du contrat UBO_VolumetricParams,
@@ -163,6 +168,27 @@ public:
             historyValid_    = false;  // redimensionnement / changement d'échelle
         }
 
+        // --- God rays : cible en demi-résolution (republiée après réallocation) ---
+        const glm::ivec2 gs((w + 1) / 2, (h + 1) / 2);
+        if (gs != godRaysSize_) {
+            gpu::Texture2D::Desc d;
+            d.width          = gs.x;
+            d.height         = gs.y;
+            d.internalFormat = GL_RGBA16F;  // rgb luminance diffusée, a transmittance (ciel)
+            d.debugName      = "volumetrics.godRays";
+            godRays_.Create(d);
+            godRaysSize_ = gs;
+            ctx.blackboard.PublishTexture(env::bb::VolumetricGodRays, godRays_, kProducer);
+        }
+        // Distance prise en charge par les god rays : l'éclairage n'y diffuse plus l'astre dominant dans son
+        // brouillard (pas de double compte). 0 sans tonemap (repli LDR de l'éclairage) ou god rays coupés.
+        {
+            LightingShared& lsh = SharedLighting();
+            const bool tonemapRuns = lsh.tonemapFrame != ~std::uint64_t{0} && lsh.tonemapFrame + 1 >= ctx.time.frameIndex;
+            godRaysActive_ = godRaysEnabled_ && tonemapRuns && godRaysProg_ && godRaysProg_->IsValid();
+            lsh.godRayDistance = godRaysActive_ ? godRayMaxDistance_ : 0.0f;
+        }
+
         // --- Reprojection temporelle : matrices et origine de la frame précédente, invalidations ---
         const glm::vec3 sunNow = glm::normalize(glm::vec3(ctx.environment.sunDirIlluminance));
         const glm::vec4 wxNow(ctx.environment.weatherExtra.x, ctx.environment.weatherExtra.y, ctx.environment.weather.x,
@@ -208,6 +234,9 @@ public:
             SharedLighting().clouds.valid     = false;  // la capture de l'IBL revient au ciel seul
         }
 
+        // --- God rays volumétriques (demi-résolution) ---
+        const bool godRays = godRaysActive_ && RenderGodRays(ctx);
+
         display_.Bind();
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
@@ -226,8 +255,11 @@ public:
         p.Set("uWhitePoint",    whitePoint_);
         p.Set("uCloudsAvailable", clouds);
         p.Set("uCloudBottom",   cloudBottom_);
+        p.Set("uGodRaysAvailable", godRays);
+        ctx.blackboard.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
+        // Le slot TEX_GodRays porte l'historique des nuages pendant leurs passes ; ici, les god rays.
+        if (godRays) godRays_.BindUnit(env::bind::tex::GodRays);
         if (clouds) {
-            ctx.blackboard.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
             glBindImageTexture(env::bind::image::VolumetricOut, cloudTargets_[current_].Id(), 0, GL_FALSE, 0, GL_READ_ONLY,
                                GL_RGBA16F);
         }
@@ -261,7 +293,7 @@ public:
         SharedLighting().cloudShadowValid = false;
         SharedLighting().clouds.valid     = false;
         for (std::string_view key : {env::bb::CloudShapeNoise, env::bb::CloudDetailNoise, env::bb::CloudWeatherMap,
-                                     env::bb::CloudShadowMap})
+                                     env::bb::CloudShadowMap, env::bb::VolumetricGodRays})
             ctx.blackboard.UnpublishIfProducer(key, kProducer);
         display_.Destroy();
         emptyVao_.Destroy();
@@ -270,8 +302,10 @@ public:
         weatherMap_.Destroy();
         cloudTargets_[0].Destroy();
         cloudTargets_[1].Destroy();
+        godRays_.Destroy();
+        SharedLighting().godRayDistance = 0.0f;
         shadowMap_.Destroy();
-        tonemapProg_ = noiseProg_ = weatherProg_ = cloudsProg_ = shadowProg_ = reprojectProg_ = nullptr;
+        tonemapProg_ = noiseProg_ = weatherProg_ = cloudsProg_ = shadowProg_ = reprojectProg_ = godRaysProg_ = nullptr;
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : ressources créées par Init.
         // Sorties  : clés clouds.*, volumetrics.godRays et scene.display retirées ; textures et cibles
@@ -345,13 +379,16 @@ public:
 
         ImGui::SeparatorText("God rays");
         ImGui::Checkbox("God rays", &godRaysEnabled_);
-        static const char* kModes[] = {"Radial ecran", "Volumetrique (ombre des nuages)"};
-        ImGui::Combo("Methode", &godRayMode_, kModes, IM_ARRAYSIZE(kModes));
-        ImGui::SliderInt("Echantillons", &godRaySamples_, 8, 256);
-        ImGui::SliderFloat("Densite", &godRayDensity_, 0.0f, 2.0f);
-        ImGui::SliderFloat("Decroissance", &godRayDecay_, 0.8f, 1.0f, "%.3f");
-        ImGui::SliderFloat("Poids", &godRayWeight_, 0.0f, 2.0f);
-        ImGui::SliderFloat("Exposition god rays", &godRayExposure_, 0.0f, 2.0f);
+        ImGui::SetItemTooltip("Lumiere de l'astre diffusee par le brouillard, ombree par les nuages et le relief.\n"
+                              "Milieu : brouillard de hauteur (densite : panneau Celestial, decroissance : Lighting).");
+        ImGui::BeginDisabled(!godRaysEnabled_);
+        ImGui::SliderFloat("Intensite (diffusion)", &godRayIntensity_, 0.0f, 8.0f, "x%.2f");
+        ImGui::SliderFloat("Distance de marche", &godRayMaxDistance_, 300.0f, 6000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Anisotropie (g)", &godRayAnisotropy_, 0.0f, 0.95f, "%.2f");
+        ImGui::SliderInt("Pas", &godRaySteps_, 8, 96);
+        ImGui::SliderFloat("Rayons dans le ciel", &godRaySkyShafts_, 0.0f, 1.0f);
+        ImGui::SetItemTooltip("Rayons crepusculaires : la brume a l'ombre des nuages ne diffuse plus le soleil.");
+        ImGui::EndDisabled();
 
         ImGui::SeparatorText("Post (scene.display)");
         LightingShared& sh = SharedLighting();
@@ -474,6 +511,26 @@ private:
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
             historyValid_ = true;
         }
+        return true;
+    }
+
+    /// God rays : marche dans le brouillard ombré par les nuages (clouds.shadowMap) et le relief (VXGI).
+    bool RenderGodRays(EngineContext& ctx) {
+        if (!godRays_.IsValid()) return false;
+        const core::RenderBlackboard& bb = ctx.blackboard;
+        BindSurfaceLightingResources(bb);  // ombre des nuages, grille VXGI, transmittance, ciel
+        bb.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
+        const gpu::ShaderProgram& p = *godRaysProg_;
+        SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
+        p.Set("uSteps", godRaySteps_);
+        p.Set("uMaxDistance", godRayMaxDistance_);
+        p.Set("uIntensity", godRayIntensity_);
+        p.Set("uAnisotropy", godRayAnisotropy_);
+        p.Set("uSkyShafts", godRaySkyShafts_);
+        godRays_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
+        p.Use();
+        glDispatchCompute(static_cast<GLuint>((godRaysSize_.x + 7) / 8), static_cast<GLuint>((godRaysSize_.y + 7) / 8), 1);
+        glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);  // lue par texelFetch dans le tonemap
         return true;
     }
 
@@ -611,6 +668,10 @@ private:
     int                 current_ = 0;
     glm::ivec2          cloudTargetSize_{0};
     gpu::ShaderProgram* reprojectProg_ = nullptr;
+    gpu::ShaderProgram* godRaysProg_   = nullptr;
+    gpu::Texture2D      godRays_;
+    glm::ivec2          godRaysSize_{0};
+    bool                godRaysActive_ = false;
     bool                historyValid_  = false;
     bool                hasPrevFrame_  = false;
     int                 temporalPattern_ = 0;   ///< 0 = 2×2, 1 = 4×4
@@ -656,13 +717,12 @@ private:
     float silverIntensity_  = 1.5f;
     float powder_           = 2.0f;
     float windInfluence_    = 1.0f;
-    bool  godRaysEnabled_   = true;
-    int   godRayMode_       = 0;
-    int   godRaySamples_    = 64;
-    float godRayDensity_    = 0.9f;
-    float godRayDecay_      = 0.96f;
-    float godRayWeight_     = 0.4f;
-    float godRayExposure_   = 0.3f;
+    bool  godRaysEnabled_    = true;
+    float godRayIntensity_   = 1.0f;
+    float godRayMaxDistance_ = 2500.0f;
+    float godRayAnisotropy_  = 0.8f;
+    int   godRaySteps_       = 32;
+    float godRaySkyShafts_   = 1.0f;
     float exposureEv_       = 13.0f;  // EV100 manuel (journée ensoleillée ≈ 15)
     bool  autoExposure_     = true;
     int   tonemapper_       = 0;      // ACES : même rendu qu'avant la passe de tonemap

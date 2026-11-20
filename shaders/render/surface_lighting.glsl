@@ -39,6 +39,8 @@ uniform vec3  uFocusChunkOrigin;       // coin du chunk focus relatif à l'origi
 uniform float uShadowPenumbra;         // demi-angle (rad) de la pénombre des ombres du relief
 uniform float uFogHeightFalloff;       // 1/m : décroissance verticale du brouillard
 uniform bool  uFogShadows;             // ombre volumétrique du brouillard (grille VXGI)
+uniform float uGodRayDistance;         // m : 0 = pas de god rays ; sinon le soleil (ou la lune) diffusé par le
+                                       // brouillard sur [0, uGodRayDistance] est calculé par volumetric_godrays.comp
 uniform float uCloudLayerAltitude;     // m : plan de projection de l'ombre des nuages (base de la couche)
 uniform float uCloudShadowExtent;      // m : emprise de clouds.shadowMap
 uniform vec2  uCloudShadowOrigin;      // m : centre de la carte, xz relatif à l'origine de rendu courante
@@ -384,8 +386,15 @@ vec3 ApplyHeightFog(vec3 color, vec3 P, vec3 rayDir, float dist, float sunShadow
     if (surfShadow < 0.99 && fog > 0.002 &&
         fog * Luminance(mainTerm) > 0.03 * Luminance(mix(color, ambient, fog)))
         vis = FogLightVisibility(rayDir, dist, normalize(sunUp ? envSunDirection() : envMoonDirection()));
-    vec3 inscatter = ambient + (sunUp ? sunTerm * vis + moonTerm : sunTerm + moonTerm * vis);
-    return mix(color, inscatter, fog);
+    vec3 otherTerm = sunUp ? moonTerm : sunTerm;
+    // Part de l'astre dominant : tronçon [0, dist] entier, ou seulement [uGodRayDistance, dist] quand les god
+    // rays (ombres des nuages et du relief) calculent déjà le premier tronçon (pas de double compte).
+    float mainWeight = fog;
+    if (uGodRayDistance > 0.0) {
+        float Tm = exp(-max(FogOpticalDepth(min(uGodRayDistance, dist), rayDir.y), 0.0));
+        mainWeight = max(Tm - (1.0 - fog), 0.0);
+    }
+    return color * (1.0 - fog) + (ambient + otherTerm) * fog + mainTerm * vis * mainWeight;
 }
 
 

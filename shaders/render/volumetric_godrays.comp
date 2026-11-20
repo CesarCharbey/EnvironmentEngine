@@ -1,0 +1,126 @@
+#version 460 core
+//  shaders/render/volumetric_godrays.comp                              [DEV 2]
+//  God rays volumétriques (rayons crépusculaires 3D), demi-résolution : lumière de l'astre dominant
+//  (soleil, sinon lune) diffusée par le brouillard de hauteur le long du rayon de vue, OMBRÉE par les
+//  nuages (clouds.shadowMap via CloudShadow) et par le relief et la végétation (cône dans la grille VXGI).
+//  Les trouées des nuages et les crêtes découpent ainsi des faisceaux dans l'air.
+//
+//  Partage du travail avec le brouillard de l'éclairage (ApplyHeightFog, surface_lighting.glsl), même milieu
+//  σ(y) = σ0 exp(-k y) (uEnv.weatherExtra.z, uFogHeightFalloff) :
+//    * géométrie : ce pass intègre l'astre dominant sur [0, min(distance, uMaxDistance)] ; l'éclairage garde
+//      l'ambiant, l'extinction et la suite du rayon -> sortie rgb, a = 1 ;
+//    * ciel : pas de brouillard (comme dans l'éclairage, qui ne l'applique pas au ciel) : avec la densité par
+//      défaut, 2,5 km de brouillard face à un soleil bas noyaient tout le ciel dans un éblouissement blanc.
+//  Rayons crépusculaires dans le ciel : le brouillard (≈ 200 m d'épaisseur) ne monte pas jusqu'aux nuages ;
+//  les faisceaux naissent dans la brume de la couche limite (~1,2 km), dont la diffusion est DÉJÀ dans la
+//  sky-view (sans ombre). On mesure donc la visibilité moyenne de l'astre le long du rayon dans cette brume
+//  (pondérée par sa densité) et on module la luminance du ciel par elle, plus fort vers l'astre (part de
+//  Mie) : a = facteur appliqué au ciel avant les nuages. Ni double compte ni halo ajouté.
+//  Marche de uSteps pas, jitter IGN différent à chaque frame (lissé par le suréchantillonnage 3 × 3 du
+//  tonemap) ; ombre du relief évaluée sur 8 points du rayon et interpolée (coût).
+#include "common/global_ubo.glsl"
+#include "render/atmo_common.glsl"
+#include "render/sky_lighting.glsl"
+#include "render/voxel_common.glsl"
+#include "render/surface_lighting.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_VolumetricOut) writeonly uniform image2D uGodRaysOut;
+layout(binding = TEX_SceneDepth) uniform sampler2D uSceneDepth;  // opaque + eau
+
+uniform int   uSteps;
+uniform float uMaxDistance;   // m
+uniform float uIntensity;     // multiplicateur de la diffusion (1 = même milieu que le brouillard)
+uniform float uAnisotropy;    // g de Henyey-Greenstein (fort lobe avant)
+uniform float uSkyShafts;     // force des rayons crépusculaires dans le ciel [0, 1]
+
+const float kHazeScaleHeight = 1200.0;  // m : brume de la couche limite
+const float kHazeTop         = 3000.0;  // m : au-delà, plus de brume utile
+const int   kHazeSteps       = 16;
+
+// Visibilité moyenne de l'astre dans la brume le long d'un rayon de ciel (1 = aucun nuage ne l'ombre).
+float HazeVisibility(vec3 cam, vec3 dir, vec3 L, float jitter) {
+    float len = dir.y > 1e-3 ? min((kHazeTop - cam.y) / dir.y, 30000.0) : 30000.0;
+    if (len <= 0.0) return 1.0;
+    float dt = len / float(kHazeSteps);
+    float acc = 0.0, wsum = 0.0;
+    for (int i = 0; i < kHazeSteps; ++i) {
+        vec3  p = cam + dir * ((float(i) + jitter) * dt);
+        float w = exp(-max(p.y, 0.0) / kHazeScaleHeight);
+        acc  += w * CloudShadow(p, L);
+        wsum += w;
+    }
+    return wsum > 0.0 ? acc / wsum : 1.0;
+}
+
+const int kShadowPoints = 8;
+
+void main() {
+    ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uGodRaysOut);
+    if (any(greaterThanEqual(id, size))) return;
+    vec2 uv = (vec2(id) + 0.5) / vec2(size);
+
+    vec3  cam    = envCameraPosition();
+    vec3  dir    = envViewRayWorld(uv);
+    float depth  = textureLod(uSceneDepth, uv, 0.0).r;
+    bool  sky    = envIsSky(depth);
+    float dist   = sky ? uMaxDistance : min(length(envWorldPosFromDepth(uv, depth) - cam), uMaxDistance);
+
+    vec3  sunDir  = normalize(envSunDirection());
+    vec3  moonDir = normalize(envMoonDirection());
+    bool  sunUp   = sunDir.y > -0.02;  // même astre dominant que le brouillard et l'ombre des nuages
+    vec3  L       = sunUp ? sunDir : moonDir;
+    if (dist <= 1.0 || (!sunUp && moonDir.y <= -0.02)) {
+        imageStore(uGodRaysOut, id, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    vec3  E0    = sunUp ? SunIlluminanceTOA() * uSunScale : MoonIlluminanceTOA() * uMoonScale;
+    float angR  = sunUp ? SunAngularRadius() : MoonAngularRadius();
+    float phase = PhaseHenyeyGreenstein(dot(dir, L), uAnisotropy);
+    // Humidité : la pluie charge l'air en gouttelettes, les faisceaux ressortent davantage.
+    float boost = uIntensity * (1.0 + 1.5 * clamp(uEnv.weather.x, 0.0, 1.0));
+
+    float frame  = float(uEnv.frameInfo.x % 64u);
+    float jitter = InterleavedGradientNoise(vec2(id) + 5.588238 * frame);
+
+    // Ciel : rayons crépusculaires (modulation de la sky-view par la visibilité dans la brume).
+    float skyFactor = 1.0;
+    if (sky && uSkyShafts > 0.0) {
+        float f    = HazeVisibility(cam, dir, L, jitter);
+        float mieW = mix(0.25, 0.8, smoothstep(0.3, 1.0, dot(dir, L)));  // part de Mie dans le ciel
+        skyFactor  = mix(1.0, f, uSkyShafts * mieW);
+    }
+    if (sky || uEnv.weatherExtra.z <= 0.0) {
+        imageStore(uGodRaysOut, id, vec4(0.0, 0.0, 0.0, skyFactor));
+        return;
+    }
+    // Ombre du relief (cône VXGI) sur kShadowPoints points régulièrement espacés, interpolée entre eux.
+    float terrainVis[kShadowPoints];
+    bool  voxel = uVoxelShadows && uVoxelAvailable && uVoxel.uGridExtent.w > 0.5;
+    for (int k = 0; k < kShadowPoints; ++k) {
+        vec3 p = cam + dir * (dist * (float(k) + 0.5) / float(kShadowPoints));
+        terrainVis[k] = voxel && VoxelUvwInside(VoxelUvw(p, uVoxel.uGridMin.xyz))
+                      ? VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.06, 0.5 * VoxelSize(), 1500.0, 12) : 1.0;
+    }
+
+    float dt     = dist / float(uSteps);
+    vec3  acc    = vec3(0.0);
+    float Tprev  = 1.0;
+    for (int i = 0; i < uSteps; ++i) {
+        float t  = (float(i) + jitter) * dt;
+        vec3  p  = cam + dir * t;
+        float T1 = exp(-max(FogOpticalDepth(min((float(i) + 1.0) * dt, dist), dir.y), 0.0));
+        float w  = Tprev - T1;  // part de lumière diffusée par ce tronçon et transmise jusqu'à l'œil
+        Tprev    = T1;
+        if (w <= 0.0) continue;
+        float kf  = clamp(t / dist * float(kShadowPoints) - 0.5, 0.0, float(kShadowPoints - 1));
+        int   k0  = int(kf);
+        float vis = mix(terrainVis[k0], terrainVis[min(k0 + 1, kShadowPoints - 1)], kf - float(k0));
+        vis *= CloudShadow(p, L);
+        acc += w * vis * LightTransmittance(p.y, L, angR);
+    }
+    vec3 rgb = acc * E0 * phase * boost;
+    imageStore(uGodRaysOut, id, vec4(min(rgb, vec3(65000.0)), skyFactor));
+}
