@@ -22,7 +22,11 @@
 //    * Ombre des nuages au sol (cloud_shadow.comp -> clouds.shadowMap, R16F 512², 20 km calés sur un texel),
 //      même modèle de densité (cloud_density.glsl) ; lue par CloudShadow() (surface_lighting.glsl) à la
 //      frame suivante, avec l'origine, l'astre et la base de couche stockés dans LightingShared.
-//  À faire : reprojection temporelle, god rays.
+//    * Reprojection temporelle (cloud_temporal.glsl, cloud_reproject.comp) : 1 pixel sur 2×2 (ou 4×4)
+//      raymarché par frame (Bayer), mélangé à son historique ; les autres reprojetés (ping-pong de deux
+//      cibles, prevViewProj_ + décalage d'origine de rendu) et bornés par les pixels frais voisins.
+//      Historique lu sur le slot TEX_GodRays (même système, inutilisé tant que les god rays n'existent pas).
+//  À faire : god rays.
 //  RÈGLE : ce fichier n'inclut jamais src/world_engine/ (vérifié au build).
 // =============================================================================
 #include <imgui.h>
@@ -72,6 +76,7 @@ public:
         weatherProg_ = &ctx.shaders.LoadCompute("render.cloud_weather_map", "render/cloud_weather_map.comp");
         cloudsProg_  = &ctx.shaders.LoadCompute("render.volumetric_clouds", "render/volumetric_clouds.comp");
         shadowProg_  = &ctx.shaders.LoadCompute("render.cloud_shadow", "render/cloud_shadow.comp");
+        reprojectProg_ = &ctx.shaders.LoadCompute("render.cloud_reproject", "render/cloud_reproject.comp");
         // Les textures sont allouées au premier Render() (Init n'émet aucune commande GPU).
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : shaders à créer dans shaders/render/ ; slots du contrat UBO_VolumetricParams,
@@ -144,14 +149,37 @@ public:
         const int div = 1 << std::clamp(renderScaleIndex_, 0, 2);
         const glm::ivec2 cs((w + div - 1) / div, (h + div - 1) / div);
         if (cs != cloudTargetSize_) {
+            // Deux cibles en ping-pong : la courante (écrite, lue par le tonemap) et l'historique (frame
+            // précédente). RGBA16F, linéaire, GL_CLAMP_TO_EDGE.
             gpu::Texture2D::Desc d;
             d.width          = cs.x;
             d.height         = cs.y;
             d.internalFormat = GL_RGBA16F;
-            d.debugName      = "clouds.target";
-            cloudTarget_.Create(d);
+            d.debugName      = "clouds.targetA";
+            cloudTargets_[0].Create(d);
+            d.debugName      = "clouds.targetB";
+            cloudTargets_[1].Create(d);
             cloudTargetSize_ = cs;
+            historyValid_    = false;  // redimensionnement / changement d'échelle
         }
+
+        // --- Reprojection temporelle : matrices et origine de la frame précédente, invalidations ---
+        const glm::vec3 sunNow = glm::normalize(glm::vec3(ctx.environment.sunDirIlluminance));
+        const glm::vec4 wxNow(ctx.environment.weatherExtra.x, ctx.environment.weatherExtra.y, ctx.environment.weather.x,
+                              ctx.environment.weather.y);
+        const int  block    = temporal_ ? (temporalPattern_ == 0 ? 2 : 4) : 1;
+        const bool jump     = !hasPrevFrame_ || glm::dot(sunNow, prevSun_) < std::cos(glm::radians(1.0f)) ||
+                              glm::any(glm::greaterThan(glm::abs(wxNow - prevWeather_), glm::vec4(0.08f))) ||
+                              block != prevBlock_;
+        if (jump) historyValid_ = false;  // saut d'heure / de météo, motif changé : historique écarté 1 frame
+        prevViewProj_     = hasPrevFrame_ ? lastViewProj_ : ctx.environment.viewProj;
+        prevOriginChunk_  = hasPrevFrame_ ? lastOriginChunk_ : ctx.renderOriginChunk;
+        lastViewProj_     = ctx.environment.viewProj;
+        lastOriginChunk_  = ctx.renderOriginChunk;
+        prevSun_          = sunNow;
+        prevWeather_      = wxNow;
+        prevBlock_        = block;
+        hasPrevFrame_     = true;
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : taille du viewport, échelle de résolution du panneau, couverture et densité nuageuses
         //            (weatherExtra), vent (windDirSpeed) lus dans le GlobalEnvironmentUBO.
@@ -197,7 +225,8 @@ public:
         p.Set("uCloudBottom",   cloudBottom_);
         if (clouds) {
             ctx.blackboard.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
-            glBindImageTexture(env::bind::image::VolumetricOut, cloudTarget_.Id(), 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
+            glBindImageTexture(env::bind::image::VolumetricOut, cloudTargets_[current_].Id(), 0, GL_FALSE, 0, GL_READ_ONLY,
+                               GL_RGBA16F);
         }
         p.Use();
         emptyVao_.Bind();
@@ -235,9 +264,10 @@ public:
         shapeNoise_.Destroy();
         detailNoise_.Destroy();
         weatherMap_.Destroy();
-        cloudTarget_.Destroy();
+        cloudTargets_[0].Destroy();
+        cloudTargets_[1].Destroy();
         shadowMap_.Destroy();
-        tonemapProg_ = noiseProg_ = weatherProg_ = cloudsProg_ = shadowProg_ = nullptr;
+        tonemapProg_ = noiseProg_ = weatherProg_ = cloudsProg_ = shadowProg_ = reprojectProg_ = nullptr;
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : ressources créées par Init.
         // Sorties  : clés clouds.*, volumetrics.godRays et scene.display retirées ; textures et cibles
@@ -261,8 +291,11 @@ public:
         ImGui::SliderFloat("Distance max", &maxDistance_, 5000.0f, 150000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("Fondu lointain", &fadeDistance_, 5000.0f, 200000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
         ImGui::SetItemTooltip("Distance caracteristique a laquelle les nuages se fondent dans le ciel.");
-        ImGui::BeginDisabled();
-        ImGui::Checkbox("Reprojection temporelle (a venir)", &temporal_);
+        ImGui::Checkbox("Reprojection temporelle", &temporal_);
+        ImGui::SetItemTooltip("Un pixel par bloc est raymarche a chaque frame, les autres sont reprojetes.");
+        ImGui::BeginDisabled(!temporal_);
+        static const char* kPatterns[] = {"2 x 2 (1/4 par frame)", "4 x 4 (1/16 par frame)"};
+        ImGui::Combo("Motif", &temporalPattern_, kPatterns, IM_ARRAYSIZE(kPatterns));
         ImGui::EndDisabled();
         ImGui::SliderFloat("Echelle bruit de forme", &shapeScale_, 1000.0f, 50000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("Echelle bruit de detail", &detailScale_, 50.0f, 5000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
@@ -366,7 +399,7 @@ private:
             ctx.blackboard.PublishTexture(env::bb::CloudShadowMap, shadowMap_, kProducer);
             noiseReady_ = true;
         }
-        if (!cloudTarget_.IsValid()) return false;
+        if (!cloudTargets_[0].IsValid() || !reprojectProg_->IsValid()) return false;
 
         // --- Passe 1 : carte météo glissante ---
         {
@@ -414,14 +447,60 @@ private:
             p.Set("uPowder", powder_);
             p.Set("uMaxDistance", maxDistance_);
             p.Set("uFadeDistance", fadeDistance_);
-            cloudTarget_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
+            // Ping-pong : la cible de la frame précédente devient l'historique.
+            current_ ^= 1;
+            const int        block = historyValid_ ? prevBlock_ : 1;  // historique invalide : tout raymarcher
+            const glm::ivec2 offset = BayerOffset(block, ctx.time.frameIndex);
+            SetTemporalUniforms(p, ctx, block, offset);
+            cloudTargets_[current_].BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
+            cloudTargets_[current_ ^ 1].BindUnit(env::bind::tex::GodRays);  // historique (cf. cloud_temporal.glsl)
             p.Use();
-            glDispatchCompute(static_cast<GLuint>((cloudTargetSize_.x + 7) / 8),
-                              static_cast<GLuint>((cloudTargetSize_.y + 7) / 8), 1);
-            // Lu ensuite par imageLoad dans la passe de tonemap.
+            const glm::ivec2 cells = (cloudTargetSize_ + block - 1) / block;
+            glDispatchCompute(static_cast<GLuint>((cells.x + 7) / 8), static_cast<GLuint>((cells.y + 7) / 8), 1);
+            // Pixels frais relus par imageLoad dans la résolution.
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+            // --- Passe 4 : résolution temporelle (pixels non raymarchés) ---
+            if (block > 1) {
+                const gpu::ShaderProgram& r = *reprojectProg_;
+                SetDensityUniforms(r);
+                SetTemporalUniforms(r, ctx, block, offset);
+                r.Set("uAtmoAvailable", sh.atmoAvailable);
+                cloudTargets_[current_].BindImage(env::bind::image::VolumetricOut, GL_READ_WRITE);
+                r.Use();
+                glDispatchCompute(static_cast<GLuint>((cloudTargetSize_.x + 7) / 8),
+                                  static_cast<GLuint>((cloudTargetSize_.y + 7) / 8), 1);
+            }
+            // Lu par imageLoad dans la passe de tonemap, puis comme historique (texture) à la frame suivante.
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+            historyValid_ = true;
         }
         return true;
+    }
+
+    /// Pixel raymarché dans chaque bloc à la frame `frame` (matrices de Bayer : les B² positions sont
+    /// visitées en B² frames, dans un ordre qui disperse les pixels frais successifs).
+    static glm::ivec2 BayerOffset(int block, std::uint64_t frame) {
+        if (block <= 1) return glm::ivec2(0);
+        static constexpr int kBayer2[4][2]  = {{0, 0}, {1, 1}, {1, 0}, {0, 1}};
+        static constexpr int kBayer4[16][2] = {{0, 0}, {2, 2}, {2, 0}, {0, 2}, {1, 1}, {3, 3}, {3, 1}, {1, 3},
+                                               {1, 0}, {3, 2}, {3, 0}, {1, 2}, {0, 1}, {2, 3}, {2, 1}, {0, 3}};
+        if (block == 2) {
+            const auto& o = kBayer2[frame % 4];
+            return {o[0], o[1]};
+        }
+        const auto& o = kBayer4[frame % 16];
+        return {o[0], o[1]};
+    }
+
+    /// Uniforms de cloud_temporal.glsl.
+    void SetTemporalUniforms(const gpu::ShaderProgram& p, const EngineContext& ctx, int block, glm::ivec2 offset) const {
+        p.Set("uBlock", block);
+        p.Set("uBlockOffset", offset);
+        p.Set("uHistoryValid", historyValid_);
+        p.Set("uPrevViewProj", prevViewProj_);
+        // Origine courante - origine précédente (m) : exacte, différence entière de chunks.
+        p.Set("uOriginShift", glm::vec2(ctx.renderOriginChunk - prevOriginChunk_) * kChunkSizeMeters);
     }
 
     /// Uniforms de cloud_density.glsl (raymarching et ombre : mêmes nuages).
@@ -516,8 +595,20 @@ private:
     gpu::Texture3D      shapeNoise_;
     gpu::Texture3D      detailNoise_;
     gpu::Texture2D      weatherMap_;
-    gpu::Texture2D      cloudTarget_;
+    gpu::Texture2D      cloudTargets_[2];       ///< ping-pong : courante / historique
+    int                 current_ = 0;
     glm::ivec2          cloudTargetSize_{0};
+    gpu::ShaderProgram* reprojectProg_ = nullptr;
+    bool                historyValid_  = false;
+    bool                hasPrevFrame_  = false;
+    int                 temporalPattern_ = 0;   ///< 0 = 2×2, 1 = 4×4
+    int                 prevBlock_       = 1;   ///< taille de bloc de la frame courante (fixée dans Update)
+    glm::mat4           prevViewProj_{1.0f};
+    glm::mat4           lastViewProj_{1.0f};
+    glm::ivec2          prevOriginChunk_{0};
+    glm::ivec2          lastOriginChunk_{0};
+    glm::vec3           prevSun_{0.0f, 1.0f, 0.0f};
+    glm::vec4           prevWeather_{0.0f};
     bool                noiseReady_ = false;
     double              windOffset_[2] = {0.0, 0.0};  ///< m, accumulé (double : monde infini)
     double              frontPeriod_   = 1.0;

@@ -1,0 +1,61 @@
+#version 460 core
+//  shaders/render/cloud_reproject.comp                                 [DEV 2]
+//  Résolution temporelle des nuages, en demi-résolution, après volumetric_clouds.comp. La cible courante
+//  (IMG_VolumetricOut, lue telle quelle par la passe de tonemap) contient déjà le pixel raymarché de
+//  chaque bloc (mélangé à son historique) ; ce pass remplit les autres pixels :
+//    * reprojection du rayon du pixel dans la frame précédente (distance de la couche : parallaxe ;
+//      décalage d'origine de rendu compensé), lecture bilinéaire de l'historique ;
+//    * clamping de voisinage : l'historique est borné par les pixels frais des 3 × 3 blocs voisins (pas de
+//      traînée lors des mouvements rapides de caméra, de soleil ou de nuages) ;
+//    * reprojection hors écran (ou historique invalide) : interpolation bilinéaire des pixels frais voisins.
+//  Aucune course : seuls les pixels non frais sont écrits, seuls les pixels frais sont lus.
+#include "common/global_ubo.glsl"
+#include "render/atmo_common.glsl"
+#include "render/sky_lighting.glsl"
+#include "render/cloud_density.glsl"
+#include "render/cloud_temporal.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_VolumetricOut) uniform image2D uClouds;  // cible courante (lecture / écriture)
+
+ivec2 FreshPixel(ivec2 block, ivec2 size) {
+    ivec2 lastBlock = (size - 1 - uBlockOffset) / uBlock;  // dernier bloc dont le pixel frais existe
+    block = clamp(block, ivec2(0), max(lastBlock, ivec2(0)));
+    return min(block * uBlock + uBlockOffset, size - 1);
+}
+
+// Interpolation bilinéaire des pixels frais des 4 blocs les plus proches (repli sans historique : pas de
+// blocs visibles en 4 × 4 sur les pixels qui entrent à l'écran).
+vec4 FreshBilinear(ivec2 id, ivec2 size) {
+    vec2  g  = (vec2(id - uBlockOffset)) / float(uBlock);  // position dans la grille des pixels frais
+    ivec2 b0 = ivec2(floor(g));
+    vec2  f  = g - vec2(b0);
+    vec4 a = imageLoad(uClouds, FreshPixel(b0, size)), b = imageLoad(uClouds, FreshPixel(b0 + ivec2(1, 0), size));
+    vec4 c = imageLoad(uClouds, FreshPixel(b0 + ivec2(0, 1), size)), d = imageLoad(uClouds, FreshPixel(b0 + 1, size));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+void main() {
+    ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uClouds);
+    if (uBlock <= 1 || any(greaterThanEqual(id, size))) return;
+    ivec2 block = id / uBlock;
+    if (id == block * uBlock + uBlockOffset) return;  // pixel frais : déjà écrit
+
+    // Voisinage des pixels frais (3 × 3 blocs) : boîte de clamping.
+    vec4 mn = vec4(1e9), mx = vec4(-1e9);
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            vec4 c = imageLoad(uClouds, FreshPixel(block + ivec2(x, y), size));
+            mn = min(mn, c);
+            mx = max(mx, c);
+        }
+    vec4 res = FreshBilinear(id, size);
+    if (uHistoryValid) {
+        vec2 uv  = (vec2(id) + 0.5) / vec2(size);
+        vec2 uvp = ReprojectCloudUv(envViewRayWorld(uv));
+        if (UvInside(uvp)) res = clamp(textureLod(uCloudHistory, uvp, 0.0), mn, mx);
+    }
+    imageStore(uClouds, id, res);
+}

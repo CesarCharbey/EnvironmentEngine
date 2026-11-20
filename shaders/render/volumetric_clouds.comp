@@ -19,9 +19,11 @@
 #include "render/atmo_common.glsl"
 #include "render/sky_lighting.glsl"
 #include "render/cloud_density.glsl"   // modèle de densité (partagé avec cloud_shadow.comp)
+#include "render/cloud_temporal.glsl"  // reprojection temporelle (motif, historique)
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+// Cible courante en demi-résolution : ce pass n'écrit que le pixel raymarché de chaque bloc.
 layout(rgba16f, binding = IMG_VolumetricOut) writeonly uniform image2D uCloudsOut;
 
 layout(binding = TEX_GBufferDepth)     uniform sampler2D   uGDepth;
@@ -64,8 +66,25 @@ float InterleavedGradientNoise(vec2 pixel) {
     return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
 }
 
+// Pixel frais, mélangé à son historique reprojeté (lisse le jitter d'une frame à l'autre). L'historique
+// est écarté si la reprojection sort de l'écran ou s'il diffère trop (nuage apparu / disparu).
+void StoreCloud(ivec2 id, vec3 dir, vec4 res) {
+    if (uBlock > 1 && uHistoryValid) {
+        vec2 uvp = ReprojectCloudUv(dir);
+        if (UvInside(uvp)) {
+            vec4  hist  = textureLod(uCloudHistory, uvp, 0.0);
+            float lr    = dot(res.rgb, vec3(0.2126, 0.7152, 0.0722)), lh = dot(hist.rgb, vec3(0.2126, 0.7152, 0.0722));
+            float diff  = max(abs(hist.a - res.a), abs(lh - lr) / max(max(lh, lr), 1e-3));
+            float alpha = mix(0.5, 1.0, smoothstep(0.15, 0.6, diff));
+            res = mix(hist, res, alpha);
+        }
+    }
+    imageStore(uCloudsOut, id, res);
+}
+
 void main() {
-    ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    // Un thread par bloc uBlock × uBlock ; il raymarche le pixel uBlockOffset du bloc (motif de Bayer).
+    ivec2 id   = ivec2(gl_GlobalInvocationID.xy) * uBlock + uBlockOffset;
     ivec2 size = imageSize(uCloudsOut);
     if (any(greaterThanEqual(id, size))) return;
     vec2 uv = (vec2(id) + 0.5) / vec2(size);
@@ -98,9 +117,15 @@ void main() {
         else            tA = max(tA, bot.y);  // la caméra est sous la base : on commence en sortant
     }
     if (gnd.x > 0.0) tB = min(tB, gnd.x);
-    tB = min(min(tB, geomDist), tA + uMaxDistance);
+    // Relief DEVANT la couche (montagne sur le ciel) : on marche quand même, à moitié des pas. La
+    // composition cache ces nuages au pixel près ; l'historique reste ainsi valide derrière les
+    // silhouettes, et un ciel découvert par le mouvement n'a pas de traînée vide. Relief DANS la couche :
+    // la marche s'arrête dessus.
+    bool behindRelief = geomDist < tA;
+    if (!behindRelief) tB = min(tB, geomDist);
+    tB = min(tB, tA + uMaxDistance);
     if (top.y <= 0.0 || tB <= tA) {
-        imageStore(uCloudsOut, id, vec4(0.0, 0.0, 0.0, 1.0));
+        StoreCloud(id, dir, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
 
@@ -118,9 +143,11 @@ void main() {
     // Ambiant : ciel (IBL, radiance E/π au zénith) ; plus sombre à la base des nuages.
     vec3 skyAmb = uIblAvailable ? texture(uIblIrradiance, vec3(0.0, 1.0, 0.0)).rgb : SkyAverage();
 
-    int   steps  = max(uPrimarySteps, 4);
+    int   steps  = max(behindRelief ? uPrimarySteps / 2 : uPrimarySteps, 4);
     float dt     = (tB - tA) / float(steps);
-    float t      = tA + dt * InterleavedGradientNoise(vec2(id));
+    // Jitter différent à chaque frame (IGN décalé, Jimenez 2014) : l'accumulation temporelle le lisse.
+    float frame  = float(uEnv.frameInfo.x % 64u);
+    float t      = tA + dt * InterleavedGradientNoise(vec2(id) + 5.588238 * frame);
     float thick  = uCloudTop - uCloudBottom;
     vec3  Lsum   = vec3(0.0);
     float T      = 1.0;
@@ -198,5 +225,5 @@ void main() {
     float dCloud = wSum > 0.0 ? tWeighted / wSum : tA;
     float fade   = exp(-dCloud / max(uFadeDistance, 1.0));
     Lsum = mix(SkyLuminance(dir) * (1.0 - T), Lsum, fade);
-    imageStore(uCloudsOut, id, vec4(min(Lsum, vec3(65000.0)), T));
+    StoreCloud(id, dir, vec4(min(Lsum, vec3(65000.0)), T));
 }
