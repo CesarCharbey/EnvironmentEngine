@@ -1,0 +1,58 @@
+#version 460 core
+//  shaders/render/cloud_shadow.comp                                    [DEV 2]
+//  Carte d'ombre des nuages au sol (clouds.shadowMap, R16F 512²) : transmittance de la couche nuageuse
+//  le long de la lumière de l'astre dominant (soleil le jour, lune la nuit), 1 = plein soleil.
+//
+//  Convention (lue par CloudShadow() de surface_lighting.glsl, mêmes formules) :
+//    * plan de référence horizontal à l'altitude uCloudBottom (base de la couche) ;
+//    * un point P du sol est projeté sur ce plan le long de la lumière L :
+//        xz = P.xz + L.xz × (uCloudBottom - P.y) / max(L.y, CLOUD_SHADOW_MIN_LY) ;
+//    * uv = (xz - uShadowOrigin) / uShadowExtent + 0.5, origine calée sur un texel en coordonnées absolues
+//      (pas de scintillement quand la caméra bouge), stockée avec la carte (une frame de latence).
+//  Chaque texel marche de la base au sommet de la couche le long de L (8 pas), avec le modèle de densité
+//  des nuages affichés (cloud_density.glsl) sans le bruit de détail ni le curl (inutiles à ~40 m/texel).
+#include "common/global_ubo.glsl"
+#include "render/cloud_density.glsl"
+
+#define CLOUD_SHADOW_MIN_LY 0.08
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(r16f, binding = IMG_VolumetricOut) writeonly uniform image2D uShadowOut;
+
+uniform vec2  uShadowOrigin;    // m : centre de la carte (xz relatif à l'origine de rendu, calé sur un texel)
+uniform float uShadowExtent;    // m : côté de la carte
+uniform vec3  uLightDir;        // direction VERS l'astre dominant (unitaire)
+uniform float uExtinction;      // 1/m pour une densité de 1 (même valeur que le raymarching)
+uniform float uShadowStrength;  // multiplicateur de l'épaisseur optique
+uniform float uShadowOpacity;   // opacité maximale de l'ombre [0, 1]
+
+const int kSteps = 8;
+
+void main() {
+    ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uShadowOut);
+    if (any(greaterThanEqual(id, size))) return;
+    vec2 uv = (vec2(id) + 0.5) / vec2(size);
+
+    float Ly    = max(uLightDir.y, CLOUD_SHADOW_MIN_LY);
+    vec3  L     = normalize(vec3(uLightDir.x, Ly, uLightDir.z));
+    float thick = uCloudTop - uCloudBottom;
+    float len   = thick / L.y;          // longueur du trajet de la lumière dans la couche
+    float ds    = len / float(kSteps);
+    vec3  p0    = vec3(uShadowOrigin.x + (uv.x - 0.5) * uShadowExtent, uCloudBottom,
+                       uShadowOrigin.y + (uv.y - 0.5) * uShadowExtent);
+
+    float od = 0.0;
+    for (int i = 0; i < kSteps; ++i) {
+        vec3 p = p0 + L * ((float(i) + 0.5) * ds);
+        od += CloudDensity(p, p.y, false) * uExtinction * ds;
+    }
+    float T = exp(-od * uShadowStrength);
+    T = 1.0 - (1.0 - T) * uShadowOpacity;
+
+    // Fondu vers 1 aux bords de la carte : pas de coupure nette au-delà de l'emprise.
+    vec2  edge = min(uv, 1.0 - uv);
+    T = mix(1.0, T, smoothstep(0.0, 0.08, min(edge.x, edge.y)));
+    imageStore(uShadowOut, id, vec4(T));
+}

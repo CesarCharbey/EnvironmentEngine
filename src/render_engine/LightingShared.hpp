@@ -42,8 +42,14 @@ struct LightingShared {
     float voxelShadowSoftnessDeg = 2.3f;     // tan ≈ 0,04
     float fogHeightFalloff       = 0.005f;   // hauteur d'échelle 200 m
     bool  fogShadows             = true;     // ombre volumétrique du brouillard (VXGI)
-    float cloudLayerAltitude     = 2000.0f;
-    float cloudShadowExtent      = 10000.0f;
+
+    // --- Ombre des nuages : écrit par VolumetricGodRaysSystem avec la carte (lue à la frame suivante) ---
+    bool       cloudShadowValid    = false;            ///< carte calculée (nuages et ombres actifs)
+    float      cloudLayerAltitude  = 1500.0f;          ///< m : base de la couche (plan de projection)
+    float      cloudShadowExtent   = 20000.0f;         ///< m
+    glm::vec2  cloudShadowOrigin{0.0f};                ///< m : centre, relatif à cloudShadowOriginChunk
+    glm::ivec2 cloudShadowOriginChunk{0};              ///< origine de rendu de la frame de calcul
+    glm::vec3  cloudShadowLight{0.0f, 1.0f, 0.0f};     ///< astre pour lequel la carte a été calculée
 
     // --- Réglages d'exposition (panneau de VolumetricGodRaysSystem) ---
     float exposureCompensationEv = 1.0f;
@@ -94,7 +100,8 @@ inline void BindSurfaceLightingResources(const core::RenderBlackboard& bb) {
 }
 
 /// Renseigne les uniforms de surface_lighting.glsl (et uAtmoAvailable de sky_lighting.glsl).
-inline void SetSurfaceLightingUniforms(const gpu::ShaderProgram& p) {
+/// renderOriginChunk : origine de rendu de la frame courante (recalage de l'origine de l'ombre des nuages).
+inline void SetSurfaceLightingUniforms(const gpu::ShaderProgram& p, glm::ivec2 renderOriginChunk) {
     const LightingShared& s = SharedLighting();
     p.Set("uAtmoAvailable",        s.atmoAvailable);
     p.Set("uGBufferAvailable",     s.gbufferAvailable);
@@ -118,6 +125,10 @@ inline void SetSurfaceLightingUniforms(const gpu::ShaderProgram& p) {
     p.Set("uFogShadows",           s.fogShadows);
     p.Set("uCloudLayerAltitude",   s.cloudLayerAltitude);
     p.Set("uCloudShadowExtent",    s.cloudShadowExtent);
+    // Origine exprimée dans le repère de rendu de la frame courante (exact : différence entière de chunks).
+    const glm::vec2 shift = glm::vec2(s.cloudShadowOriginChunk - renderOriginChunk) * kChunkSizeMeters;
+    p.Set("uCloudShadowOrigin",    s.cloudShadowOrigin + shift);
+    p.Set("uCloudShadowLight",     s.cloudShadowLight);
 }
 
 /// Renseigne les uniforms d'exposure.glsl.

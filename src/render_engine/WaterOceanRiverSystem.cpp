@@ -291,7 +291,7 @@ public:
 
         if (wantOcean && oceanProg_->IsValid()) {
             const gpu::ShaderProgram& p = *oceanProg_;
-            SetSurfaceLightingUniforms(p);
+            SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
             p.Set("uKind", 0);
             p.Set("uGridMargin", 0.15f);
             p.Set("uGridCells", glm::vec2(kOceanGridX, kOceanGridY));
@@ -303,7 +303,7 @@ public:
 
         if (wantRivers && riverProg_->IsValid()) {
             const gpu::ShaderProgram& p = *riverProg_;
-            SetSurfaceLightingUniforms(p);
+            SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
             p.Set("uKind", 1);
             p.Set("uRivers", riversEnabled_);
             p.Set("uSwamps", swampsEnabled_);

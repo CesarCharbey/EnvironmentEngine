@@ -69,7 +69,7 @@ public:
         sh.atmoAvailable = bb.IsPublished(env::bb::AtmoSkyViewLUT) && bb.IsPublished(env::bb::AtmoTransmittanceLUT);
         sh.iblAvailable  = bb.IsPublished(env::bb::IblIrradiance) && bb.IsPublished(env::bb::IblPrefiltered) &&
                            bb.IsPublished(env::bb::IblBrdfLUT);
-        sh.cloudShadowAvailable = bb.IsPublished(env::bb::CloudShadowMap);
+        sh.cloudShadowAvailable = bb.IsPublished(env::bb::CloudShadowMap) && sh.cloudShadowValid;
         sh.voxelAvailable       = bb.IsPublished(env::bb::VoxelGrid);  // VoxelIlluminationSystem (ADR-008)
         sh.dataView             = (debugView_ >= 1 && debugView_ <= 6) || debugView_ == 9 || debugView_ == 10;
 
@@ -109,7 +109,7 @@ public:
         BindSurfaceLightingResources(bb);
 
         const gpu::ShaderProgram& p = *program_;
-        SetSurfaceLightingUniforms(p);
+        SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
         SetExposureUniforms(p);
         p.Set("uApplyFallbackExposure", !writeHdr_);
         p.Set("uDebugView",             debugView_);
@@ -188,10 +188,9 @@ public:
         ImGui::SetItemTooltip("L'air a l'ombre du relief ne diffuse plus le soleil (grille VXGI) : "
                               "pas de voile aveuglant devant les montagnes a contre-jour.");
 
-        ImGui::SeparatorText("Ombre des nuages (convention provisoire)");
-        ImGui::SliderFloat("Altitude de la couche", &sh.cloudLayerAltitude, 500.0f, 8000.0f, "%.0f m");
-        ImGui::SliderFloat("Emprise de la carte", &sh.cloudShadowExtent, 1000.0f, 50000.0f, "%.0f m",
-                           ImGuiSliderFlags_Logarithmic);
+        ImGui::SeparatorText("Ombre des nuages");
+        ImGui::TextDisabled("Reglages : panneau VolumetricGodRays (carte de %.0f km, base a %.0f m)",
+                            sh.cloudShadowExtent / 1000.0f, sh.cloudLayerAltitude);
         ImGui::TextDisabled("Exposition : panneau VolumetricGodRays");
     }
 

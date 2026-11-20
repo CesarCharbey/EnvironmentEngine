@@ -39,8 +39,10 @@ uniform vec3  uFocusChunkOrigin;       // coin du chunk focus relatif à l'origi
 uniform float uShadowPenumbra;         // demi-angle (rad) de la pénombre des ombres du relief
 uniform float uFogHeightFalloff;       // 1/m : décroissance verticale du brouillard
 uniform bool  uFogShadows;             // ombre volumétrique du brouillard (grille VXGI)
-uniform float uCloudLayerAltitude;     // m : plan de projection de l'ombre des nuages
-uniform float uCloudShadowExtent;      // m : emprise de clouds.shadowMap, centrée sur la caméra
+uniform float uCloudLayerAltitude;     // m : plan de projection de l'ombre des nuages (base de la couche)
+uniform float uCloudShadowExtent;      // m : emprise de clouds.shadowMap
+uniform vec2  uCloudShadowOrigin;      // m : centre de la carte, xz relatif à l'origine de rendu courante
+uniform vec3  uCloudShadowLight;       // direction de l'astre pour lequel la carte a été calculée
 
 const float kHalfMax = 65000.0;  // borne du RGBA16F de scene.color
 
@@ -111,15 +113,18 @@ vec3 DirectLight(Surface s, vec3 V, vec3 L, vec3 E) {
     return (diffuse + specular) * E * NoL;
 }
 
-// Ombre des nuages. Convention PROVISOIRE (à aligner avec VolumetricGodRaysSystem quand il publiera
-// clouds.shadowMap) : projection le long du soleil sur un plan d'altitude uCloudLayerAltitude, carte
-// centrée sur la caméra, emprise uCloudShadowExtent mètres.
+// Ombre des nuages (clouds.shadowMap, VolumetricGodRaysSystem / cloud_shadow.comp, mêmes formules) :
+// projection le long de la lumière de l'astre pour lequel la carte a été calculée (uCloudShadowLight) sur
+// le plan de la base des nuages, origine de la carte calée sur un texel et stockée avec elle (recalée
+// ici sur l'origine de rendu courante). L'autre astre (la lune le jour, le soleil la nuit, négligeables
+// alors) n'est pas ombré. Hors de la carte : 1 (la carte s'y fond déjà vers 1).
 float CloudShadow(vec3 P, vec3 L) {
-    if (!uCloudShadowAvailable) return 1.0;
-    float t = (uCloudLayerAltitude - P.y) / max(L.y, 0.05);
-    vec3 pc = P + L * max(t, 0.0);
-    vec2 uv = (pc.xz - envCameraPosition().xz) / uCloudShadowExtent + 0.5;
-    return texture(uCloudShadow, uv).r;
+    if (!uCloudShadowAvailable || dot(L, uCloudShadowLight) < 0.99) return 1.0;
+    vec3  Lm = normalize(vec3(uCloudShadowLight.x, max(uCloudShadowLight.y, 0.08), uCloudShadowLight.z));
+    vec2  xz = P.xz + Lm.xz * ((uCloudLayerAltitude - P.y) / Lm.y);
+    vec2  uv = (xz - uCloudShadowOrigin) / uCloudShadowExtent + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
+    return textureLod(uCloudShadow, uv, 0.0).r;
 }
 
 // =============================================================================

@@ -19,7 +19,10 @@
 //      Vent accumulé en double (monde infini) ; les décalages des bruits sont réduits modulo leur
 //      période côté CPU : aucune perte de précision loin de l'origine, pas de saut au recalage.
 //    * Exposition + tonemapping de scene.color (HDR) vers scene.display (tonemap.vert/.frag), après l'eau.
-//  À faire : reprojection temporelle, ombre des nuages (clouds.shadowMap), god rays.
+//    * Ombre des nuages au sol (cloud_shadow.comp -> clouds.shadowMap, R16F 512², 20 km calés sur un texel),
+//      même modèle de densité (cloud_density.glsl) ; lue par CloudShadow() (surface_lighting.glsl) à la
+//      frame suivante, avec l'origine, l'astre et la base de couche stockés dans LightingShared.
+//  À faire : reprojection temporelle, god rays.
 //  RÈGLE : ce fichier n'inclut jamais src/world_engine/ (vérifié au build).
 // =============================================================================
 #include <imgui.h>
@@ -48,6 +51,7 @@ constexpr std::string_view kProducer      = "VolumetricGodRaysSystem";
 constexpr GLsizei          kShapeSize      = 128;
 constexpr GLsizei          kDetailSize     = 32;
 constexpr GLsizei          kWeatherSize    = 512;
+constexpr GLsizei          kShadowSize     = 512;
 constexpr int              kFrontPeriodCells = 128;  ///< période des fronts = 128 cellules de base
 
 /// x mod period dans [0, period), en double (positions absolues d'un monde infini).
@@ -67,6 +71,7 @@ public:
         noiseProg_   = &ctx.shaders.LoadCompute("render.cloud_noise", "render/cloud_noise.comp");
         weatherProg_ = &ctx.shaders.LoadCompute("render.cloud_weather_map", "render/cloud_weather_map.comp");
         cloudsProg_  = &ctx.shaders.LoadCompute("render.volumetric_clouds", "render/volumetric_clouds.comp");
+        shadowProg_  = &ctx.shaders.LoadCompute("render.cloud_shadow", "render/cloud_shadow.comp");
         // Les textures sont allouées au premier Render() (Init n'émet aucune commande GPU).
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : shaders à créer dans shaders/render/ ; slots du contrat UBO_VolumetricParams,
@@ -124,6 +129,17 @@ public:
                                   static_cast<float>(WrapPositive(-0.05 * ctx.time.time * speed, dd)),
                                   static_cast<float>(WrapPositive(originZ - 1.3 * windOffset_[1], dd)));
 
+        // --- Ombre des nuages : carte centrée sur la caméra, calée sur un texel (coordonnées absolues) ---
+        {
+            const double st = static_cast<double>(cloudShadowExtent_) / kShadowSize;
+            const double sx = std::floor(camX / st + 0.5) * st, sz = std::floor(camZ / st + 0.5) * st;
+            shadowOriginRel_ = glm::vec2(static_cast<float>(sx - originX), static_cast<float>(sz - originZ));
+            const glm::vec3 sun  = glm::normalize(glm::vec3(ctx.environment.sunDirIlluminance));
+            const glm::vec3 moon = glm::normalize(glm::vec3(ctx.environment.moonDirPhase));
+            shadowLightUp_ = sun.y > -0.02f || moon.y > 0.0f;
+            shadowLight_   = sun.y > -0.02f ? sun : moon;  // même choix d'astre que le raymarching
+        }
+
         // --- Cible des nuages (résolution réduite), allouée / redimensionnée ici comme le G-Buffer ---
         const int div = 1 << std::clamp(renderScaleIndex_, 0, 2);
         const glm::ivec2 cs((w + div - 1) / div, (h + div - 1) / div);
@@ -159,6 +175,7 @@ public:
 
         // --- Nuages : bruits (une fois), carte météo, raymarching ---
         const bool clouds = cloudsEnabled_ && RenderClouds(ctx);
+        if (!clouds) SharedLighting().cloudShadowValid = false;
 
         display_.Bind();
         glDisable(GL_DEPTH_TEST);
@@ -209,7 +226,9 @@ public:
 
     void Shutdown(EngineContext& ctx) override {
         ctx.blackboard.UnpublishIfProducer(env::bb::SceneDisplay, kTonemapProducer);
-        for (std::string_view key : {env::bb::CloudShapeNoise, env::bb::CloudDetailNoise, env::bb::CloudWeatherMap})
+        SharedLighting().cloudShadowValid = false;
+        for (std::string_view key : {env::bb::CloudShapeNoise, env::bb::CloudDetailNoise, env::bb::CloudWeatherMap,
+                                     env::bb::CloudShadowMap})
             ctx.blackboard.UnpublishIfProducer(key, kProducer);
         display_.Destroy();
         emptyVao_.Destroy();
@@ -217,7 +236,8 @@ public:
         detailNoise_.Destroy();
         weatherMap_.Destroy();
         cloudTarget_.Destroy();
-        tonemapProg_ = noiseProg_ = weatherProg_ = cloudsProg_ = nullptr;
+        shadowMap_.Destroy();
+        tonemapProg_ = noiseProg_ = weatherProg_ = cloudsProg_ = shadowProg_ = nullptr;
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : ressources créées par Init.
         // Sorties  : clés clouds.*, volumetrics.godRays et scene.display retirées ; textures et cibles
@@ -257,6 +277,20 @@ public:
         ImGui::SetItemTooltip("Probabilite d'in-scattering de Nubis 2017 (remplace le powder de 2015) : 2 = complet.");
         ImGui::SliderFloat("Influence du vent", &windInfluence_, 0.0f, 10.0f);
         ImGui::SetItemTooltip("Multiplicateur du vent au sol pour l'advection des nuages et des fronts.");
+
+        ImGui::SeparatorText("Ombre des nuages au sol (clouds.shadowMap)");
+        ImGui::Checkbox("Ombres des nuages", &cloudShadowsEnabled_);
+        ImGui::BeginDisabled(!cloudShadowsEnabled_);
+        ImGui::SliderFloat("Opacite maximale", &cloudShadowOpacity_, 0.0f, 1.0f);
+        ImGui::SetItemTooltip("1 = un nuage epais coupe entierement le soleil direct (physique).");
+        ImGui::SliderFloat("Epaisseur optique", &cloudShadowStrength_, 0.05f, 4.0f, "x%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Emprise de l'ombre", &cloudShadowExtent_, 4000.0f, 80000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
+        ImGui::SetItemTooltip("Cote de la carte (512 texels) centree sur la camera ; au-dela, pas d'ombre.");
+        if (shadowMap_.IsValid()) {
+            ImGui::Image(static_cast<ImTextureID>(static_cast<std::uintptr_t>(shadowMap_.Id())), ImVec2(160, 160));
+            ImGui::SetItemTooltip("Transmittance vers l'astre dominant (blanc = plein soleil), camera au centre.");
+        }
+        ImGui::EndDisabled();
 
         ImGui::SeparatorText("Carte meteo (fenetre glissante)");
         ImGui::SliderFloat("Emprise", &weatherMapExtent_, 10000.0f, 160000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
@@ -320,6 +354,16 @@ private:
             ctx.blackboard.PublishTexture(env::bb::CloudShapeNoise, shapeNoise_, kProducer);
             ctx.blackboard.PublishTexture(env::bb::CloudDetailNoise, detailNoise_, kProducer);
             ctx.blackboard.PublishTexture(env::bb::CloudWeatherMap, weatherMap_, kProducer);
+            // Ombre des nuages : R16F, linéaire, GL_CLAMP_TO_EDGE, initialisée à 1 (plein soleil).
+            gpu::Texture2D::Desc sd;
+            sd.width = sd.height = kShadowSize;
+            sd.internalFormat    = GL_R16F;
+            sd.sampler           = gpu::SamplerDesc{};
+            sd.debugName         = "clouds.shadowMap";
+            shadowMap_.Create(sd);
+            const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+            shadowMap_.Clear(GL_RGBA, GL_FLOAT, one);
+            ctx.blackboard.PublishTexture(env::bb::CloudShadowMap, shadowMap_, kProducer);
             noiseReady_ = true;
         }
         if (!cloudTarget_.IsValid()) return false;
@@ -341,40 +385,35 @@ private:
             glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
         }
 
-        // --- Passe 2 : raymarching en résolution réduite ---
+        // Ressources du modèle de densité, communes aux passes 2 (ombre) et 3 (raymarching).
+        shapeNoise_.BindUnit(env::bind::tex::CloudShapeNoise);
+        detailNoise_.BindUnit(env::bind::tex::CloudDetailNoise);
+        weatherMap_.BindUnit(env::bind::tex::CloudWeatherMap);
+
+        // --- Passe 2 : carte d'ombre des nuages au sol (lue par l'éclairage à la frame suivante) ---
+        RenderCloudShadow(ctx);
+
+        // --- Passe 3 : raymarching en résolution réduite ---
         {
             const LightingShared& sh = SharedLighting();
             bb.BindTexture(env::bb::GBufferDepth, env::bind::tex::GBufferDepth);
             bb.BindTexture(env::bb::AtmoTransmittanceLUT, env::bind::tex::AtmoTransmittance);
             bb.BindTexture(env::bb::AtmoSkyViewLUT, env::bind::tex::AtmoSkyView);
             bb.BindTexture(env::bb::IblIrradiance, env::bind::tex::IblIrradiance);
-            shapeNoise_.BindUnit(env::bind::tex::CloudShapeNoise);
-            detailNoise_.BindUnit(env::bind::tex::CloudDetailNoise);
-            weatherMap_.BindUnit(env::bind::tex::CloudWeatherMap);
             const gpu::ShaderProgram& p = *cloudsProg_;
+            SetDensityUniforms(p);
             p.Set("uAtmoAvailable", sh.atmoAvailable);
             p.Set("uGBufferAvailable", sh.gbufferAvailable);
             p.Set("uIblAvailable", sh.iblAvailable);
-            p.Set("uCloudBottom", cloudBottom_);
-            p.Set("uCloudTop", cloudTop_);
             p.Set("uPrimarySteps", primarySteps_);
             p.Set("uLightSteps", lightSteps_);
-            p.Set("uShapeScale", shapeScale_);
-            p.Set("uDetailScale", detailScale_);
-            p.Set("uDetailStrength", detailStrength_);
             p.Set("uExtinction", extinction_);
             p.Set("uHgForward", hgForward_);
             p.Set("uHgBackward", hgBackward_);
             p.Set("uSilver", silverIntensity_);
             p.Set("uPowder", powder_);
-            p.Set("uShapeOffset", shapeOffset_);
-            p.Set("uDetailOffset", detailOffset_);
-            p.Set("uWeatherOriginRel", weatherOriginRel_);
-            p.Set("uWeatherExtent", weatherMapExtent_);
             p.Set("uMaxDistance", maxDistance_);
             p.Set("uFadeDistance", fadeDistance_);
-            p.Set("uSkew", windDirXZ_ * skew_);
-            p.Set("uCurlStrength", curlStrength_);
             cloudTarget_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
             p.Use();
             glDispatchCompute(static_cast<GLuint>((cloudTargetSize_.x + 7) / 8),
@@ -383,6 +422,52 @@ private:
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         }
         return true;
+    }
+
+    /// Uniforms de cloud_density.glsl (raymarching et ombre : mêmes nuages).
+    void SetDensityUniforms(const gpu::ShaderProgram& p) const {
+        p.Set("uCloudBottom", cloudBottom_);
+        p.Set("uCloudTop", cloudTop_);
+        p.Set("uShapeScale", shapeScale_);
+        p.Set("uDetailScale", detailScale_);
+        p.Set("uDetailStrength", detailStrength_);
+        p.Set("uShapeOffset", shapeOffset_);
+        p.Set("uDetailOffset", detailOffset_);
+        p.Set("uWeatherOriginRel", weatherOriginRel_);
+        p.Set("uWeatherExtent", weatherMapExtent_);
+        p.Set("uSkew", windDirXZ_ * skew_);
+        p.Set("uCurlStrength", curlStrength_);
+    }
+
+    /// Carte d'ombre : astre dominant (soleil, sinon lune) ; sans astre levé ou ombres coupées, la carte
+    /// est déclarée invalide et l'éclairage n'ombre pas (CloudShadow() renvoie 1).
+    void RenderCloudShadow(EngineContext& ctx) {
+        LightingShared& sh = SharedLighting();
+        if (!cloudShadowsEnabled_ || !shadowProg_->IsValid() || !shadowLightUp_) {
+            sh.cloudShadowValid = false;
+            return;
+        }
+        const gpu::ShaderProgram& p = *shadowProg_;
+        SetDensityUniforms(p);
+        p.Set("uShadowOrigin", shadowOriginRel_);
+        p.Set("uShadowExtent", cloudShadowExtent_);
+        p.Set("uLightDir", shadowLight_);
+        p.Set("uExtinction", extinction_);
+        p.Set("uShadowStrength", cloudShadowStrength_);
+        p.Set("uShadowOpacity", cloudShadowOpacity_);
+        shadowMap_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
+        p.Use();
+        glDispatchCompute(kShadowSize / 8, kShadowSize / 8, 1);
+        // Lue par texture() dans l'éclairage (frame suivante).
+        glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+
+        // Tout ce qu'il faut pour relire la carte exactement comme elle a été calculée.
+        sh.cloudShadowValid       = true;
+        sh.cloudLayerAltitude     = cloudBottom_;
+        sh.cloudShadowExtent      = cloudShadowExtent_;
+        sh.cloudShadowOrigin      = shadowOriginRel_;
+        sh.cloudShadowOriginChunk = ctx.renderOriginChunk;
+        sh.cloudShadowLight       = shadowLight_;
     }
 
     /// Bruits 3D périodiques, une seule fois (quelques ms). Mips par le pilote : RGBA8 128³ généré une fois.
@@ -419,6 +504,15 @@ private:
     gpu::ShaderProgram* noiseProg_   = nullptr;
     gpu::ShaderProgram* weatherProg_ = nullptr;
     gpu::ShaderProgram* cloudsProg_  = nullptr;
+    gpu::ShaderProgram* shadowProg_  = nullptr;
+    gpu::Texture2D      shadowMap_;
+    glm::vec2           shadowOriginRel_{0.0f};
+    glm::vec3           shadowLight_{0.0f, 1.0f, 0.0f};
+    bool                shadowLightUp_       = false;
+    bool                cloudShadowsEnabled_ = true;
+    float               cloudShadowExtent_   = 20000.0f;
+    float               cloudShadowStrength_ = 1.0f;
+    float               cloudShadowOpacity_  = 1.0f;
     gpu::Texture3D      shapeNoise_;
     gpu::Texture3D      detailNoise_;
     gpu::Texture2D      weatherMap_;
