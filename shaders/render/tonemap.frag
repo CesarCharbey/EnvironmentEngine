@@ -17,6 +17,12 @@ flat in float vExposure;  // calculée par tonemap.vert
 layout(location = 0) out vec4 oColor;
 
 layout(binding = TEX_SceneColor) uniform sampler2D uSceneColor;
+layout(binding = TEX_SceneDepth) uniform sampler2D uSceneDepth;  // opaque + eau (WaterOceanRiverSystem)
+// Nuages (volumetric_clouds.comp, résolution réduite) : rgb = luminance, a = transmittance.
+layout(rgba16f, binding = IMG_VolumetricOut) readonly uniform image2D uClouds;
+
+uniform bool  uCloudsAvailable;
+uniform float uCloudBottom;  // m : base de la couche (rejet du relief situé devant les nuages)
 
 uniform bool  uDataView;      // vue de debug « données brutes » : ni exposition ni tonemap
 uniform int   uTonemapper;    // 0 ACES, 1 AgX, 2 Reinhard étendu, 3 Khronos PBR Neutral
@@ -59,11 +65,42 @@ vec3 PbrNeutral(vec3 c) {
     return mix(c, vec3(newPeak), g);
 }
 
+// Suréchantillonnage bilinéaire de la cible des nuages (imageLoad : pas de filtrage matériel).
+vec4 CloudsAt(vec2 uv) {
+    ivec2 size = imageSize(uClouds);
+    vec2  st   = uv * vec2(size) - 0.5;
+    ivec2 i0   = ivec2(floor(st));
+    vec2  f    = st - vec2(i0);
+    ivec2 hi   = size - 1;
+    vec4 a = imageLoad(uClouds, clamp(i0, ivec2(0), hi)), b = imageLoad(uClouds, clamp(i0 + ivec2(1, 0), ivec2(0), hi));
+    vec4 c = imageLoad(uClouds, clamp(i0 + ivec2(0, 1), ivec2(0), hi)), d = imageLoad(uClouds, clamp(i0 + 1, ivec2(0), hi));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Le relief (ou l'eau) situé devant la base des nuages les cache, au pixel près.
+bool GeometryInFrontOfClouds(vec2 uv) {
+    float d = texture(uSceneDepth, uv).r;
+    if (envIsSky(d)) return false;
+    vec3  cam  = envCameraPosition();
+    if (cam.y >= uCloudBottom) return false;  // caméra dans / au-dessus de la couche : la marche a borné
+    vec3  dir  = envViewRayWorld(uv);
+    float Rm   = (AtmoValid() ? uAtmo.uRadiiAndScaleHeights.x : 6360.0) * 1000.0;
+    vec3  pc   = vec3(0.0, cam.y + Rm, 0.0);
+    float R    = Rm + uCloudBottom;
+    float b    = dot(pc, dir), c = dot(pc, pc) - R * R;
+    float tIn  = -b + sqrt(max(b * b - c, 0.0));  // sortie de la sphère de base (caméra dedans)
+    return length(envWorldPosFromDepth(uv, d) - cam) < tIn;
+}
+
 void main() {
     vec3 hdr = texture(uSceneColor, vUv).rgb;
     if (uDataView) {
         oColor = vec4(LinearToSrgb(hdr), 1.0);
         return;
+    }
+    if (uCloudsAvailable && !GeometryInFrontOfClouds(vUv)) {
+        vec4 cl = CloudsAt(vUv);
+        hdr = hdr * cl.a + cl.rgb;
     }
     if (uMoonlightShift) hdr = MoonlightShift(hdr);
     vec3 c = hdr * vExposure;

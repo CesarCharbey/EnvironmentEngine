@@ -1,0 +1,111 @@
+#version 460 core
+//  shaders/render/cloud_noise.comp                                     [DEV 2]
+//  Bruits 3D périodiques des nuages (Schneider 2015, « Nubis »), générés une seule fois :
+//    * uPass 0 : forme 128³ RGBA8 : R = Perlin-Worley (bruit de Perlin fBm « gonflé » par du Worley),
+//                G, B, A = fBm de Worley aux fréquences 4, 8, 16 (érosion de la forme de base) ;
+//    * uPass 1 : détail 32³ RGBA8 : R = fBm de Worley (fréquences 2, 4, 8), GBA = bruit de curl
+//                (rotationnel d'un potentiel de Perlin, ×0,5 + 0,5) : il tord les coordonnées du détail
+//                pour les volutes et l'effilochage des bords (Schneider 2015).
+//  Tous les octaves sont périodiques sur la texture (répétition sans couture, GL_REPEAT).
+//  Écriture par image (IMG_VolumetricOut) : passes jamais simultanées avec le raymarching.
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(rgba8, binding = IMG_VolumetricOut) writeonly uniform image3D uNoiseOut;
+
+uniform int uPass;
+
+uvec3 Pcg3d(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+vec3 Hash33(ivec3 c, uint seed) { return vec3(Pcg3d(uvec3(c) + uvec3(seed * 7919u)) >> 8u) * (1.0 / 16777216.0); }
+
+// Worley : 1 - distance au point caractéristique le plus proche (cellules de période `freq`).
+float Worley(vec3 p, int freq, uint seed) {
+    vec3  q  = p * float(freq);
+    ivec3 c  = ivec3(floor(q));
+    vec3  f  = q - vec3(c);
+    float d2 = 1e9;
+    for (int z = -1; z <= 1; ++z)
+        for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x) {
+                ivec3 o  = ivec3(x, y, z);
+                ivec3 cw = (c + o + freq) % freq;  // périodique
+                vec3  r  = vec3(o) + Hash33(cw, seed) - f;
+                d2 = min(d2, dot(r, r));
+            }
+    return 1.0 - clamp(sqrt(d2), 0.0, 1.0);
+}
+
+float WorleyFbm(vec3 p, int freq, uint seed) {
+    return Worley(p, freq, seed) * 0.625 + Worley(p, freq * 2, seed + 1u) * 0.25 + Worley(p, freq * 4, seed + 2u) * 0.125;
+}
+
+// Bruit de gradient (Perlin) périodique.
+uint gPerlinSeed = 91u;
+vec3 Gradient(ivec3 c, int freq) {
+    vec3 h = Hash33((c + freq) % freq, gPerlinSeed) * 2.0 - 1.0;
+    return normalize(h + 1e-5);
+}
+float Perlin(vec3 p, int freq) {
+    vec3  q = p * float(freq);
+    ivec3 c = ivec3(floor(q));
+    vec3  f = q - vec3(c);
+    vec3  u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float n000 = dot(Gradient(c + ivec3(0, 0, 0), freq), f - vec3(0, 0, 0));
+    float n100 = dot(Gradient(c + ivec3(1, 0, 0), freq), f - vec3(1, 0, 0));
+    float n010 = dot(Gradient(c + ivec3(0, 1, 0), freq), f - vec3(0, 1, 0));
+    float n110 = dot(Gradient(c + ivec3(1, 1, 0), freq), f - vec3(1, 1, 0));
+    float n001 = dot(Gradient(c + ivec3(0, 0, 1), freq), f - vec3(0, 0, 1));
+    float n101 = dot(Gradient(c + ivec3(1, 0, 1), freq), f - vec3(1, 0, 1));
+    float n011 = dot(Gradient(c + ivec3(0, 1, 1), freq), f - vec3(0, 1, 1));
+    float n111 = dot(Gradient(c + ivec3(1, 1, 1), freq), f - vec3(1, 1, 1));
+    return mix(mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
+               mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y), u.z);
+}
+float PerlinFbm(vec3 p, int freq) {
+    float s = 0.0, a = 0.5, n = 0.0;
+    for (int o = 0; o < 4; ++o) {
+        s += a * Perlin(p, freq << o);
+        n += a;
+        a *= 0.5;
+    }
+    return clamp(s / n * 0.5 * 1.6 + 0.5, 0.0, 1.0);  // ~[0, 1]
+}
+
+float Remap(float v, float a, float b, float c, float d) { return c + (v - a) / max(b - a, 1e-5) * (d - c); }
+
+void main() {
+    ivec3 id   = ivec3(gl_GlobalInvocationID);
+    ivec3 size = imageSize(uNoiseOut);
+    if (any(greaterThanEqual(id, size))) return;
+    vec3 p = (vec3(id) + 0.5) / vec3(size);
+
+    // Les canaux sont étalés sur [0, 1] (bornes mesurées sur la texture générée : Perlin-Worley brut dans
+    // [0,50 ; 0,82], fBm de Worley dans [0,20 ; 0,76]) : sans cela le RGBA8 perd la moitié de sa précision
+    // et la densité de base des nuages varie trop peu pour que la couverture découpe des trous.
+    vec4 v;
+    if (uPass == 0) {
+        float w4  = WorleyFbm(p, 4, 1u);
+        float pw  = clamp(Remap(PerlinFbm(p, 4), w4 - 1.0, 1.0, 0.0, 1.0), 0.0, 1.0);
+        vec3  wf  = vec3(w4, WorleyFbm(p, 8, 11u), WorleyFbm(p, 16, 21u));
+        v = vec4(clamp((pw - 0.50) / 0.32, 0.0, 1.0), clamp((wf - 0.20) / 0.56, 0.0, 1.0));
+    } else {
+        vec3  wf  = vec3(WorleyFbm(p, 2, 31u), WorleyFbm(p, 4, 41u), WorleyFbm(p, 8, 51u));
+        float dfb = dot(clamp((wf - 0.20) / 0.56, 0.0, 1.0), vec3(0.625, 0.25, 0.125));
+        // Curl d'un potentiel vectoriel (3 Perlin périodiques, fréquence 2), différences centrées.
+        const float e = 0.5 / 32.0;
+        const int   F = 2;
+        vec3 dx = vec3(e, 0, 0), dy = vec3(0, e, 0), dz = vec3(0, 0, e);
+        gPerlinSeed = 101u; float ax_dy = Perlin(p + dy, F) - Perlin(p - dy, F), ax_dz = Perlin(p + dz, F) - Perlin(p - dz, F);
+        gPerlinSeed = 103u; float ay_dx = Perlin(p + dx, F) - Perlin(p - dx, F), ay_dz = Perlin(p + dz, F) - Perlin(p - dz, F);
+        gPerlinSeed = 107u; float az_dx = Perlin(p + dx, F) - Perlin(p - dx, F), az_dy = Perlin(p + dy, F) - Perlin(p - dy, F);
+        vec3 curl = vec3(az_dy - ay_dz, ax_dz - az_dx, ay_dx - ax_dy) / (2.0 * e);
+        curl /= 3.0 * float(F);  // ~[-1, 1]
+        v = vec4(dfb, clamp(curl * 0.5 + 0.5, 0.0, 1.0));
+    }
+    imageStore(uNoiseOut, id, v);
+}

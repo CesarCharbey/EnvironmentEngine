@@ -1,0 +1,270 @@
+#version 460 core
+//  shaders/render/volumetric_clouds.comp                               [DEV 2]
+//  Nuages volumétriques (Schneider 2015 « Nubis », Hillaire 2016), raymarching en résolution réduite.
+//    * Couche sphérique [uCloudBottom, uCloudTop] au-dessus de la planète (centre sous la caméra) : la
+//      couche suit la courbure, les nuages plongent sous l'horizon au loin.
+//    * Densité : carte météo glissante (R couverture, B type -> profil vertical, A densité), bruit de forme
+//      Perlin-Worley, érosion des bords par le bruit de détail ; vent ajouté aux coordonnées des bruits.
+//    * Modèle de densité de Nubis 2017 : gradients de hauteur par type (stratus / stratocumulus / cumulus),
+//      carte météo qui place chaque nuage, érosion par la couverture, enclume réservée aux orages, nuages
+//      inclinés par le vent, détail tordu par un bruit de curl.
+//    * Éclairage : marche secondaire en cône vers l'astre dominant + échantillon lointain (ombre propre),
+//      Henyey-Greenstein à deux lobes, diffusion multiple approchée par octaves (Wrenninge 2013) +
+//      transmission diffuse des nuages épais, probabilité d'in-scattering (Nubis 2017), liseré argenté.
+//      Ambiant : ciel (IBL) plus faible sous les nuages.
+//    * Intégration de Beer-Lambert à conservation d'énergie (Hillaire 2015) le long du rayon.
+//  Sortie (IMG_VolumetricOut, RGBA16F) : rgb = luminance diffusée (cd/m²), a = transmittance.
+//  Composition dans la passe de tonemap : couleur = scène × a + rgb.
+#include "common/global_ubo.glsl"
+#include "render/atmo_common.glsl"
+#include "render/sky_lighting.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba16f, binding = IMG_VolumetricOut) writeonly uniform image2D uCloudsOut;
+
+layout(binding = TEX_GBufferDepth)     uniform sampler2D   uGDepth;
+layout(binding = TEX_CloudShapeNoise)  uniform sampler3D   uShapeNoise;
+layout(binding = TEX_CloudDetailNoise) uniform sampler3D   uDetailNoise;
+layout(binding = TEX_CloudWeatherMap)  uniform sampler2D   uWeatherMap;
+layout(binding = TEX_IblIrradiance)    uniform samplerCube uIblIrradiance;
+
+uniform bool  uGBufferAvailable;
+uniform bool  uIblAvailable;
+uniform float uCloudBottom;     // m (altitude)
+uniform float uCloudTop;        // m
+uniform int   uPrimarySteps;
+uniform int   uLightSteps;
+uniform float uShapeScale;      // m : côté d'une répétition du bruit de forme
+uniform float uDetailScale;     // m
+uniform float uDetailStrength;  // [0, 1]
+uniform float uExtinction;      // 1/m pour une densité de 1
+uniform float uHgForward;
+uniform float uHgBackward;
+uniform float uSilver;
+uniform float uPowder;
+uniform vec3  uShapeOffset;     // m : (origine de rendu absolue - vent) mod uShapeScale (double côté C++)
+uniform vec3  uDetailOffset;    // m : idem mod uDetailScale
+uniform vec2  uWeatherOriginRel;  // m : centre de la fenêtre météo, relatif à l'origine de rendu
+uniform float uWeatherExtent;     // m
+uniform float uMaxDistance;     // m : longueur maximale de marche
+uniform float uFadeDistance;    // m : les nuages lointains se fondent dans le ciel (perspective aérienne)
+uniform vec2  uSkew;            // m : décalage horizontal au sommet de la couche (vent, Nubis)
+uniform float uCurlStrength;    // torsion du détail (en périodes du bruit de détail)
+
+// Cône de 6 directions (fixes) autour du rayon de lumière : comme Nubis, la marche secondaire s'élargit
+// en cône, ce qui lisse l'ombre propre obtenue avec peu d'échantillons.
+const vec3 kCone[6] = vec3[6](vec3( 0.38,  0.92,  0.12), vec3(-0.65, -0.21,  0.73), vec3( 0.18, -0.83, -0.53),
+                              vec3( 0.86, -0.31,  0.40), vec3(-0.34,  0.48, -0.81), vec3(-0.79,  0.16, -0.59));
+
+// Intersections d'un rayon avec une sphère centrée à l'origine : (t0, t1), ou (-1, -1).
+vec2 RaySphere(vec3 p, vec3 d, float R) {
+    float b = dot(p, d);
+    float c = dot(p, p) - R * R;
+    float disc = b * b - c;
+    if (disc < 0.0) return vec2(-1.0);
+    float s = sqrt(disc);
+    return vec2(-b - s, -b + s);
+}
+
+float Remap(float v, float a, float b, float c, float d) { return c + (v - a) / max(b - a, 1e-5) * (d - c); }
+
+float HenyeyGreenstein(float cosT, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(max(1e-4, 1.0 + g2 - 2.0 * g * cosT), 1.5));
+}
+
+// Météo au point (xz relatif à l'origine de rendu). Hors de la fenêtre, la carte est lue en miroir :
+// les nuages continuent jusqu'à l'horizon sans coupure ni retour à une couverture uniforme (qui laissait
+// apparaître la répétition du bruit 3D) ; au-delà de 20 km, la symétrie ne se remarque pas.
+vec4 SampleWeather(vec2 xz) {
+    vec2 uv = (xz - uWeatherOriginRel) / uWeatherExtent + 0.5;
+    uv = 1.0 - abs(mod(uv, 2.0) - 1.0);
+    return textureLod(uWeatherMap, uv, 0.0);
+}
+
+// Gradient de densité selon la hauteur et le type (Nubis 2017) : remap(h, a, b, 0, 1) × remap(h, c, d, 1, 0),
+// points interpolés entre stratus (0), stratocumulus (0,5) et cumulus (1). La décroissance progressive
+// vers le haut, combinée à l'érosion par la couverture, arrondit les sommets (dômes, pas d'enclume).
+float DensityHeightGradient(float h, float type) {
+    const vec4 kStratus       = vec4(0.00, 0.08, 0.15, 0.28);
+    const vec4 kStratocumulus = vec4(0.00, 0.12, 0.30, 0.60);
+    const vec4 kCumulus       = vec4(0.00, 0.08, 0.40, 1.00);
+    vec4 g = type < 0.5 ? mix(kStratus, kStratocumulus, type * 2.0) : mix(kStratocumulus, kCumulus, type * 2.0 - 1.0);
+    return clamp(Remap(h, g.x, g.y, 0.0, 1.0), 0.0, 1.0) * clamp(Remap(h, g.z, g.w, 1.0, 0.0), 0.0, 1.0);
+}
+
+// Densité [0, 1+] ; `detail` = false pour les marches secondaires (lumière), plus économes.
+float CloudDensity(vec3 pRel, float alt, bool detail) {
+    float h = (alt - uCloudBottom) / (uCloudTop - uCloudBottom);
+    if (h <= 0.0 || h >= 1.0) return 0.0;
+    vec3 p = vec3(pRel.x, alt, pRel.z);
+    p.xz += h * uSkew;  // le vent incline les nuages avec l'altitude
+
+    vec4 w = SampleWeather(p.xz);
+    float coverage = w.r;
+    if (coverage <= 0.01) return 0.0;
+    // Enclume (Nubis) : seulement pour les cellules orageuses (forte pluie + cumulus), le haut s'étale.
+    float anvil = smoothstep(0.5, 1.0, w.g) * smoothstep(0.7, 1.0, w.b);
+    coverage = pow(coverage, clamp(Remap(h, 0.7, 0.8, 1.0, mix(1.0, 0.5, anvil)), mix(1.0, 0.5, anvil), 1.0));
+
+    vec4  shape = textureLod(uShapeNoise, (p + uShapeOffset) / uShapeScale, 0.0);
+    float fbm   = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
+    float base  = Remap(shape.r, fbm - 1.0, 1.0, 0.0, 1.0);
+    base  = smoothstep(0.30, 0.98, base);  // égalisation (répartition mesurée de la texture)
+    base *= DensityHeightGradient(h, w.b);
+    base  = clamp(Remap(base, 1.0 - coverage, 1.0, 0.0, 1.0), 0.0, 1.0) * coverage;
+    if (base <= 0.0) return 0.0;
+
+    if (detail && uDetailStrength > 0.0) {
+        // Curl : torsion des coordonnées du détail, plus forte à la base (volutes, bords effilochés).
+        vec3 pd   = (p + uDetailOffset) / uDetailScale;
+        vec3 curl = textureLod(uDetailNoise, pd * 0.25, 0.0).gba * 2.0 - 1.0;
+        pd += curl * uCurlStrength * (1.0 - h);
+        float dfb   = textureLod(uDetailNoise, pd, 0.0).r;
+        float erode = mix(dfb, 1.0 - dfb, clamp(h * 10.0, 0.0, 1.0));  // volutes en bas, bourgeons en haut
+        base = clamp(Remap(base, erode * uDetailStrength * 0.4, 1.0, 0.0, 1.0), 0.0, 1.0);
+    }
+    return base * mix(0.6, 1.6, w.a);
+}
+
+float InterleavedGradientNoise(vec2 pixel) {
+    return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+}
+
+void main() {
+    ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uCloudsOut);
+    if (any(greaterThanEqual(id, size))) return;
+    vec2 uv = (vec2(id) + 0.5) / vec2(size);
+
+    vec3  cam = envCameraPosition();
+    vec3  dir = envViewRayWorld(uv);
+    float Rm  = (AtmoValid() ? uAtmo.uRadiiAndScaleHeights.x : 6360.0) * 1000.0;  // rayon planétaire (m)
+
+    // Distance de la géométrie opaque : la plus lointaine du bloc de pixels couvert (silhouettes : la
+    // composition rejette ensuite, par pixel, le relief situé devant la couche).
+    float geomDist = 1e30;
+    if (uGBufferAvailable) {
+        vec2  texel = 0.5 / vec2(size);
+        float dMin  = 1.0;
+        for (int i = 0; i < 4; ++i) {
+            vec2 o = vec2(i & 1, i >> 1) * 2.0 - 1.0;
+            dMin = min(dMin, textureLod(uGDepth, uv + o * texel * 0.5, 0.0).r);
+        }
+        if (!envIsSky(dMin)) geomDist = length(envWorldPosFromDepth(uv, dMin) - cam);
+    }
+
+    // Segment dans la coque [bas, haut] ; le sol de la planète l'arrête.
+    vec3 pc   = vec3(0.0, cam.y + Rm, 0.0);  // caméra dans le repère centré planète
+    vec2 top  = RaySphere(pc, dir, Rm + uCloudTop);
+    vec2 bot  = RaySphere(pc, dir, Rm + uCloudBottom);
+    vec2 gnd  = RaySphere(pc, dir, Rm);
+    float tA = max(top.x, 0.0), tB = top.y;
+    if (bot.y > 0.0) {
+        if (bot.x > tA) tB = min(tB, bot.x);  // la caméra est au-dessus de la base : on s'arrête en y entrant
+        else            tA = max(tA, bot.y);  // la caméra est sous la base : on commence en sortant
+    }
+    if (gnd.x > 0.0) tB = min(tB, gnd.x);
+    tB = min(min(tB, geomDist), tA + uMaxDistance);
+    if (top.y <= 0.0 || tB <= tA) {
+        imageStore(uCloudsOut, id, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // Astre dominant : le soleil tant qu'il éclaire, sinon la lune.
+    vec3  sunDir  = normalize(envSunDirection());
+    vec3  moonDir = normalize(envMoonDirection());
+    bool  sunMain = sunDir.y > -0.08;
+    vec3  L       = sunMain ? sunDir : moonDir;
+    vec3  lightTOA = sunMain ? SunIlluminanceTOA() : MoonIlluminanceTOA();
+    float angR    = sunMain ? SunAngularRadius() : MoonAngularRadius();
+    float cosT    = dot(dir, L);
+    float phase   = mix(HenyeyGreenstein(cosT, uHgForward), HenyeyGreenstein(cosT, uHgBackward), 0.3);
+    float silver  = uSilver * 0.1 * HenyeyGreenstein(cosT, 0.95);
+
+    // Ambiant : ciel (IBL, radiance E/π au zénith) ; plus sombre à la base des nuages.
+    vec3 skyAmb = uIblAvailable ? texture(uIblIrradiance, vec3(0.0, 1.0, 0.0)).rgb : SkyAverage();
+
+    int   steps  = max(uPrimarySteps, 4);
+    float dt     = (tB - tA) / float(steps);
+    float t      = tA + dt * InterleavedGradientNoise(vec2(id));
+    float thick  = uCloudTop - uCloudBottom;
+    vec3  Lsum   = vec3(0.0);
+    float T      = 1.0;
+    float tWeighted = 0.0, wSum = 0.0;
+
+    for (int i = 0; i < steps; ++i) {
+        if (t > tB || T < 0.01) break;  // opaque : arrêt anticipé
+        vec3  p   = cam + dir * t;
+        vec3  pp  = pc + dir * t;
+        float alt = length(pp) - Rm;
+        float den = CloudDensity(p, alt, true);
+        if (den > 0.0) {
+            float sigma = den * uExtinction;
+            vec3  up    = pp / max(length(pp), 1.0);
+
+            // Ombre propre : marche en cône vers l'astre (pas croissants), puis un échantillon lointain pour
+            // l'ombre des grands nuages voisins (Nubis 2017).
+            float od    = 0.0;
+            float stepL = 0.3 * thick / float(max(uLightSteps, 1));
+            float tl    = 0.0;
+            for (int j = 0; j < uLightSteps; ++j) {
+                float tm   = tl + 0.5 * stepL;
+                vec3  off  = L * tm + kCone[j % 6] * (0.25 * tm);
+                float qAlt = length(pp + off) - Rm;
+                od += CloudDensity(p + off, qAlt, j < 2) * uExtinction * stepL;
+                tl += stepL;
+                stepL *= 1.6;
+            }
+            {
+                vec3  off  = L * (tl + thick);
+                float qAlt = length(pp + off) - Rm;
+                od += CloudDensity(p + off, qAlt, false) * uExtinction * thick * 0.5;
+            }
+            // Éclairement de l'astre à cette altitude (transmittance atmosphérique, ombre de la planète).
+            vec3 E = lightTOA * LightTransmittance(alt, L, angR);
+
+            // Probabilité d'in-scattering (Nubis 2017, remplace le « powder » de 2015) : peu de lumière
+            // diffusée plusieurs fois arrive sur les bords peu denses et à la base des nuages.
+            float hFrac    = clamp((alt - uCloudBottom) / thick, 0.0, 1.0);
+            float depthP   = 0.05 + pow(clamp(den, 0.0, 1.0), Remap(hFrac, 0.3, 0.85, 0.5, 2.0));
+            float vertP    = pow(clamp(Remap(hFrac, 0.07, 0.14, 0.1, 1.0), 0.1, 1.0), 0.8);
+            float inscatter = mix(1.0, depthP * vertP, clamp(uPowder * 0.5, 0.0, 1.0));
+
+            // Diffusion simple + diffusion multiple approchée (octaves de Wrenninge : extinction,
+            // contribution et anisotropie réduites) ; les octaves multiples subissent l'in-scattering.
+            float ms = phase * exp(-od) + silver * exp(-od) * (1.0 - clamp(den, 0.0, 1.0));
+            float a = 0.25, b = 0.5, c = 0.5;
+            for (int o = 1; o < 3; ++o) {
+                float ph = mix(HenyeyGreenstein(cosT, uHgForward * c), HenyeyGreenstein(cosT, uHgBackward * c), 0.3);
+                ms += b * exp(-od * a) * ph * inscatter;
+                a *= 0.25; b *= 0.5; c *= 0.5;
+            }
+            // Transmission diffuse des nuages épais (approximation de diffusion, 1 / (1 + 0,75 τ (1 - g))) :
+            // c'est elle qui éclaire la base grise d'un nuage d'orage, que la diffusion simple laisse noire.
+            ms += (1.0 - exp(-0.5 * od)) / (1.0 + 0.75 * (1.0 - 0.85) * od) * (0.8 / (4.0 * PI)) * inscatter;
+
+            vec3 S = sigma * (E * ms + skyAmb * mix(0.35, 1.0, hFrac));
+
+            // Intégration à conservation d'énergie sur le pas.
+            float Tstep = exp(-sigma * dt);
+            Lsum += T * (S - S * Tstep) / max(sigma, 1e-7);
+            tWeighted += T * (1.0 - Tstep) * t;
+            wSum      += T * (1.0 - Tstep);
+            T *= Tstep;
+        }
+        t += dt;
+    }
+
+    // Marche arrêtée sous 1 % de transmittance : le nuage est opaque. Garder ce 1 % laissait passer le
+    // disque du soleil (~10⁹ cd/m²) en blanc éclatant à travers les nuages épais.
+    if (T < 0.01) T = 0.0;
+
+    // Perspective aérienne : la luminance des nuages lointains tend vers celle du ciel derrière eux, mais
+    // leur opacité est conservée (sinon le soleil et la lune réapparaissaient à travers les nuages lointains).
+    float dCloud = wSum > 0.0 ? tWeighted / wSum : tA;
+    float fade   = exp(-dCloud / max(uFadeDistance, 1.0));
+    Lsum = mix(SkyLuminance(dir) * (1.0 - T), Lsum, fade);
+    imageStore(uCloudsOut, id, vec4(min(Lsum, vec3(65000.0)), T));
+}

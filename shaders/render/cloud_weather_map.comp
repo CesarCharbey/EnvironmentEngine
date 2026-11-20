@@ -1,0 +1,138 @@
+#version 460 core
+//  shaders/render/cloud_weather_map.comp                               [DEV 2]
+//  Carte météo des nuages en fenêtre glissante (512², par défaut 40 × 40 km centrés sur la caméra, centre
+//  calé sur un texel : pas de scintillement quand la caméra bouge). Chaque texel = un point du monde
+//  ABSOLU (modulo une grande période, calculée en double côté C++) advecté par le vent.
+//    * Fronts météo : fBm de bruit de valeur à 4 octaves (cellule de base `uFrontScale`, ~15 km) :
+//      dépressions orageuses et éclaircies qui dérivent avec le vent.
+//    * Empreintes des nuages (Nubis 2017, « cloud map ») : Perlin-Worley 2D de cellule `uCloudCells`
+//      (~2,5 km) : îlots isolés reliés par des voiles. C'est la carte, et non le bruit 3D, qui place
+//      chaque nuage : en coordonnées absolues, aucun motif ne se répète. Le bruit 3D ne fait que sculpter.
+//    * Les curseurs du panneau Celestial pilotent toujours l'ambiance générale : couverture
+//      (uEnv.weatherExtra.x), densité (weatherExtra.y), pluie (uEnv.weather.x) ; les fronts ne font que
+//      répartir localement autour de ces valeurs (désactivables : météo uniforme).
+//  Sortie RGBA8 (contrat clouds.weatherMap) :
+//    R = couverture locale, G = précipitations locales, B = type (0 stratus bas et plat, 1 cumulonimbus),
+//    A = densité / humidité locale (assombrit les nuages d'orage).
+#include "common/global_ubo.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(rgba8, binding = IMG_VolumetricOut) writeonly uniform image2D uWeatherOut;
+
+uniform vec2  uCenterMod;       // centre de la fenêtre, coordonnées absolues advectées (mod uPeriod)
+uniform float uPeriod;          // m : période du bruit (multiple de uFrontScale)
+uniform float uExtent;          // m : côté de la fenêtre
+uniform float uFrontScale;      // m : taille des cellules de fronts
+uniform bool  uLocalVariation;  // false : météo uniforme
+uniform int   uCloudCells;      // empreintes : nombre de cellules sur la période (entier : périodique)
+
+uvec3 Pcg3d(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v;
+}
+float Hash(ivec2 c, uint seed) { return float(Pcg3d(uvec3(uvec2(c), seed)).x >> 8u) * (1.0 / 16777216.0); }
+
+// Bruit de valeur périodique (période en cellules : `cells`).
+float ValueNoise(vec2 p, int cells, uint seed) {
+    vec2  fl = floor(p);
+    vec2  f  = p - fl;
+    ivec2 i  = ivec2(fl);
+    vec2  u  = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    ivec2 i0 = i % cells, i1 = (i + 1) % cells;  // p >= 0 (coordonnées réduites modulo la période)
+    float a = Hash(i0, seed), b = Hash(ivec2(i1.x, i0.y), seed);
+    float c = Hash(ivec2(i0.x, i1.y), seed), d = Hash(i1, seed);
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// fBm à 4 octaves (cellules uFrontScale, /2, /4, /8 : toutes divisent la période).
+float FrontsFbm(vec2 world, uint seed) {
+    int   cells = int(uPeriod / uFrontScale + 0.5);
+    vec2  p     = world / uFrontScale;
+    float s = 0.0, a = 0.5, n = 0.0;
+    for (int o = 0; o < 4; ++o) {
+        s += a * ValueNoise(p, cells, seed + uint(o));
+        n += a;
+        p *= 2.0;
+        cells *= 2;
+        a *= 0.5;
+    }
+    return s / n;
+}
+
+// Worley 2D périodique (1 - distance au point le plus proche), cellules de période `cells`.
+float Worley2(vec2 p, int cells, uint seed) {
+    vec2  fl = floor(p);
+    ivec2 c  = ivec2(fl);
+    vec2  f  = p - fl;
+    float d2 = 1e9;
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 o  = ivec2(x, y);
+            ivec2 cw = (c + o + cells) % cells;  // opérandes >= 0 : `%` d'un négatif est indéfini en GLSL
+            vec2  h  = vec2(Hash(cw, seed), Hash(cw, seed + 101u));
+            vec2  r  = vec2(o) + h - f;
+            d2 = min(d2, dot(r, r));
+        }
+    return 1.0 - clamp(sqrt(d2), 0.0, 1.0);
+}
+
+// Empreintes des nuages [0, 1] : Perlin-Worley (Perlin « creusé » par l'inverse du Worley -> îlots).
+float CloudFootprints(vec2 world) {
+    float cellSize = uPeriod / float(uCloudCells);
+    vec2  p   = world / cellSize;
+    float per = ValueNoise(p * 0.5, uCloudCells / 2, 41u) * 0.6 + ValueNoise(p, uCloudCells, 42u) * 0.3
+              + ValueNoise(p * 2.0, uCloudCells * 2, 43u) * 0.1;
+    float wor = Worley2(p, uCloudCells, 44u) * 0.7 + Worley2(p * 2.0, uCloudCells * 2, 45u) * 0.3;
+    return clamp((per - (1.0 - wor)) / max(wor, 1e-3), 0.0, 1.0) * 0.5 + per * wor * 0.5;
+}
+
+// Point d'entrée réservé au World Engine : modulation de la météo par le relief / le biome (Dev 1).
+// Actuellement neutre. Retour : x = facteur de couverture, y = décalage du type, z = facteur de
+// précipitations, w = facteur de densité.
+vec4 SampleMacroBiome(vec2 worldXz) {
+    return vec4(1.0, 0.0, 1.0, 1.0);
+}
+
+void main() {
+    ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uWeatherOut);
+    if (any(greaterThanEqual(id, size))) return;
+
+    vec2  uv    = (vec2(id) + 0.5) / vec2(size);
+    vec2  world = mod(uCenterMod + (uv - 0.5) * uExtent, uPeriod);
+
+    float cover = clamp(uEnv.weatherExtra.x, 0.0, 1.0);
+    float dens  = clamp(uEnv.weatherExtra.y, 0.0, 1.0);
+    float rain  = clamp(uEnv.weather.x, 0.0, 1.0);
+
+    // Fronts (0,5 = neutre) : régions où l'air permet aux nuages de se former, et type de nuages.
+    float front = uLocalVariation ? FrontsFbm(world, 3u) : 0.5;
+    float conv  = uLocalVariation ? FrontsFbm(world * 2.0, 17u) : 0.5;
+    float fp    = CloudFootprints(world);
+
+    // Couverture régionale : la valeur globale, répartie par les fronts (zones dégagées / bouchées).
+    float regional = clamp(cover + (front - 0.5) * (uLocalVariation ? 1.0 : 0.0), 0.0, 1.0);
+    // Couverture locale : les empreintes gonflent avec la couverture régionale ; à 1, ciel bouché.
+    float coverage = clamp((fp - (1.0 - regional)) / 0.35 + regional * regional * 0.5, 0.0, 1.0);
+    coverage *= smoothstep(0.0, 0.08, regional);
+    // Pluie concentrée au cœur des fronts (là où la couverture est forte), toujours pilotée par le curseur.
+    float precip = rain * clamp(0.35 + (front - 0.45) * 3.0, 0.0, 1.0) * smoothstep(0.4, 0.8, regional);
+    // Type (Nubis : 0 stratus, 0,5 stratocumulus, 1 cumulus) : bruit basse fréquence, cumulus plus
+    // probables sous les orages ; ciel bouché sans pluie -> stratus.
+    float type = clamp(0.25 + conv * 0.8 + precip * 0.5, 0.0, 1.0);
+    type = mix(type, 0.05, smoothstep(0.85, 1.0, regional) * (1.0 - precip));
+    // Densité / humidité : assombrit les nuages chargés.
+    float density = clamp(dens * 0.7 + precip * 0.6 + (front - 0.5) * 0.3, 0.0, 1.0);
+
+    vec4 macro = SampleMacroBiome(world);
+    coverage = clamp(coverage * macro.x, 0.0, 1.0);
+    type     = clamp(type + macro.y, 0.0, 1.0);
+    precip   = clamp(precip * macro.z, 0.0, 1.0);
+    density  = clamp(density * macro.w, 0.0, 1.0);
+
+    imageStore(uWeatherOut, id, vec4(coverage, precip, type, density));
+}
