@@ -237,7 +237,10 @@ bool VoxelDiffuse(vec3 P, vec3 N, out vec3 radiance, out float visibility) {
     visibility = 0.0;
     for (int i = 0; i < 5; ++i) {
         vec4 c = VoxelConeRadiance(uVoxel.uGridMin.xyz, origin, dirs[i], kTanHalf, 0.5 * voxel, 256.0, 8);
-        radiance   += w[i] * (c.rgb * uGiIntensity + (1.0 - c.a) * SkyLuminanceAbove(dirs[i]));
+        // Part du cône qui voit le ciel : l'IBL (nuages compris, cf. ibl_capture.comp) quand elle existe ;
+        // l'irradiance dans l'axe du cône (convention E/π) approche la radiance moyenne d'un cône de 60°.
+        vec3 sky = uIblAvailable ? texture(uIblIrradiance, dirs[i]).rgb : SkyLuminanceAbove(dirs[i]);
+        radiance   += w[i] * (c.rgb * uGiIntensity + (1.0 - c.a) * sky);
         visibility += w[i] * (1.0 - c.a);
     }
     return true;

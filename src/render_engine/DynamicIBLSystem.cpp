@@ -16,7 +16,9 @@
 //    exponentielle) : mesuré sur le lac, maintenant continu. Le jeu publié est mis à jour EN ENTIER
 //    dans ce stage, avant l'éclairage : jamais de cubemap à moitié mise à jour à l'écran.
 //  * Update (CPU) : décide de démarrer un cycle (intervalle écoulé, soleil ou lune déplacés au-delà du
-//    seuil, demande manuelle) ; jamais pendant un cycle, jamais quand l'IBL est gelée.
+//    seuil, météo des nuages changée, demande manuelle) ; jamais pendant un cycle, jamais quand l'IBL est gelée.
+//  * Nuages : la capture compose les nuages volumétriques (mêmes paramètres que l'affichage, partagés par
+//    LightingShared::clouds) quand VolumetricGodRaysSystem les publie ; sinon ciel seul.
 //  * Changement de résolution : seul le jeu de travail est réalloué au début d'un cycle ; le jeu publié
 //    suit à la fin du cycle (copie directe, aucun retour au repli gris).
 //  * LUT BRDF 512² RG16F calculée une seule fois, à la première frame.
@@ -43,6 +45,7 @@
 #include "core/gpu/ShaderManager.hpp"
 #include "core/gpu/Cubemap.hpp"
 #include "core/gpu/Texture2D.hpp"
+#include "render_engine/LightingShared.hpp"
 
 namespace env::render {
 namespace {
@@ -102,6 +105,14 @@ public:
         lastSunDelta_  = AngleDeg(sunDir, cycleSunDir_);
         lastMoonDelta_ = AngleDeg(moonDir, cycleMoonDir_);
 
+        // Nuages : capturés si VolumetricGodRaysSystem les a calculés (paramètres partagés) et publiés.
+        cloudsAvailable_ = includeClouds_ && SharedLighting().clouds.valid &&
+                           bb.IsPublished(env::bb::CloudWeatherMap) && bb.IsPublished(env::bb::CloudShapeNoise);
+        // Météo des nuages (couverture, densité, pluie, présence) : un changement notable relance un cycle.
+        const glm::vec4 cloudKey(ctx.environment.weatherExtra.x, ctx.environment.weatherExtra.y,
+                                 ctx.environment.weather.x, cloudsAvailable_ ? 1.0f : 0.0f);
+        lastCloudDelta_ = glm::length(cloudKey - cycleCloudKey_);
+
         if (cycleActive_) return;
         timeSinceCycle_ += ctx.time.dt;
         if (!atmoAvailable_) return;  // ciel pas encore calculé : rien à capturer
@@ -110,7 +121,8 @@ public:
         bool start = manual;
         if (!freeze_) {
             start = start || target_ < 0 || timeSinceCycle_ >= updateInterval_ ||
-                    std::max(lastSunDelta_, lastMoonDelta_) > sunAngleThresholdDeg_;
+                    std::max(lastSunDelta_, lastMoonDelta_) > sunAngleThresholdDeg_ ||
+                    lastCloudDelta_ > cloudThreshold_;
         }
         if (!start) return;
 
@@ -122,6 +134,7 @@ public:
         timeSinceCycle_ = 0.0f;
         cycleSunDir_    = sunDir;
         cycleMoonDir_   = moonDir;
+        cycleCloudKey_  = cloudKey;
     }
 
     void Render(EngineContext& ctx) override {
@@ -181,6 +194,15 @@ public:
         ImGui::SetItemTooltip("Doubles a chaque mip suivant, plafond 1024.");
         ImGui::Checkbox("Sol sous l'horizon", &includeGround_);
         ImGui::SetItemTooltip("Hemisphere bas = sol (albedo de l'atmosphere eclaire) au lieu du seul air.");
+
+        ImGui::SeparatorText("Nuages dans l'IBL");
+        ImGui::Checkbox("Nuages", &includeClouds_);
+        ImGui::SameLine();
+        ImGui::TextDisabled(cloudsAvailable_ ? "(captures)" : "(non publies : ciel seul)");
+        ImGui::SliderInt("Pas principaux", &cloudSteps_, 8, 48);
+        ImGui::SliderInt("Pas de lumiere", &cloudLightSteps_, 1, 8);
+        ImGui::SliderFloat("Seuil meteo", &cloudThreshold_, 0.005f, 0.2f, "%.3f");
+        ImGui::SetItemTooltip("Variation de couverture / densite / pluie qui relance un cycle.");
 
         ImGui::SeparatorText("Mise a jour (time-slicing)");
         ImGui::SliderInt("Etapes / frame", &stepsPerFrame_, 1, 16);
@@ -259,6 +281,28 @@ private:
         set.prefMips = prefMips;
     }
 
+    /// Nuages de la capture : bruits, carte météo et ombre publiés par VolumetricGodRaysSystem, paramètres
+    /// de la frame où la carte météo a été calculée (recalés sur l'origine de rendu courante).
+    void BindClouds(EngineContext& ctx) {
+        const gpu::ShaderProgram& p  = *captureProgram_;
+        const LightingShared&     sh = SharedLighting();
+        p.Set("uClouds", cloudsAvailable_);
+        if (!cloudsAvailable_) return;
+        const core::RenderBlackboard& bb = ctx.blackboard;
+        bb.BindTexture(env::bb::CloudShapeNoise,  env::bind::tex::CloudShapeNoise);
+        bb.BindTexture(env::bb::CloudDetailNoise, env::bind::tex::CloudDetailNoise);
+        bb.BindTexture(env::bb::CloudWeatherMap,  env::bind::tex::CloudWeatherMap);
+        bb.BindTexture(env::bb::CloudShadowMap,   env::bind::tex::CloudShadow);
+        SetCloudUniforms(p, sh.clouds, ctx.renderOriginChunk);
+        p.Set("uCloudSteps", cloudSteps_);
+        p.Set("uCloudLightSteps", cloudLightSteps_);
+        // Ombre moyenne au sol : centre de la carte d'ombre = caméra (à un texel près), recalé si besoin.
+        const glm::vec2 shift = glm::vec2(sh.cloudShadowOriginChunk - ctx.renderOriginChunk) * kChunkSizeMeters;
+        const glm::vec2 cam(ctx.environment.cameraPosition.x, ctx.environment.cameraPosition.z);
+        p.Set("uCloudShadowValid", sh.cloudShadowValid);
+        p.Set("uCloudShadowCenter", (cam - (sh.cloudShadowOrigin + shift)) / std::max(sh.cloudShadowExtent, 1.0f) + 0.5f);
+    }
+
     void RunStep(EngineContext& ctx) {
         IblSet& set = sets_[WorkIndex()];
         switch (step_) {
@@ -268,6 +312,7 @@ private:
                 ctx.blackboard.BindTexture(env::bb::AtmoSkyViewLUT, env::bind::tex::AtmoSkyView);
                 captureProgram_->Set("uAtmoAvailable", atmoAvailable_);
                 captureProgram_->Set("uIncludeGround", includeGround_);
+                BindClouds(ctx);
                 set.environment.BindImage(env::bind::image::IblOut, GL_WRITE_ONLY, 0, GL_TRUE);
                 captureProgram_->Dispatch(Groups(set.envSize), Groups(set.envSize), gpu::Cubemap::kFaceCount);
                 StepBarrier();
@@ -425,6 +470,9 @@ private:
     float         timeSinceCycle_  = 0.0f;
     glm::vec3     cycleSunDir_{0.0f, 1.0f, 0.0f};
     glm::vec3     cycleMoonDir_{0.0f, 1.0f, 0.0f};
+    glm::vec4     cycleCloudKey_{-1.0f};
+    float         lastCloudDelta_  = 0.0f;
+    bool          cloudsAvailable_ = false;
     float         lastSunDelta_  = 0.0f;
     float         lastMoonDelta_ = 0.0f;
     bool          atmoAvailable_ = false;
@@ -438,6 +486,10 @@ private:
     int   stepsPerFrame_         = 2;
     float updateInterval_        = 2.0f;
     float sunAngleThresholdDeg_  = 0.25f;
+    bool  includeClouds_         = true;
+    int   cloudSteps_            = 20;
+    int   cloudLightSteps_       = 4;
+    float cloudThreshold_        = 0.03f;
     float smoothingTime_         = 0.3f;
     bool  includeGround_         = true;
     bool  freeze_                = false;

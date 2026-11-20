@@ -27,6 +27,22 @@ namespace env::render {
 /// Producteur de scene.display (passe de tonemap).
 inline constexpr std::string_view kTonemapProducer = "VolumetricGodRaysSystem";
 
+/// Paramètres des nuages tels qu'ils ont servi à la frame de calcul de la carte météo (VolumetricGodRaysSystem),
+/// relus par la capture de l'IBL (DynamicIBLSystem) à la frame suivante : uniforms de cloud_density.glsl et
+/// cloud_march.glsl. Les positions sont relatives à `originChunk` (recalées par SetCloudUniforms).
+struct CloudParams {
+    bool       valid = false;            ///< nuages actifs, bruits et carte météo publiés
+    float      bottom = 1500.0f, top = 4500.0f;
+    float      shapeScale = 9000.0f, detailScale = 900.0f, detailStrength = 0.35f, curl = 0.35f;
+    glm::vec3  shapeOffset{0.0f}, detailOffset{0.0f};
+    glm::vec2  weatherOriginRel{0.0f};
+    float      weatherExtent = 40000.0f;
+    glm::vec2  skew{0.0f};
+    float      extinction = 0.04f, hgForward = 0.6f, hgBackward = -0.3f, silver = 1.5f, powder = 2.0f;
+    float      maxDistance = 60000.0f, fadeDistance = 45000.0f;
+    glm::ivec2 originChunk{0};
+};
+
 struct LightingShared {
     // --- Réglages (panneau de DeferredLightingSystem) ---
     float sunScale               = 1.0f;
@@ -50,6 +66,9 @@ struct LightingShared {
     glm::vec2  cloudShadowOrigin{0.0f};                ///< m : centre, relatif à cloudShadowOriginChunk
     glm::ivec2 cloudShadowOriginChunk{0};              ///< origine de rendu de la frame de calcul
     glm::vec3  cloudShadowLight{0.0f, 1.0f, 0.0f};     ///< astre pour lequel la carte a été calculée
+
+    // --- Nuages : écrit par VolumetricGodRaysSystem avec la carte météo, lu par la capture de l'IBL ---
+    CloudParams clouds;
 
     // --- Réglages d'exposition (panneau de VolumetricGodRaysSystem) ---
     float exposureCompensationEv = 1.0f;
@@ -129,6 +148,31 @@ inline void SetSurfaceLightingUniforms(const gpu::ShaderProgram& p, glm::ivec2 r
     const glm::vec2 shift = glm::vec2(s.cloudShadowOriginChunk - renderOriginChunk) * kChunkSizeMeters;
     p.Set("uCloudShadowOrigin",    s.cloudShadowOrigin + shift);
     p.Set("uCloudShadowLight",     s.cloudShadowLight);
+}
+
+/// Uniforms de cloud_density.glsl et cloud_march.glsl. renderOriginChunk : origine de rendu de la frame qui
+/// dessine ; les positions de `c` (relatives à c.originChunk) y sont recalées exactement (différence entière).
+inline void SetCloudUniforms(const gpu::ShaderProgram& p, const CloudParams& c, glm::ivec2 renderOriginChunk) {
+    // Position relative à l'origine de calcul = position relative à l'origine courante - shift.
+    const glm::vec2 shift = glm::vec2(c.originChunk - renderOriginChunk) * kChunkSizeMeters;
+    p.Set("uCloudBottom",      c.bottom);
+    p.Set("uCloudTop",         c.top);
+    p.Set("uShapeScale",       c.shapeScale);
+    p.Set("uDetailScale",      c.detailScale);
+    p.Set("uDetailStrength",   c.detailStrength);
+    p.Set("uShapeOffset",      c.shapeOffset - glm::vec3(shift.x, 0.0f, shift.y));
+    p.Set("uDetailOffset",     c.detailOffset - glm::vec3(shift.x, 0.0f, shift.y));
+    p.Set("uWeatherOriginRel", c.weatherOriginRel + shift);
+    p.Set("uWeatherExtent",    c.weatherExtent);
+    p.Set("uSkew",             c.skew);
+    p.Set("uCurlStrength",     c.curl);
+    p.Set("uExtinction",       c.extinction);
+    p.Set("uHgForward",        c.hgForward);
+    p.Set("uHgBackward",       c.hgBackward);
+    p.Set("uSilver",           c.silver);
+    p.Set("uPowder",           c.powder);
+    p.Set("uMaxDistance",      c.maxDistance);
+    p.Set("uFadeDistance",     c.fadeDistance);
 }
 
 /// Renseigne les uniforms d'exposure.glsl.

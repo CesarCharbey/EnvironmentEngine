@@ -203,7 +203,10 @@ public:
 
         // --- Nuages : bruits (une fois), carte météo, raymarching ---
         const bool clouds = cloudsEnabled_ && RenderClouds(ctx);
-        if (!clouds) SharedLighting().cloudShadowValid = false;
+        if (!clouds) {
+            SharedLighting().cloudShadowValid = false;
+            SharedLighting().clouds.valid     = false;  // la capture de l'IBL revient au ciel seul
+        }
 
         display_.Bind();
         glDisable(GL_DEPTH_TEST);
@@ -256,6 +259,7 @@ public:
     void Shutdown(EngineContext& ctx) override {
         ctx.blackboard.UnpublishIfProducer(env::bb::SceneDisplay, kTonemapProducer);
         SharedLighting().cloudShadowValid = false;
+        SharedLighting().clouds.valid     = false;
         for (std::string_view key : {env::bb::CloudShapeNoise, env::bb::CloudDetailNoise, env::bb::CloudWeatherMap,
                                      env::bb::CloudShadowMap})
             ctx.blackboard.UnpublishIfProducer(key, kProducer);
@@ -417,6 +421,10 @@ private:
             glDispatchCompute(kWeatherSize / 8, kWeatherSize / 8, 1);
             glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
         }
+        // Mêmes paramètres pour toutes les passes de cette frame, et pour la capture de l'IBL de la suivante
+        // (DynamicIBLSystem, stage AtmosphereIBL : il lit la carte météo et les bruits publiés ici).
+        cloudParams_ = MakeCloudParams(ctx.renderOriginChunk);
+        SharedLighting().clouds = cloudParams_;
 
         // Ressources du modèle de densité, communes aux passes 2 (ombre) et 3 (raymarching).
         shapeNoise_.BindUnit(env::bind::tex::CloudShapeNoise);
@@ -432,21 +440,12 @@ private:
             bb.BindTexture(env::bb::GBufferDepth, env::bind::tex::GBufferDepth);
             bb.BindTexture(env::bb::AtmoTransmittanceLUT, env::bind::tex::AtmoTransmittance);
             bb.BindTexture(env::bb::AtmoSkyViewLUT, env::bind::tex::AtmoSkyView);
-            bb.BindTexture(env::bb::IblIrradiance, env::bind::tex::IblIrradiance);
             const gpu::ShaderProgram& p = *cloudsProg_;
             SetDensityUniforms(p);
             p.Set("uAtmoAvailable", sh.atmoAvailable);
             p.Set("uGBufferAvailable", sh.gbufferAvailable);
-            p.Set("uIblAvailable", sh.iblAvailable);
             p.Set("uPrimarySteps", primarySteps_);
             p.Set("uLightSteps", lightSteps_);
-            p.Set("uExtinction", extinction_);
-            p.Set("uHgForward", hgForward_);
-            p.Set("uHgBackward", hgBackward_);
-            p.Set("uSilver", silverIntensity_);
-            p.Set("uPowder", powder_);
-            p.Set("uMaxDistance", maxDistance_);
-            p.Set("uFadeDistance", fadeDistance_);
             // Ping-pong : la cible de la frame précédente devient l'historique.
             current_ ^= 1;
             const int        block = historyValid_ ? prevBlock_ : 1;  // historique invalide : tout raymarcher
@@ -503,20 +502,34 @@ private:
         p.Set("uOriginShift", glm::vec2(ctx.renderOriginChunk - prevOriginChunk_) * kChunkSizeMeters);
     }
 
-    /// Uniforms de cloud_density.glsl (raymarching et ombre : mêmes nuages).
-    void SetDensityUniforms(const gpu::ShaderProgram& p) const {
-        p.Set("uCloudBottom", cloudBottom_);
-        p.Set("uCloudTop", cloudTop_);
-        p.Set("uShapeScale", shapeScale_);
-        p.Set("uDetailScale", detailScale_);
-        p.Set("uDetailStrength", detailStrength_);
-        p.Set("uShapeOffset", shapeOffset_);
-        p.Set("uDetailOffset", detailOffset_);
-        p.Set("uWeatherOriginRel", weatherOriginRel_);
-        p.Set("uWeatherExtent", weatherMapExtent_);
-        p.Set("uSkew", windDirXZ_ * skew_);
-        p.Set("uCurlStrength", curlStrength_);
+    /// Paramètres des nuages de cette frame (uniforms de cloud_density.glsl et cloud_march.glsl).
+    CloudParams MakeCloudParams(glm::ivec2 renderOriginChunk) const {
+        CloudParams c;
+        c.valid            = true;
+        c.bottom           = cloudBottom_;
+        c.top              = cloudTop_;
+        c.shapeScale       = shapeScale_;
+        c.detailScale      = detailScale_;
+        c.detailStrength   = detailStrength_;
+        c.curl             = curlStrength_;
+        c.shapeOffset      = shapeOffset_;
+        c.detailOffset     = detailOffset_;
+        c.weatherOriginRel = weatherOriginRel_;
+        c.weatherExtent    = weatherMapExtent_;
+        c.skew             = windDirXZ_ * skew_;
+        c.extinction       = extinction_;
+        c.hgForward        = hgForward_;
+        c.hgBackward       = hgBackward_;
+        c.silver           = silverIntensity_;
+        c.powder           = powder_;
+        c.maxDistance      = maxDistance_;
+        c.fadeDistance     = fadeDistance_;
+        c.originChunk      = renderOriginChunk;
+        return c;
     }
+
+    /// Uniforms des nuages (raymarching, ombre, résolution : mêmes nuages que la capture de l'IBL).
+    void SetDensityUniforms(const gpu::ShaderProgram& p) const { SetCloudUniforms(p, cloudParams_, cloudParams_.originChunk); }
 
     /// Carte d'ombre : astre dominant (soleil, sinon lune) ; sans astre levé ou ombres coupées, la carte
     /// est déclarée invalide et l'éclairage n'ombre pas (CloudShadow() renvoie 1).
@@ -531,7 +544,6 @@ private:
         p.Set("uShadowOrigin", shadowOriginRel_);
         p.Set("uShadowExtent", cloudShadowExtent_);
         p.Set("uLightDir", shadowLight_);
-        p.Set("uExtinction", extinction_);
         p.Set("uShadowStrength", cloudShadowStrength_);
         p.Set("uShadowOpacity", cloudShadowOpacity_);
         shadowMap_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
@@ -609,6 +621,7 @@ private:
     glm::ivec2          lastOriginChunk_{0};
     glm::vec3           prevSun_{0.0f, 1.0f, 0.0f};
     glm::vec4           prevWeather_{0.0f};
+    CloudParams         cloudParams_;
     bool                noiseReady_ = false;
     double              windOffset_[2] = {0.0, 0.0};  ///< m, accumulé (double : monde infini)
     double              frontPeriod_   = 1.0;

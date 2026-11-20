@@ -20,6 +20,7 @@
 #include "render/sky_lighting.glsl"
 #include "render/cloud_density.glsl"   // modèle de densité (partagé avec cloud_shadow.comp)
 #include "render/cloud_temporal.glsl"  // reprojection temporelle (motif, historique)
+#include "render/cloud_march.glsl"     // marche et éclairage (partagés avec la capture de l'IBL)
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -27,44 +28,10 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(rgba16f, binding = IMG_VolumetricOut) writeonly uniform image2D uCloudsOut;
 
 layout(binding = TEX_GBufferDepth)     uniform sampler2D   uGDepth;
-layout(binding = TEX_IblIrradiance)    uniform samplerCube uIblIrradiance;
 
 uniform bool  uGBufferAvailable;
-uniform bool  uIblAvailable;
 uniform int   uPrimarySteps;
 uniform int   uLightSteps;
-uniform float uExtinction;      // 1/m pour une densité de 1
-uniform float uHgForward;
-uniform float uHgBackward;
-uniform float uSilver;
-uniform float uPowder;
-uniform float uMaxDistance;     // m : longueur maximale de marche
-uniform float uFadeDistance;    // m : les nuages lointains se fondent dans le ciel (perspective aérienne)
-
-// Cône de 6 directions (fixes) autour du rayon de lumière : comme Nubis, la marche secondaire s'élargit
-// en cône, ce qui lisse l'ombre propre obtenue avec peu d'échantillons.
-const vec3 kCone[6] = vec3[6](vec3( 0.38,  0.92,  0.12), vec3(-0.65, -0.21,  0.73), vec3( 0.18, -0.83, -0.53),
-                              vec3( 0.86, -0.31,  0.40), vec3(-0.34,  0.48, -0.81), vec3(-0.79,  0.16, -0.59));
-
-// Intersections d'un rayon avec une sphère centrée à l'origine : (t0, t1), ou (-1, -1).
-vec2 RaySphere(vec3 p, vec3 d, float R) {
-    float b = dot(p, d);
-    float c = dot(p, p) - R * R;
-    float disc = b * b - c;
-    if (disc < 0.0) return vec2(-1.0);
-    float s = sqrt(disc);
-    return vec2(-b - s, -b + s);
-}
-
-
-float HenyeyGreenstein(float cosT, float g) {
-    float g2 = g * g;
-    return (1.0 - g2) / (4.0 * PI * pow(max(1e-4, 1.0 + g2 - 2.0 * g * cosT), 1.5));
-}
-
-float InterleavedGradientNoise(vec2 pixel) {
-    return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
-}
 
 // Pixel frais, mélangé à son historique reprojeté (lisse le jitter d'une frame à l'autre). L'historique
 // est écarté si la reprojection sort de l'écran ou s'il diffère trop (nuage apparu / disparu).
@@ -89,9 +56,8 @@ void main() {
     if (any(greaterThanEqual(id, size))) return;
     vec2 uv = (vec2(id) + 0.5) / vec2(size);
 
-    vec3  cam = envCameraPosition();
-    vec3  dir = envViewRayWorld(uv);
-    float Rm  = (AtmoValid() ? uAtmo.uRadiiAndScaleHeights.x : 6360.0) * 1000.0;  // rayon planétaire (m)
+    vec3 cam = envCameraPosition();
+    vec3 dir = envViewRayWorld(uv);
 
     // Distance de la géométrie opaque : la plus lointaine du bloc de pixels couvert (silhouettes : la
     // composition rejette ensuite, par pixel, le relief situé devant la couche).
@@ -106,124 +72,21 @@ void main() {
         if (!envIsSky(dMin)) geomDist = length(envWorldPosFromDepth(uv, dMin) - cam);
     }
 
-    // Segment dans la coque [bas, haut] ; le sol de la planète l'arrête.
-    vec3 pc   = vec3(0.0, cam.y + Rm, 0.0);  // caméra dans le repère centré planète
-    vec2 top  = RaySphere(pc, dir, Rm + uCloudTop);
-    vec2 bot  = RaySphere(pc, dir, Rm + uCloudBottom);
-    vec2 gnd  = RaySphere(pc, dir, Rm);
-    float tA = max(top.x, 0.0), tB = top.y;
-    if (bot.y > 0.0) {
-        if (bot.x > tA) tB = min(tB, bot.x);  // la caméra est au-dessus de la base : on s'arrête en y entrant
-        else            tA = max(tA, bot.y);  // la caméra est sous la base : on commence en sortant
-    }
-    if (gnd.x > 0.0) tB = min(tB, gnd.x);
-    // Relief DEVANT la couche (montagne sur le ciel) : on marche quand même, à moitié des pas. La
-    // composition cache ces nuages au pixel près ; l'historique reste ainsi valide derrière les
-    // silhouettes, et un ciel découvert par le mouvement n'a pas de traînée vide. Relief DANS la couche :
-    // la marche s'arrête dessus.
-    bool behindRelief = geomDist < tA;
-    if (!behindRelief) tB = min(tB, geomDist);
-    tB = min(tB, tA + uMaxDistance);
-    if (top.y <= 0.0 || tB <= tA) {
+    // Relief devant la couche : marche continuée à moitié des pas (l'historique reste valide derrière les
+    // silhouettes, pas de traînée vide quand le mouvement découvre le ciel).
+    float tA, tB;
+    bool  behindRelief;
+    if (!CloudSegment(cam, dir, geomDist, tA, tB, behindRelief)) {
         StoreCloud(id, dir, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
 
-    // Astre dominant : le soleil tant qu'il éclaire, sinon la lune.
-    vec3  sunDir  = normalize(envSunDirection());
-    vec3  moonDir = normalize(envMoonDirection());
-    bool  sunMain = sunDir.y > -0.08;
-    vec3  L       = sunMain ? sunDir : moonDir;
-    vec3  lightTOA = sunMain ? SunIlluminanceTOA() : MoonIlluminanceTOA();
-    float angR    = sunMain ? SunAngularRadius() : MoonAngularRadius();
-    float cosT    = dot(dir, L);
-    float phase   = mix(HenyeyGreenstein(cosT, uHgForward), HenyeyGreenstein(cosT, uHgBackward), 0.3);
-    float silver  = uSilver * 0.1 * HenyeyGreenstein(cosT, 0.95);
-
-    // Ambiant : ciel (IBL, radiance E/π au zénith) ; plus sombre à la base des nuages.
-    vec3 skyAmb = uIblAvailable ? texture(uIblIrradiance, vec3(0.0, 1.0, 0.0)).rgb : SkyAverage();
-
-    int   steps  = max(behindRelief ? uPrimarySteps / 2 : uPrimarySteps, 4);
-    float dt     = (tB - tA) / float(steps);
+    // Ambiant : ciel CLAIR moyen (celui qui éclaire la couche par au-dessus). Pas l'irradiance de l'IBL :
+    // elle contient maintenant les nuages, et leurs bases sombres assombriraient les sommets, de cycle en cycle.
+    vec3 skyAmb = SkyAverage();
     // Jitter différent à chaque frame (IGN décalé, Jimenez 2014) : l'accumulation temporelle le lisse.
     float frame  = float(uEnv.frameInfo.x % 64u);
-    float t      = tA + dt * InterleavedGradientNoise(vec2(id) + 5.588238 * frame);
-    float thick  = uCloudTop - uCloudBottom;
-    vec3  Lsum   = vec3(0.0);
-    float T      = 1.0;
-    float tWeighted = 0.0, wSum = 0.0;
-
-    for (int i = 0; i < steps; ++i) {
-        if (t > tB || T < 0.01) break;  // opaque : arrêt anticipé
-        vec3  p   = cam + dir * t;
-        vec3  pp  = pc + dir * t;
-        float alt = length(pp) - Rm;
-        float den = CloudDensity(p, alt, true);
-        if (den > 0.0) {
-            float sigma = den * uExtinction;
-            vec3  up    = pp / max(length(pp), 1.0);
-
-            // Ombre propre : marche en cône vers l'astre (pas croissants), puis un échantillon lointain pour
-            // l'ombre des grands nuages voisins (Nubis 2017).
-            float od    = 0.0;
-            float stepL = 0.3 * thick / float(max(uLightSteps, 1));
-            float tl    = 0.0;
-            for (int j = 0; j < uLightSteps; ++j) {
-                float tm   = tl + 0.5 * stepL;
-                vec3  off  = L * tm + kCone[j % 6] * (0.25 * tm);
-                float qAlt = length(pp + off) - Rm;
-                od += CloudDensity(p + off, qAlt, j < 2) * uExtinction * stepL;
-                tl += stepL;
-                stepL *= 1.6;
-            }
-            {
-                vec3  off  = L * (tl + thick);
-                float qAlt = length(pp + off) - Rm;
-                od += CloudDensity(p + off, qAlt, false) * uExtinction * thick * 0.5;
-            }
-            // Éclairement de l'astre à cette altitude (transmittance atmosphérique, ombre de la planète).
-            vec3 E = lightTOA * LightTransmittance(alt, L, angR);
-
-            // Probabilité d'in-scattering (Nubis 2017, remplace le « powder » de 2015) : peu de lumière
-            // diffusée plusieurs fois arrive sur les bords peu denses et à la base des nuages.
-            float hFrac    = clamp((alt - uCloudBottom) / thick, 0.0, 1.0);
-            float depthP   = 0.05 + pow(clamp(den, 0.0, 1.0), Remap(hFrac, 0.3, 0.85, 0.5, 2.0));
-            float vertP    = pow(clamp(Remap(hFrac, 0.07, 0.14, 0.1, 1.0), 0.1, 1.0), 0.8);
-            float inscatter = mix(1.0, depthP * vertP, clamp(uPowder * 0.5, 0.0, 1.0));
-
-            // Diffusion simple + diffusion multiple approchée (octaves de Wrenninge : extinction,
-            // contribution et anisotropie réduites) ; les octaves multiples subissent l'in-scattering.
-            float ms = phase * exp(-od) + silver * exp(-od) * (1.0 - clamp(den, 0.0, 1.0));
-            float a = 0.25, b = 0.5, c = 0.5;
-            for (int o = 1; o < 3; ++o) {
-                float ph = mix(HenyeyGreenstein(cosT, uHgForward * c), HenyeyGreenstein(cosT, uHgBackward * c), 0.3);
-                ms += b * exp(-od * a) * ph * inscatter;
-                a *= 0.25; b *= 0.5; c *= 0.5;
-            }
-            // Transmission diffuse des nuages épais (approximation de diffusion, 1 / (1 + 0,75 τ (1 - g))) :
-            // c'est elle qui éclaire la base grise d'un nuage d'orage, que la diffusion simple laisse noire.
-            ms += (1.0 - exp(-0.5 * od)) / (1.0 + 0.75 * (1.0 - 0.85) * od) * (0.8 / (4.0 * PI)) * inscatter;
-
-            vec3 S = sigma * (E * ms + skyAmb * mix(0.35, 1.0, hFrac));
-
-            // Intégration à conservation d'énergie sur le pas.
-            float Tstep = exp(-sigma * dt);
-            Lsum += T * (S - S * Tstep) / max(sigma, 1e-7);
-            tWeighted += T * (1.0 - Tstep) * t;
-            wSum      += T * (1.0 - Tstep);
-            T *= Tstep;
-        }
-        t += dt;
-    }
-
-    // Marche arrêtée sous 1 % de transmittance : le nuage est opaque. Garder ce 1 % laissait passer le
-    // disque du soleil (~10⁹ cd/m²) en blanc éclatant à travers les nuages épais.
-    if (T < 0.01) T = 0.0;
-
-    // Perspective aérienne : la luminance des nuages lointains tend vers celle du ciel derrière eux, mais
-    // leur opacité est conservée (sinon le soleil et la lune réapparaissaient à travers les nuages lointains).
-    float dCloud = wSum > 0.0 ? tWeighted / wSum : tA;
-    float fade   = exp(-dCloud / max(uFadeDistance, 1.0));
-    Lsum = mix(SkyLuminance(dir) * (1.0 - T), Lsum, fade);
-    StoreCloud(id, dir, vec4(min(Lsum, vec3(65000.0)), T));
+    float jitter = InterleavedGradientNoise(vec2(id) + 5.588238 * frame);
+    int   steps  = behindRelief ? uPrimarySteps / 2 : uPrimarySteps;
+    StoreCloud(id, dir, MarchClouds(cam, dir, tA, tB, steps, uLightSteps, true, jitter, skyAmb));
 }

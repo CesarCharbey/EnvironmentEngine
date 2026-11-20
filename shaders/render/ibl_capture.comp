@@ -9,16 +9,41 @@
 //  * Sous l'horizon : la sky-view ne contient que l'air entre la caméra et le sol. On y ajoute le sol
 //    lui-même (albédo de l'atmosphère éclairé par le soleil, la lune et le ciel), atténué par l'air
 //    traversé : sans lui, l'hémisphère bas serait noir (faces tournées vers le bas, reflets rasants).
+//    Le soleil et la lune qui l'éclairent sont atténués par l'ombre moyenne des nuages autour de la caméra.
+//  * Nuages (si VolumetricGodRaysSystem les publie) : même modèle de densité (cloud_density.glsl) et même
+//    marche (cloud_march.glsl) que les nuages affichés, allégés (uCloudSteps pas, uCloudLightSteps pas de
+//    lumière, sans bruit de détail ni curl : inutiles à cette résolution), composés sur le ciel et le sol.
+//    L'irradiance et le spéculaire préfiltré voient ainsi la couverture réelle (ciel couvert -> ambiant gris).
 #include "common/global_ubo.glsl"
 #include "render/atmo_common.glsl"
 #include "render/sky_lighting.glsl"
 #include "render/ibl_common.glsl"
+#include "render/cloud_density.glsl"
+#include "render/cloud_march.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(rgba16f, binding = IMG_IblOut) writeonly uniform imageCube uEnvOut;
 
 uniform bool uIncludeGround;
+uniform bool uClouds;            // nuages publiés et actifs (CloudParams.valid)
+uniform int  uCloudSteps;        // pas principaux
+uniform int  uCloudLightSteps;   // pas vers l'astre
+uniform bool uCloudShadowValid;  // clouds.shadowMap calculée (ombre des nuages au sol)
+uniform vec2 uCloudShadowCenter; // uv de la caméra dans la carte d'ombre
+
+layout(binding = TEX_CloudShadow) uniform sampler2D uCloudShadow;
+
+// Ombre moyenne des nuages sur le sol autour de la caméra (± 3 km) : 16 lectures de clouds.shadowMap.
+float MeanCloudShadow() {
+    if (!uCloudShadowValid) return 1.0;
+    float s = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        vec2 o = (vec2(i & 3, i >> 2) - 1.5) / 1.5 * 0.15;
+        s += textureLod(uCloudShadow, uCloudShadowCenter + o, 0.0).r;
+    }
+    return s / 16.0;
+}
 
 const float kHalfMax = 60000.0;  // borne du RGBA16F
 
@@ -26,8 +51,9 @@ const float kHalfMax = 60000.0;  // borne du RGBA16F
 vec3 GroundIlluminance() {
     vec3 sunDir  = normalize(envSunDirection());
     vec3 moonDir = normalize(envMoonDirection());
-    return SunIlluminanceTOA()  * LightTransmittance(0.0, sunDir,  SunAngularRadius())  * max(sunDir.y, 0.0)
-         + MoonIlluminanceTOA() * LightTransmittance(0.0, moonDir, MoonAngularRadius()) * max(moonDir.y, 0.0)
+    float shadow = MeanCloudShadow();
+    return (SunIlluminanceTOA()  * LightTransmittance(0.0, sunDir,  SunAngularRadius())  * max(sunDir.y, 0.0)
+          + MoonIlluminanceTOA() * LightTransmittance(0.0, moonDir, MoonAngularRadius()) * max(moonDir.y, 0.0)) * shadow
          + PI * SkyAverage();
 }
 
@@ -50,5 +76,15 @@ void main() {
     vec3 dir = CubeTexelDir(id.z, id.xy, size);
     vec3 L   = SkyLuminance(dir);
     if (uIncludeGround && dir.y < 0.0 && AtmoValid()) L += GroundRadiance(dir, GroundIlluminance());
+    if (uClouds) {
+        vec3  cam = envCameraPosition();
+        float tA, tB;
+        bool  behind;
+        if (CloudSegment(cam, dir, 1e30, tA, tB, behind)) {
+            float jitter = InterleavedGradientNoise(vec2(id.xy) + 17.0 * float(id.z));
+            vec4  c = MarchClouds(cam, dir, tA, tB, uCloudSteps, uCloudLightSteps, false, jitter, SkyAverage());
+            L = L * c.a + c.rgb;
+        }
+    }
     imageStore(uEnvOut, id, vec4(min(L, vec3(kHalfMax)), 1.0));
 }
