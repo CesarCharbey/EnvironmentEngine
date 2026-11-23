@@ -1,0 +1,152 @@
+#version 460 core
+// shaders/world/terrain_fbm.comp
+
+#include "common/global_ubo.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = IMG_HeightNormalOut, rgba32f) writeonly uniform image2D uHeightNormalOut;
+layout(binding = IMG_BiomeHydroOut, rgba16f) writeonly uniform image2D uBiomeHydroOut;
+
+layout(location = 0) uniform vec2  uChunkOriginWorld;
+layout(location = 1) uniform float uContinentScale;
+layout(location = 2) uniform float uHeightAmplitude;
+layout(location = 3) uniform int   uOctaves;
+layout(location = 4) uniform float uLacunarity;
+layout(location = 5) uniform float uGain;
+layout(location = 6) uniform int   uSeed;
+layout(location = 7) uniform float uMoistureScale; 
+
+vec2 hash22(vec2 p) {
+    p = p + float(uSeed) * 0.1337;
+    vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy) * 2.0 - 1.0;
+}
+
+float perlin(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(dot(hash22(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0)),
+                   dot(hash22(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+               mix(dot(hash22(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)),
+                   dot(hash22(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x), u.y);
+}
+
+// FBM Hybride Modulé (Plaines douces + Montagnes acérées)
+// FBM Hybride Modulé (Plaines + Montagnes)
+float getTerrainHeight(vec2 worldPos) {
+    vec2 freq = worldPos / uContinentScale;
+    float baseNoise = perlin(freq);
+    float normalizedBase = pow(baseNoise * 0.5 + 0.5, 1.8);
+    float totalHeight = (normalizedBase * 2.0 - 1.0) * uHeightAmplitude;
+    
+    float amplitude = uHeightAmplitude * uGain;
+    freq *= uLacunarity;
+    
+    for (int i = 1; i < uOctaves; i++) {
+        float n = perlin(freq);
+        float smoothNoise = n;
+        float ridgedNoise = 1.0 - abs(n);
+        ridgedNoise = (ridgedNoise * ridgedNoise) * 2.0 - 1.0; 
+        
+        float detail = mix(smoothNoise, ridgedNoise, normalizedBase);
+        totalHeight += detail * amplitude;
+        
+        freq *= uLacunarity;
+        amplitude *= uGain;
+    }
+    return totalHeight - (uHeightAmplitude * 0.1);
+}
+
+// Bruit lent pour dicter la répartition des forêts et déserts
+float getMoisture(vec2 worldPos) {
+    vec2 freq = worldPos / uMoistureScale;
+    float noise = perlin(freq) + 0.5 * perlin(freq * 2.0); 
+    return clamp(noise * 0.5 + 0.5, 0.0, 1.0); 
+}
+
+// NOUVEAU : Réseau de rivières procédural (SDF approximative)
+float getRiverSDF(vec2 worldPos) {
+    // Un bruit basse fréquence pour tracer le chemin global
+    float n = perlin(worldPos / 3000.0);
+    // On ajoute des méandres
+    n += perlin(worldPos / 600.0) * 0.15;
+    
+    // abs(n) crée des "creux" en V qui tombent exactement à 0. 
+    // On multiplie pour transformer cette valeur en une vraie distance en mètres.
+    return abs(n) * 3000.0;
+}
+
+const int B_OCEAN = 0;
+const int B_BEACH = 1;
+const int B_DESERT = 2;
+const int B_PLAINS = 3;
+const int B_FOREST = 4;
+const int B_JUNGLE = 5;
+const int B_SWAMP = 6;
+const int B_HIGHMOUNTAIN = 7;
+
+void main() {
+    ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
+    if (texelCoord.x >= CHUNK_TEX_RESOLUTION || texelCoord.y >= CHUNK_TEX_RESOLUTION) return;
+
+    vec2 localPos = (vec2(texelCoord) + 0.5) / float(CHUNK_TEX_RESOLUTION) * CHUNK_SIZE_METERS;
+    vec2 worldPos = uChunkOriginWorld + localPos;
+
+    // 1. Hauteur de base
+    float h = getTerrainHeight(worldPos);
+    
+    // 2. Hydrologie (SDF des rivières)
+    float riverSDF = getRiverSDF(worldPos);
+    
+    // NOUVEAU : On creuse le terrain si la rivière est proche (ex: à moins de 40 mètres)
+    float riverBankWidth = 40.0;
+    float riverDepth = 15.0; // Profondeur du lit de la rivière
+    
+    if (riverSDF < riverBankWidth) {
+        // Calcul d'une courbe en "U" pour le lit de la rivière
+        float carve = 1.0 - smoothstep(0.0, riverBankWidth, riverSDF);
+        // On force le terrain à descendre
+        h = mix(h, h - riverDepth, carve);
+    }
+
+    // 3. Normales 
+    float eps = 1.0; 
+    float hL = getTerrainHeight(worldPos - vec2(eps, 0.0));
+    float hR = getTerrainHeight(worldPos + vec2(eps, 0.0));
+    float hD = getTerrainHeight(worldPos - vec2(0.0, eps));
+    float hU = getTerrainHeight(worldPos + vec2(0.0, eps));
+    
+    // On applique aussi le creusement de la rivière aux normales pour que la pente de la berge soit correcte !
+    if (getRiverSDF(worldPos - vec2(eps, 0.0)) < riverBankWidth) hL -= riverDepth * (1.0 - smoothstep(0.0, riverBankWidth, getRiverSDF(worldPos - vec2(eps, 0.0))));
+    if (getRiverSDF(worldPos + vec2(eps, 0.0)) < riverBankWidth) hR -= riverDepth * (1.0 - smoothstep(0.0, riverBankWidth, getRiverSDF(worldPos + vec2(eps, 0.0))));
+    if (getRiverSDF(worldPos - vec2(0.0, eps)) < riverBankWidth) hD -= riverDepth * (1.0 - smoothstep(0.0, riverBankWidth, getRiverSDF(worldPos - vec2(0.0, eps))));
+    if (getRiverSDF(worldPos + vec2(0.0, eps)) < riverBankWidth) hU -= riverDepth * (1.0 - smoothstep(0.0, riverBankWidth, getRiverSDF(worldPos + vec2(0.0, eps))));
+
+    vec3 normal = normalize(vec3(hL - hR, 2.0 * eps, hD - hU));
+    imageStore(uHeightNormalOut, texelCoord, vec4(h, normal));
+
+    // 4. Biomes
+    float moisture = getMoisture(worldPos);
+    int biome = B_PLAINS;
+
+    // L'humidité augmente près des rivières
+    if (riverSDF < 100.0) moisture += 0.3;
+
+    if (h < 2.0) {
+        biome = B_BEACH; 
+    } else if (h > uHeightAmplitude * 0.45) { 
+        biome = B_HIGHMOUNTAIN; 
+    } else {
+        if (moisture > 0.55) {
+            biome = B_FOREST;
+        } else if (moisture < 0.45) {
+            biome = B_DESERT;
+        }
+    }
+
+    // Écriture : G = riverSDF
+    imageStore(uBiomeHydroOut, texelCoord, vec4(float(biome), riverSDF, RIVER_SDF_FAR, clamp(moisture, 0.0, 1.0)));
+}

@@ -11,12 +11,19 @@
 //  RÈGLE : ce fichier n'inclut jamais src/render_engine/ (vérifié au build).
 // =============================================================================
 #include <imgui.h>
+#include <glad/glad.h>
+#include <entt/entt.hpp>
 
 #include "contracts/ISystemModule.hpp"
+#include "contracts/WorldContracts.hpp"
+#include "contracts/GpuBindings.hpp"
 #include "core/SystemRegistry.hpp"
+#include "core/gpu/ShaderManager.hpp"
 
 namespace env::world {
 namespace {
+
+gpu::ShaderProgram* computeTerrain_ = nullptr;
 
 void TodoBanner(const char* scope) {
     ImGui::TextColored(ImVec4(1.0f, 0.62f, 0.15f, 1.0f), "TODO Dev 1");
@@ -26,53 +33,84 @@ void TodoBanner(const char* scope) {
 
 class BiomeHydrologySystem final : public ISystemModule {
 public:
-    void Init(EngineContext&) override {
-        // [DEV 1 WORKSPACE] — Spécification fonctionnelle
-        // Entrées  : shaders compute à créer dans shaders/world/ ; slots du contrat UBO_WorldChunkParams,
-        //            UBO_BiomeHydroParams, IMG_HeightNormalOut, IMG_BiomeHydroOut, SSBO_HydroGraphNodes,
-        //            SSBO_HydroGraphEdges.
-        // Sorties  : programmes compute chargés par le ShaderManager (terrain, macro-hydrologie,
-        //            méso-hydrologie et biomes), UBO de paramètres, buffers du macro-graphe, carte macro.
-        // Objectif : préparer une fois les ressources réutilisées par toutes les générations de chunks.
+    void Init(EngineContext& ctx) override {
+        computeTerrain_ = &ctx.shaders.LoadCompute("world.terrain_fbm", "world/terrain_fbm.comp");
     }
 
-    void Update(EngineContext&) override {
-        // [DEV 1 WORKSPACE] — Spécification fonctionnelle
-        // Entrées  : entités chunk à l'état Requested (hors MockChunkTag), budget de chunks par frame,
-        //            position de la caméra, paramètres du panneau (dont les niveaux d'eau).
-        // Sorties  : waterTime.x (niveau de l'océan) et waterTime.y (niveau du marais) écrits dans le
-        //            GlobalEnvironmentUBO — ce système en est l'unique écrivain ; un jeu de ressources du
-        //            réservoir attribué (composant ChunkGpuResources) et l'état Generating pour chaque chunk
-        //            retenu ; la liste des chunks à générer cette frame ; les cellules du macro-graphe proches
-        //            de la caméra mises à jour et publiées sous world.hydro.graphNodes,
-        //            world.hydro.graphEdges et world.hydro.macroMap.
-        // Objectif : sélection côté CPU / ECS uniquement. Graphe de drainage déterministe calculable
-        //            localement à partir de la graine (bassins versants, directions d'écoulement, débits,
-        //            confluences, embouchures), mis en cache autour de la caméra.
+    void Update(EngineContext& ctx) override {
+
+        ctx.environment.waterTime.x = oceanLevel_;
+        ctx.environment.waterTime.y = swampLevel_;
     }
 
-    void Render(EngineContext&) override {
-        // [DEV 1 WORKSPACE] — Spécification fonctionnelle
-        // Entrées  : chunks retenus par Update, leurs coordonnées entières (précision illimitée), le
-        //            macro-graphe, les paramètres de terrain, d'hydrologie et de biomes.
-        // Sorties  : heightNormalTex (R = hauteur absolue en mètres, GBA = normale monde unitaire) ;
-        //            biomeHydroTex (R = identifiant de biome entier, G = distance signée à la rivière en
-        //            mètres, négative dans le lit, B = distance signée au marais, A = humidité dans [0, 1],
-        //            valeur kRiverSdfFar loin de toute eau) ; heightRange du chunk ; readyMask complété des
-        //            bits HeightNormal et BiomeHydro ; état GpuReady.
-        // Objectif : 1) terrain procédural évalué en coordonnées monde (bruit fractal, déformation de
-        //            domaine, érosion approchée) pour des coutures continues entre chunks ;
-        //            2) rastérisation des segments macro traversant le chunk en distances signées, creusement
-        //            du terrain cohérent avec le lit ; 3) classification des biomes (température, humidité,
-        //            altitude, proximité de l'eau). Respecter la convention de centre de texel du contrat et
-        //            insérer une barrière mémoire entre les étapes dépendantes.
+    void Render(EngineContext& ctx) override {
+        // Si le shader n'a pas pu compiler (erreur de syntaxe), on annule
+        if (!computeTerrain_ || !computeTerrain_->IsValid()) return;
+
+        bool computeIssued = false;
+
+        // On cherche tous les chunks demandés par le système de streaming
+        auto view = ctx.registry.view<const ChunkCoordComponent, ChunkStateComponent, ChunkGpuResources>();
+
+        int chunksProcessed = 0;
+
+        for (auto entity : view) {
+            // Limite de budget par frame pour ne pas faire ramer le GPU
+            if (chunksProcessed >= maxChunksPerFrame_) break;
+
+            auto& state = view.get<ChunkStateComponent>(entity);
+            const auto& coord = view.get<const ChunkCoordComponent>(entity);
+            const auto& gpuRes = view.get<ChunkGpuResources>(entity);
+
+            // On regarde les masques (Bits) du contrat. 
+            // Si la hauteur n'est pas encore calculée, ET que le streaming nous a donné une texture vierge :
+            if ((state.readyMask & ChunkReady::HeightNormal) == 0 && gpuRes.heightNormalTex != 0) {
+                
+                // 1. Activation du Shader
+                computeTerrain_->Use();
+                
+                // 2. Envoi des variables au Shader
+                glm::dvec3 originWorld = ChunkOriginWorld(coord.coord);
+                glProgramUniform2f(computeTerrain_->Id(), 0, static_cast<float>(originWorld.x), static_cast<float>(originWorld.z));
+                glProgramUniform1f(computeTerrain_->Id(), 1, continentScale_);
+                glProgramUniform1f(computeTerrain_->Id(), 2, heightAmplitude_);
+                glProgramUniform1i(computeTerrain_->Id(), 3, octaves_);
+                glProgramUniform1f(computeTerrain_->Id(), 4, lacunarity_);
+                glProgramUniform1f(computeTerrain_->Id(), 5, gain_);
+                glProgramUniform1i(computeTerrain_->Id(), 6, seed_);
+                glProgramUniform1f(computeTerrain_->Id(), 7, moistureScale_);
+
+                // 3. On lie la texture du chunk comme image de destination
+                glBindImageTexture(env::bind::image::HeightNormalOut, gpuRes.heightNormalTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+                glBindImageTexture(env::bind::image::HeightNormalOut, gpuRes.heightNormalTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+                glBindImageTexture(env::bind::image::BiomeHydroOut, gpuRes.biomeHydroTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+
+
+                // 4. Exécution ! (256/16 = 16 groupes de travail par axe)
+                glDispatchCompute(kChunkTexResolution / 16, kChunkTexResolution / 16, 1);
+                
+                computeIssued = true;
+                chunksProcessed++;
+
+                // 5. On valide que le travail est fait (Bits HeightNormal ET BiomeHydro)
+                state.readyMask |= (ChunkReady::HeightNormal | ChunkReady::BiomeHydro);
+                
+                // Pour que notre collègue l'affiche immédiatement (Jalon 1), on le passe en GpuReady
+                if (state.state == ChunkState::Requested) {
+                    state.state = ChunkState::GpuReady;
+                }
+            }
+        }
+
+        // 6. Règle absolue (ADR) : Si on a écrit sur la carte graphique, il faut mettre une barrière mémoire
+        // pour empêcher le moteur de rendu de lire la texture tant que l'écriture n'est pas finie.
+        if (computeIssued) {
+            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        }
     }
 
     void Shutdown(EngineContext&) override {
-        // [DEV 1 WORKSPACE] — Spécification fonctionnelle
-        // Entrées  : ressources créées par Init.
-        // Sorties  : buffers du macro-graphe, carte macro et UBO libérés ; clés world.hydro.* retirées.
-        // Objectif : libération propre avant la destruction du contexte OpenGL.
+
     }
 
     void OnGui(EngineContext&) override {
