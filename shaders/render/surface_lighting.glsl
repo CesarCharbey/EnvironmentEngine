@@ -121,12 +121,16 @@ vec3 DirectLight(Surface s, vec3 V, vec3 L, vec3 E) {
 // ici sur l'origine de rendu courante). L'autre astre (la lune le jour, le soleil la nuit, négligeables
 // alors) n'est pas ombré. Hors de la carte : 1 (la carte s'y fond déjà vers 1).
 float CloudShadow(vec3 P, vec3 L) {
-    if (!uCloudShadowAvailable || dot(L, uCloudShadowLight) < 0.99) return 1.0;
+    if (!uCloudShadowAvailable) return 1.0;
+    // Transmittance de repli hors carte : 1.0 par temps clair, 0.0 (ombre totale) à couverture 1.0.
+    float fallback = 1.0 - smoothstep(0.35, 0.98, uEnv.weatherExtra.x);
+    if (dot(L, uCloudShadowLight) < 0.99) return fallback;
     vec3  Lm = normalize(vec3(uCloudShadowLight.x, max(uCloudShadowLight.y, 0.08), uCloudShadowLight.z));
     vec2  xz = P.xz + Lm.xz * ((uCloudLayerAltitude - P.y) / Lm.y);
     vec2  uv = (xz - uCloudShadowOrigin) / uCloudShadowExtent + 0.5;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
-    return textureLod(uCloudShadow, uv, 0.0).r;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return fallback;
+    float edge = smoothstep(0.35, 0.5, max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
+    return min(textureLod(uCloudShadow, uv, 0.0).r, mix(1.0, fallback, edge));
 }
 
 // =============================================================================
@@ -393,6 +397,13 @@ vec3 ApplyHeightFog(vec3 color, vec3 P, vec3 rayDir, float dist, float sunShadow
     if (uGodRayDistance > 0.0) {
         float Tm = exp(-max(FogOpticalDepth(min(uGodRayDistance, dist), rayDir.y), 0.0));
         mainWeight = max(Tm - (1.0 - fog), 0.0);
+    }
+
+    // Atténuation macro par la couverture nuageuse sur le brouillard lointain (au-delà des god rays) :
+    // sous un plafond couvert, le soleil ne peut plus illuminer le brouillard de hauteur à l'horizon.
+    if (uCloudShadowAvailable) {
+        float overcast = smoothstep(0.35, 0.95, uEnv.weatherExtra.x);
+        vis *= 1.0 - overcast * 0.95;
     }
     return color * (1.0 - fog) + (ambient + otherTerm) * fog + mainTerm * vis * mainWeight;
 }

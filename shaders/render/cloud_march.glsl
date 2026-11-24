@@ -264,9 +264,13 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
     if (T < 0.01) T = 0.0;
 
     // Perspective aérienne des nuages volumétriques bas.
-    float dCloud = wSum > 0.0 ? tWeighted / wSum : tA;
-    float fade   = exp(-dCloud / max(uFadeDistance, 1.0));
-    Lsum = mix(SkyLuminance(dir) * (1.0 - T), Lsum, fade);
+    // Sous forte couverture, on rabat le ciel de fondu vers skyAmb (sans halo solaire de Mie)
+    // pour éviter que le soleil couchant ne perce artificiellement un plafond opaque à l'horizon.
+    float dCloud   = wSum > 0.0 ? tWeighted / wSum : tA;
+    float fade     = exp(-dCloud / max(uFadeDistance, 1.0));
+    float overcast = smoothstep(0.4, 0.9, uEnv.weatherExtra.x) * (1.0 - T);
+    vec3  farSky   = mix(SkyLuminance(dir), skyAmb, overcast);
+    Lsum = mix(farSky * (1.0 - T), Lsum, fade);
 
     // Sous-couche Cirrus 2.5D en haute altitude (derrière les nuages bas, uniquement si T > 0).
     if (T > 0.01 && uCirrusCoverage > 0.001) {

@@ -75,6 +75,10 @@ void main() {
 
     vec3 dir = CubeTexelDir(id.z, id.xy, size);
     vec3 L   = SkyLuminance(dir);
+    if (uClouds) {
+        float overcast = smoothstep(0.4, 0.95, uEnv.weatherExtra.x);
+        L = mix(L, SkyAverage(), overcast);
+    }
     if (uIncludeGround && dir.y < 0.0 && AtmoValid()) L += GroundRadiance(dir, GroundIlluminance());
     if (uClouds) {
         vec3  cam = envCameraPosition();
