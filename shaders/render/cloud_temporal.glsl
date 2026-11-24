@@ -18,6 +18,7 @@ uniform ivec2 uBlockOffset;    // pixel raymarché dans chaque bloc cette frame 
 uniform bool  uHistoryValid;   // false : premier rendu, redimensionnement, saut d'heure / de météo
 uniform mat4  uPrevViewProj;   // viewProj de la frame précédente (repère de SON origine de rendu)
 uniform vec2  uOriginShift;    // m : (origine courante - origine précédente) en xz
+uniform vec2 uWindDelta;       // m : déplacement du vent en xz sur la dernière frame
 
 // Distance représentative des nuages le long du rayon : entrée dans la couche (parallaxe). -1 si le rayon
 // ne la rencontre pas (direction traitée comme à l'infini).
@@ -42,7 +43,8 @@ vec2 ReprojectCloudUv(vec3 dir) {
     vec4  clip;
     if (d > 0.0) {
         vec3 X = envCameraPosition() + dir * d;
-        X.xz += uOriginShift;  // positions relatives à l'origine de rendu de la frame précédente
+        // Position à la frame précédente : recalage d'origine + compensation du vent (Nubis Evolved 2022).
+        X.xz += uOriginShift - uWindDelta;
         clip = uPrevViewProj * vec4(X, 1.0);
     } else {
         clip = uPrevViewProj * vec4(dir, 0.0);  // point à l'infini : rotation seule

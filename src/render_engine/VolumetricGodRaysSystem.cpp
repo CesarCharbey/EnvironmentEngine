@@ -109,13 +109,17 @@ public:
         }
 
         // --- Vent : décalage accumulé en double (m) ---
+        windDeltaXZ_ = glm::vec2(0.0f);
         const glm::vec2 wind  = glm::vec2(ctx.environment.windDirSpeed);
         const double    speed = static_cast<double>(ctx.environment.windDirSpeed.z) * windInfluence_;
         if (glm::length(wind) > 1e-4f) {
             const glm::vec2 d = glm::normalize(wind);
+            const double    dx = d.x * speed * ctx.time.dt;
+            const double    dz = d.y * speed * ctx.time.dt;
             windDirXZ_ = d;
-            windOffset_[0] += d.x * speed * ctx.time.dt;
-            windOffset_[1] += d.y * speed * ctx.time.dt;
+            windDeltaXZ_   = glm::vec2(static_cast<float>(dx), static_cast<float>(dz));
+            windOffset_[0] += dx;
+            windOffset_[1] += dz;
         }
 
         // --- Fenêtre glissante de la carte météo, centrée sur la caméra et calée sur un texel ---
@@ -557,6 +561,7 @@ private:
         p.Set("uPrevViewProj", prevViewProj_);
         // Origine courante - origine précédente (m) : exacte, différence entière de chunks.
         p.Set("uOriginShift", glm::vec2(ctx.renderOriginChunk - prevOriginChunk_) * kChunkSizeMeters);
+        p.Set("uWindDelta", windDeltaXZ_);
     }
 
     /// Paramètres des nuages de cette frame (uniforms de cloud_density.glsl et cloud_march.glsl).
@@ -699,6 +704,7 @@ private:
     float               curlStrength_     = 0.35f;
     float               skew_             = 500.0f;
     glm::vec2           windDirXZ_{1.0f, 0.0f};
+    glm::vec2           windDeltaXZ_{0.0f};
 
     // Variables liées aux sliders d'OnGui (god rays : aucune logique branchée).
     bool  cloudsEnabled_    = true;

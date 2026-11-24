@@ -44,8 +44,10 @@ float DensityHeightGradient(float h, float type) {
     return clamp(Remap(h, g.x, g.y, 0.0, 1.0), 0.0, 1.0) * clamp(Remap(h, g.z, g.w, 1.0, 0.0), 0.0, 1.0);
 }
 
-// Densité [0, 1+] ; `detail` = false pour les marches secondaires (lumière), plus économes.
-float CloudDensity(vec3 pRel, float alt, bool detail) {
+// Densité [0, 1+] avec sortie du profil dimensionnel (Nubis Evolved 2022) ;
+// `detail` = false pour les marches secondaires (lumière), plus économes.
+float CloudDensity(vec3 pRel, float alt, bool detail, out float dimProfile) {
+    dimProfile = 0.0;
     float h = (alt - uCloudBottom) / (uCloudTop - uCloudBottom);
     if (h <= 0.0 || h >= 1.0) return 0.0;
     vec3 p = vec3(pRel.x, alt, pRel.z);
@@ -58,11 +60,16 @@ float CloudDensity(vec3 pRel, float alt, bool detail) {
     float anvil = smoothstep(0.5, 1.0, w.g) * smoothstep(0.7, 1.0, w.b);
     coverage = pow(coverage, clamp(Remap(h, 0.7, 0.8, 1.0, mix(1.0, 0.5, anvil)), mix(1.0, 0.5, anvil), 1.0));
 
+    // Profil dimensionnel (Nubis Evolved 2022) : early-out avant de lire le bruit 3D 128^3.
+    float heightGrad = DensityHeightGradient(h, w.b);
+    dimProfile = heightGrad * coverage;
+    if (dimProfile <= 0.01) return 0.0;
+
     vec4  shape = textureLod(uShapeNoise, (p + uShapeOffset) / uShapeScale, 0.0);
     float fbm   = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
     float base  = Remap(shape.r, fbm - 1.0, 1.0, 0.0, 1.0);
     base  = smoothstep(0.30, 0.98, base);  // égalisation (répartition mesurée de la texture)
-    base *= DensityHeightGradient(h, w.b);
+    base *= heightGrad;
     base  = clamp(Remap(base, 1.0 - coverage, 1.0, 0.0, 1.0), 0.0, 1.0) * coverage;
     if (base <= 0.0) return 0.0;
 
@@ -76,6 +83,12 @@ float CloudDensity(vec3 pRel, float alt, bool detail) {
         base = clamp(Remap(base, erode * uDetailStrength * 0.4, 1.0, 0.0, 1.0), 0.0, 1.0);
     }
     return base * mix(0.6, 1.6, w.a);
+}
+
+// Surcharge sans profil dimensionnel (utilisée par cloud_shadow.comp et la marche de lumière).
+float CloudDensity(vec3 pRel, float alt, bool detail) {
+    float unusedProfile;
+    return CloudDensity(pRel, alt, detail, unusedProfile);
 }
 
 #endif  // ENV_CLOUD_DENSITY_GLSL

@@ -87,19 +87,32 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
     float silver  = uSilver * 0.1 * HenyeyGreenstein(cosT, 0.95);
 
     steps        = max(steps, 4);
-    float dt     = (tB - tA) / float(steps);
-    float t      = tA + dt * jitter;
     float thick  = uCloudTop - uCloudBottom;
-    vec3  Lsum   = vec3(0.0);
-    float T      = 1.0;
+
+    // Taille de pas adaptative selon la distance (Nubis Evolved 2022) :
+    // pas fin de près (netteté des détails), pas croissant au loin (moins de pas vers l'horizon).
+    // stepScale adapte automatiquement les constantes pour behindRelief (32 pas) et l'IBL (20 pas).
+    const float kNearStep   = 35.0;     // m : pas fin près de la caméra (~47 m à 1,5 km)
+    const float kFarOffset  = 250.0;    // m : augmentation de pas à kAdjustDist
+    const float kAdjustDist = 25000.0;  // m : distance de référence
+    float stepScale = 64.0 / float(steps);
+
+    float dt0 = (kNearStep + (kFarOffset * tA) / kAdjustDist) * stepScale;
+    float t   = tA + dt0 * jitter;
+    vec3  Lsum = vec3(0.0);
+    float T    = 1.0;
     float tWeighted = 0.0, wSum = 0.0;
 
     for (int i = 0; i < steps; ++i) {
-        if (t > tB || T < 0.01) break;  // opaque : arrêt anticipé
+        if (t >= tB || T < 0.01) break;  // opaque ou fin de segment : arrêt anticipé
+        float dt     = (kNearStep + (kFarOffset * t) / kAdjustDist) * stepScale;
+        float stepDt = min(dt, tB - t);  // évite de dépasser tB sur le dernier pas
+
         vec3  p   = cam + dir * t;
         vec3  pp  = pc + dir * t;
         float alt = length(pp) - Rm;
-        float den = CloudDensity(p, alt, detail);
+        float dimProfile = 0.0;
+        float den = CloudDensity(p, alt, detail, dimProfile);
         if (den > 0.0) {
             float sigma = den * uExtinction;
             vec3  up    = pp / max(length(pp), 1.0);
@@ -141,20 +154,18 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
                 ms += b * exp(-od * a) * ph * inscatter;
                 a *= 0.25; b *= 0.5; c *= 0.5;
             }
-            // Transmission diffuse des nuages épais (approximation de diffusion, 1 / (1 + 0,75 τ (1 - g))) :
-            // c'est elle qui éclaire la base grise d'un nuage d'orage, que la diffusion simple laisse noire.
-            // Sortie lambertienne : L = E × T_diff / π (un nuage opaque intègre ∫ σ T dt = 1). L'ancien facteur
-            // 0,8 / 4π sous-estimait ce terme d'un facteur ~5 : les bases étaient éclairées surtout par le ciel
-            // bleu, d'où des nuages couverts bleutés au lieu de gris.
+            // Transmission diffuse des nuages épais (approximation de diffusion, 1 / (1 + 0,75 τ (1 - g))).
             ms += (1.0 - exp(-0.5 * od)) / (1.0 + 0.75 * (1.0 - 0.85) * od) * (1.0 / PI) * inscatter;
 
-            // Ambiant du ciel : plus faible en bas de la couche, et atténué en profondeur (le ciel bleu
-            // n'atteint pas le cœur ni la base d'un nuage épais ; la lumière y vient de la diffusion du soleil).
+            // Ambiant du ciel (Nubis Evolved 2022) : occlusion par le profil dimensionnel (cœur dense
+            // plus sombre, bords plus lumineux), combinée à la hauteur et à l'atténuation en profondeur.
+            // skyAmb reste le ciel clair (jamais l'IBL) pour éviter toute boucle de rétroaction.
+            float ambAO    = pow(1.0 - clamp(dimProfile, 0.0, 1.0), 0.5);
             float ambDepth = 0.25 + 0.75 * exp(-0.04 * od);
-            vec3 S = sigma * (E * ms + skyAmb * mix(0.35, 1.0, hFrac) * ambDepth);
+            vec3 S = sigma * (E * ms + skyAmb * mix(0.35, 1.0, hFrac) * ambDepth * ambAO);
 
-            // Intégration à conservation d'énergie sur le pas.
-            float Tstep = exp(-sigma * dt);
+            // Intégration à conservation d'énergie sur le pas (utilise stepDt).
+            float Tstep = exp(-sigma * stepDt);
             Lsum += T * (S - S * Tstep) / max(sigma, 1e-7);
             tWeighted += T * (1.0 - Tstep) * t;
             wSum      += T * (1.0 - Tstep);
