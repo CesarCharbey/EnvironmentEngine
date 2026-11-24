@@ -143,6 +143,43 @@ public:
                                   static_cast<float>(WrapPositive(-0.05 * ctx.time.time * speed, dd)),
                                   static_cast<float>(WrapPositive(originZ - 1.3 * windOffset_[1], dd)));
 
+        // Cirrus 2.5D : décalage en double précision modulo la période (vent un peu plus rapide en haute altitude).
+        const double dc = cirrusScale_;
+        cirrusOffset_ = glm::vec2(static_cast<float>(WrapPositive(originX - 1.6 * windOffset_[0], dc)),
+                                  static_cast<float>(WrapPositive(originZ - 1.6 * windOffset_[1], dc)));
+
+        // --- Éclairs internes (orage : forte pluie + couverture, ou bouton manuel) ---
+        lightningIntensity_ = 0.0f;
+        if (lightningEnabled_) {
+            const float dt    = static_cast<float>(ctx.time.dt);
+            const bool  storm = ctx.environment.weather.x > 0.45f && ctx.environment.weatherExtra.x > 0.55f;
+            auto NextRand = [&]() {
+                lightningRng_ = lightningRng_ * 1664525u + 1013904223u;
+                return static_cast<float>(lightningRng_ >> 8u) * (1.0f / 16777216.0f);
+            };
+            if (lightningTimer_ <= 0.0f) {
+                if (storm) lightningCooldown_ -= dt;
+                if (triggerLightning_ || (storm && lightningCooldown_ <= 0.0f)) {
+                    triggerLightning_ = false;
+                    // Position autour de la caméra (2 à 10 km), au cœur de la couche nuageuse.
+                    const float angle = NextRand() * 6.2831853f;
+                    const float dist  = 2000.0f + NextRand() * 8000.0f;
+                    const float alt   = cloudBottom_ + (0.35f + 0.35f * NextRand()) * (cloudTop_ - cloudBottom_);
+                    lightningPosRel_  = glm::vec3(ctx.environment.cameraPosition.x + std::cos(angle) * dist, alt,
+                                                  ctx.environment.cameraPosition.z + std::sin(angle) * dist);
+                    lightningTimer_    = 0.38f;
+                    lightningCooldown_ = 2.0f + NextRand() * 5.0f;
+                }
+            } else {
+                lightningTimer_ = std::max(0.0f, lightningTimer_ - dt);
+                // Double flash réaliste sur 0,38 s (stable avec la reprojection 2×2).
+                const float u  = 1.0f - lightningTimer_ / 0.38f;
+                const float p1 = std::exp(-std::pow((u - 0.12f) / 0.08f, 2.0f));
+                const float p2 = 0.85f * std::exp(-std::pow((u - 0.42f) / 0.14f, 2.0f));
+                lightningIntensity_ = p1 + p2;  // enveloppe normalisée (mise à l'échelle dans le shader)
+            }
+        }
+
         // --- Ombre des nuages : carte centrée sur la caméra, calée sur un texel (coordonnées absolues) ---
         {
             const double st = static_cast<double>(cloudShadowExtent_) / kShadowSize;
@@ -352,6 +389,15 @@ public:
         ImGui::SetItemTooltip("Probabilite d'in-scattering de Nubis 2017 (remplace le powder de 2015) : 2 = complet.");
         ImGui::SliderFloat("Influence du vent", &windInfluence_, 0.0f, 10.0f);
         ImGui::SetItemTooltip("Multiplicateur du vent au sol pour l'advection des nuages et des fronts.");
+        ImGui::SeparatorText("Cirrus 2.5D (haute altitude)");
+        ImGui::SliderFloat("Couverture cirrus", &cirrusCoverage_, 0.0f, 1.0f);
+        ImGui::SliderFloat("Type cirrus", &cirrusType_, 0.0f, 1.0f, "%.2f");
+        ImGui::SetItemTooltip("0 = stries (streaky), 0.5 = filaments (wispy), 1 = moutonne (round).");
+        ImGui::SliderFloat("Altitude cirrus", &cirrusAltitude_, 5000.0f, 12000.0f, "%.0f m");
+        ImGui::SliderFloat("Echelle cirrus", &cirrusScale_, 8000.0f, 60000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
+        ImGui::Checkbox("Eclairs internes (orage)", &lightningEnabled_);
+        ImGui::SameLine();
+        if (ImGui::Button("Declencher un eclair")) triggerLightning_ = true;
 
         ImGui::SeparatorText("Ombre des nuages au sol (clouds.shadowMap)");
         ImGui::Checkbox("Ombres des nuages", &cloudShadowsEnabled_);
@@ -586,6 +632,13 @@ private:
         c.powder           = powder_;
         c.maxDistance      = maxDistance_;
         c.fadeDistance     = fadeDistance_;
+        c.cirrusAltitude   = cirrusAltitude_;
+        c.cirrusCoverage   = cirrusCoverage_;
+        c.cirrusType       = cirrusType_;
+        c.cirrusScale      = cirrusScale_;
+        c.cirrusOffset     = cirrusOffset_;
+        c.lightningPosRel    = lightningPosRel_;
+        c.lightningIntensity = lightningIntensity_;
         c.originChunk      = renderOriginChunk;
         return c;
     }
@@ -723,12 +776,24 @@ private:
     float silverIntensity_  = 1.5f;
     float powder_           = 2.0f;
     float windInfluence_    = 1.0f;
-    bool  godRaysEnabled_    = true;
-    float godRayIntensity_   = 1.0f;
-    float godRayMaxDistance_ = 2500.0f;
-    float godRayAnisotropy_  = 0.8f;
-    int   godRaySteps_       = 32;
-    float godRaySkyShafts_   = 1.0f;
+    float cirrusAltitude_   = 7500.0f;
+    float cirrusCoverage_   = 0.35f;
+    float cirrusType_       = 0.5f;     ///< 0 = streaky, 0.5 = wispy, 1 = round
+    float cirrusScale_      = 24000.0f;
+    glm::vec2 cirrusOffset_{0.0f};
+    bool lightningEnabled_   = true;
+    bool triggerLightning_   = false;
+    float lightningTimer_     = 0.0f;   ///< temps restant sur l'éclair en cours (s)
+    float lightningCooldown_  = 3.0f;   ///< attente avant le prochain éclair (s)
+    glm::vec3 lightningPosRel_{0.0f};
+    float lightningIntensity_ = 0.0f;
+    std::uint32_t lightningRng_= 1337u;
+    bool  godRaysEnabled_   = true;
+    float godRayIntensity_  = 1.0f;
+    float godRayMaxDistance_= 2500.0f;
+    float godRayAnisotropy_ = 0.8f;
+    int   godRaySteps_      = 32;
+    float godRaySkyShafts_  = 1.0f;
     float exposureEv_       = 13.0f;  // EV100 manuel (journée ensoleillée ≈ 15)
     bool  autoExposure_     = true;
     int   tonemapper_       = 0;      // ACES : même rendu qu'avant la passe de tonemap

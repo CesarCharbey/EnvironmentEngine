@@ -40,6 +40,15 @@ struct CloudParams {
     glm::vec2  skew{0.0f};
     float      extinction = 0.04f, hgForward = 0.6f, hgBackward = -0.3f, silver = 1.5f, powder = 2.0f;
     float      maxDistance = 60000.0f, fadeDistance = 45000.0f;
+    // Cirrus 2.5D (Nubis Evolved 2022)
+    float      cirrusAltitude = 7500.0f;
+    float      cirrusCoverage = 0.35f;
+    float      cirrusType     = 0.5f;    ///< 0 = streaky, 0.5 = wispy, 1 = round (cirrocumulus)
+    float      cirrusScale    = 24000.0f;
+    glm::vec2  cirrusOffset{0.0f};
+    // Éclairs internes (Nubis Evolved 2022)
+    glm::vec3  lightningPosRel{0.0f};
+    float      lightningIntensity = 0.0f;
     glm::ivec2 originChunk{0};
 };
 
@@ -177,6 +186,13 @@ inline void SetCloudUniforms(const gpu::ShaderProgram& p, const CloudParams& c, 
     p.Set("uPowder",           c.powder);
     p.Set("uMaxDistance",      c.maxDistance);
     p.Set("uFadeDistance",     c.fadeDistance);
+    p.Set("uCirrusAltitude",   c.cirrusAltitude);
+    p.Set("uCirrusCoverage",   c.cirrusCoverage);
+    p.Set("uCirrusType",       c.cirrusType);
+    p.Set("uCirrusScale",      c.cirrusScale);
+    p.Set("uCirrusOffset",     c.cirrusOffset - shift);
+    p.Set("uLightningPos",       c.lightningPosRel + glm::vec3(shift.x, 0.0f, shift.y));
+    p.Set("uLightningIntensity", c.lightningIntensity);
 }
 
 /// Renseigne les uniforms d'exposure.glsl.

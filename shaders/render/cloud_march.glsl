@@ -18,6 +18,13 @@ uniform float uSilver;
 uniform float uPowder;
 uniform float uMaxDistance;     // m : longueur maximale de marche
 uniform float uFadeDistance;    // m : les nuages lointains se fondent dans le ciel (perspective aérienne)
+uniform float uCirrusAltitude;  // m (~7500 m)
+uniform float uCirrusCoverage;  // [0, 1]
+uniform float uCirrusType;      // 0 = streaky, 0.5 = wispy, 1 = round
+uniform float uCirrusScale;     // m
+uniform vec2  uCirrusOffset;    // m : (origine - vent) mod uCirrusScale
+uniform vec3  uLightningPos;        // m : position de l'éclair, relative à l'origine de rendu
+uniform float uLightningIntensity;  // cd/m² (0 = pas d'éclair)
 
 // Cône de 6 directions (fixes) autour du rayon de lumière : comme Nubis, la marche secondaire s'élargit
 // en cône, ce qui lisse l'ombre propre obtenue avec peu d'échantillons.
@@ -66,6 +73,68 @@ bool CloudSegment(vec3 cam, vec3 dir, float geomDist, out float tA, out float tB
     if (!behindRelief) tB = min(tB, geomDist);
     tB = min(tB, tA + uMaxDistance);
     return top.y > 0.0 && tB > tA;
+}
+
+// Densité 2D des cirrus (Nubis Evolved 2022) : mélange de 3 motifs (streaky, wispy, round)
+// synthétisés depuis uShapeNoise et uDetailNoise sans nouveau slot de texture.
+float SampleCirrusDensity(vec2 xz) {
+    vec2 uv = (xz + uCirrusOffset) / max(uCirrusScale, 1.0);
+
+    // 1. Streaky : stries étirées dans le sens du vent (ou axe X par défaut).
+    vec2 windDir = length(uSkew) > 1e-3 ? normalize(uSkew) : vec2(1.0, 0.0);
+    vec2 windPerp = vec2(-windDir.y, windDir.x);
+    vec2 uvStretch = vec2(dot(uv, windDir) * 0.35, dot(uv, windPerp) * 2.2);
+    float sShape   = textureLod(uShapeNoise, vec3(uvStretch, 0.25), 0.0).r;
+    float sFine    = textureLod(uDetailNoise, vec3(uvStretch * 3.0, 0.5), 0.0).r;
+    float streaky  = clamp(sShape * 0.75 + sFine * 0.25, 0.0, 1.0);
+
+    // 2. Wispy : filaments fins tordus par le curl de uDetailNoise.
+    vec2 curl   = textureLod(uDetailNoise, vec3(uv * 2.0, 0.35), 0.0).gb * 2.0 - 1.0;
+    float wispy = textureLod(uShapeNoise, vec3(uv * 1.4 + curl * 0.12, 0.65), 0.0).r;
+
+    // 3. Round : cirrocumulus (ciel pommelé) basé sur les cellules Worley.
+    vec4  rTex  = textureLod(uShapeNoise, vec3(uv * 2.2, 0.85), 0.0);
+    float round = clamp(rTex.g * 0.7 + rTex.b * 0.3, 0.0, 1.0);
+
+    // Mélange des 3 motifs selon uCirrusType (0 -> 0.5 -> 1).
+    float pattern = uCirrusType < 0.5
+        ? mix(streaky, wispy, uCirrusType * 2.0)
+        : mix(wispy, round, uCirrusType * 2.0 - 1.0);
+
+    // Découpe par la couverture locale (modulation douce par la météo globale).
+    float cov = clamp(uCirrusCoverage, 0.0, 1.0);
+    return clamp(Remap(pattern, 1.0 - cov * 0.85, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
+}
+
+// Sous-couche Cirrus 2.5D : une seule intersection sphérique à uCirrusAltitude,
+// éclairage rasant au coucher de soleil (haute altitude) et 1 échantillon d'auto-ombrage.
+vec4 EvaluateCirrus(vec3 cam, vec3 dir, vec3 L, vec3 lightTOA, float angR, vec3 skyAmb) {
+    if (uCirrusCoverage <= 0.001 || dir.y <= 0.005) return vec4(0.0, 0.0, 0.0, 1.0);
+    float Rm = CloudPlanetRadius();
+    vec3  pc = vec3(0.0, cam.y + Rm, 0.0);
+    vec2  hit = RaySphere(pc, dir, Rm + uCirrusAltitude);
+    float tC  = hit.x > 0.0 ? hit.x : hit.y;
+    if (tC <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
+
+    vec3  pC  = cam + dir * tC;
+    float den = SampleCirrusDensity(pC.xz);
+    if (den <= 0.001) return vec4(0.0, 0.0, 0.0, 1.0);
+
+    // Auto-ombrage 2.5D léger : 1 seul échantillon décalé vers l'astre.
+    float denL = SampleCirrusDensity(pC.xz + L.xz * 450.0);
+    float od   = denL * 1.4;
+
+    // Éclairage à 7500 m : reste illuminé en doré/rose plus longtemps au coucher du soleil.
+    float cosT  = dot(dir, L);
+    float phase = mix(HenyeyGreenstein(cosT, 0.65), 1.0 / (4.0 * PI), 0.45);
+    vec3  E     = lightTOA * LightTransmittance(uCirrusAltitude, L, angR);
+    vec3  col   = E * exp(-od) * phase * 1.8 + skyAmb * 0.65;
+
+    // Opacité fine (les cirrus sont semi-transparents) + fondu lointain vers le ciel.
+    float alpha = clamp(1.0 - exp(-den * 1.15), 0.0, 0.85);
+    float fade  = exp(-tC / max(uFadeDistance * 1.8, 1.0));
+    vec3  Lcir  = mix(SkyLuminance(dir) * alpha, col * alpha, fade);
+    return vec4(Lcir, 1.0 - alpha);
 }
 
 // Marche de [tA, tB] : vec4(luminance diffusée (cd/m²), transmittance). jitter ∈ [0, 1) : décalage du
@@ -164,6 +233,23 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
             float ambDepth = 0.25 + 0.75 * exp(-0.04 * od);
             vec3 S = sigma * (E * ms + skyAmb * mix(0.35, 1.0, hFrac) * ambDepth * ambAO);
 
+            // Lueur interne d'éclair (Nubis Evolved 2022) : rayon fini (zéro fuite au loin)
+            // et intensité calée sur la luminance du ciel (cohérente avec l'auto-exposition jour/nuit).
+            if (uLightningIntensity > 0.001) {
+                const float kLightningRadius = 4500.0;  // m : portée maximale stricte de l'éclair
+                float dL = length(p - uLightningPos);
+                if (dL < kLightningRadius) {
+                    float falloff    = 1.0 - dL / kLightningRadius;
+                    float atten      = falloff * falloff * falloff;  // décroissance douce -> 0 exact au bord
+                    float ambLum     = dot(skyAmb, vec3(0.2126, 0.7152, 0.0722));
+                    float flashScale = max(ambLum * 8.0, 0.6);       // adapté au jour comme à la nuit
+                    float hGrad      = mix(0.35, 1.0, hFrac);
+                    float glow       = uLightningIntensity * flashScale * hGrad * atten
+                                     * (0.35 + 0.65 * clamp(dimProfile, 0.0, 1.0));
+                    S += sigma * vec3(0.72, 0.84, 1.0) * glow;
+                }
+            }
+
             // Intégration à conservation d'énergie sur le pas (utilise stepDt).
             float Tstep = exp(-sigma * stepDt);
             Lsum += T * (S - S * Tstep) / max(sigma, 1e-7);
@@ -174,15 +260,20 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
         t += dt;
     }
 
-    // Marche arrêtée sous 1 % de transmittance : le nuage est opaque. Garder ce 1 % laissait passer le
-    // disque du soleil (~10⁹ cd/m²) en blanc éclatant à travers les nuages épais.
+    // Marche arrêtée sous 1 % de transmittance : le nuage est opaque.
     if (T < 0.01) T = 0.0;
 
-    // Perspective aérienne : la luminance des nuages lointains tend vers celle du ciel derrière eux, mais
-    // leur opacité est conservée (sinon le soleil et la lune réapparaissaient à travers les nuages lointains).
+    // Perspective aérienne des nuages volumétriques bas.
     float dCloud = wSum > 0.0 ? tWeighted / wSum : tA;
     float fade   = exp(-dCloud / max(uFadeDistance, 1.0));
     Lsum = mix(SkyLuminance(dir) * (1.0 - T), Lsum, fade);
+
+    // Sous-couche Cirrus 2.5D en haute altitude (derrière les nuages bas, uniquement si T > 0).
+    if (T > 0.01 && uCirrusCoverage > 0.001) {
+        vec4 cir = EvaluateCirrus(cam, dir, L, lightTOA, angR, skyAmb);
+        Lsum += T * cir.rgb;
+        T    *= cir.a;
+    }
     return vec4(min(Lsum, vec3(65000.0)), T);
 }
 
