@@ -11,21 +11,6 @@
 #ifndef ENV_CLOUD_MARCH_GLSL
 #define ENV_CLOUD_MARCH_GLSL
 
-uniform float uExtinction;      // 1/m pour une densité de 1
-uniform float uHgForward;
-uniform float uHgBackward;
-uniform float uSilver;
-uniform float uPowder;
-uniform float uMaxDistance;     // m : longueur maximale de marche
-uniform float uFadeDistance;    // m : les nuages lointains se fondent dans le ciel (perspective aérienne)
-uniform float uCirrusAltitude;  // m (~7500 m)
-uniform float uCirrusCoverage;  // [0, 1]
-uniform float uCirrusType;      // 0 = streaky, 0.5 = wispy, 1 = round
-uniform float uCirrusScale;     // m
-uniform vec2  uCirrusOffset;    // m : (origine - vent) mod uCirrusScale
-uniform vec3  uLightningPos;        // m : position de l'éclair, relative à l'origine de rendu
-uniform float uLightningIntensity;  // cd/m² (0 = pas d'éclair)
-
 // Cône de 6 directions (fixes) autour du rayon de lumière : comme Nubis, la marche secondaire s'élargit
 // en cône, ce qui lisse l'ombre propre obtenue avec peu d'échantillons.
 const vec3 kCone[6] = vec3[6](vec3( 0.38,  0.92,  0.12), vec3(-0.65, -0.21,  0.73), vec3( 0.18, -0.83, -0.53),

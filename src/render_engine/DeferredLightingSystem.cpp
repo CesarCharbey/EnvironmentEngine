@@ -59,6 +59,8 @@ public:
                                              "render/deferred_lighting.vert",
                                              "render/deferred_lighting.frag");
         emptyVao_.Create("deferred.emptyVao");
+        surfaceLightingUbo_.Create(sizeof(SurfaceLightingUbo), GL_DYNAMIC_STORAGE_BIT, nullptr,
+                                   "deferred.surfaceLightingUbo");
     }
 
     void Update(EngineContext& ctx) override {
@@ -109,7 +111,9 @@ public:
         BindSurfaceLightingResources(bb);
 
         const gpu::ShaderProgram& p = *program_;
-        SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
+        surfaceLightingUbo_.UploadObject(BuildSurfaceLightingUbo(ctx.renderOriginChunk));
+        surfaceLightingUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::PostParams);
+        p.Set("uAtmoAvailable", sh.atmoAvailable);
         SetExposureUniforms(p);
         p.Set("uApplyFallbackExposure", !writeHdr_);
         p.Set("uDebugView",             debugView_);
@@ -138,6 +142,7 @@ public:
 
     void Shutdown(EngineContext&) override {
         emptyVao_.Destroy();
+        surfaceLightingUbo_.Destroy();
         program_ = nullptr;
     }
 
@@ -197,6 +202,7 @@ public:
 private:
     gpu::ShaderProgram* program_ = nullptr;
     gpu::VertexArray    emptyVao_;
+    gpu::GpuBuffer      surfaceLightingUbo_;
     bool                writeHdr_ = false;  ///< scene.color en HDR (tonemap actif) ou repli LDR
 
     // Paramètres propres à la résolution différée (OnGui) ; les autres sont dans LightingShared.

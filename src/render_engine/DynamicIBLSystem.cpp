@@ -44,6 +44,7 @@
 #include "core/RenderBlackboard.hpp"
 #include "core/gpu/ShaderManager.hpp"
 #include "core/gpu/Cubemap.hpp"
+#include "core/gpu/GpuBuffer.hpp"
 #include "core/gpu/Texture2D.hpp"
 #include "render_engine/LightingShared.hpp"
 
@@ -94,6 +95,7 @@ public:
 
         brdfLut_.Create({.width = kBrdfLutSize, .height = kBrdfLutSize, .internalFormat = GL_RG16F, .levels = 1,
                          .sampler = {}, .debugName = "ibl.brdfLUT"});
+        cloudUbo_.Create(sizeof(CloudParamsUbo), GL_DYNAMIC_STORAGE_BIT, nullptr, "ibl.cloudParams");
     }
 
     void Update(EngineContext& ctx) override {
@@ -165,6 +167,7 @@ public:
             set->prefiltered.Destroy();
         }
         brdfLut_.Destroy();
+        cloudUbo_.Destroy();
         target_        = -1;
         displayValid_  = false;
     }
@@ -293,7 +296,8 @@ private:
         bb.BindTexture(env::bb::CloudDetailNoise, env::bind::tex::CloudDetailNoise);
         bb.BindTexture(env::bb::CloudWeatherMap,  env::bind::tex::CloudWeatherMap);
         bb.BindTexture(env::bb::CloudShadowMap,   env::bind::tex::CloudShadow);
-        SetCloudUniforms(p, sh.clouds, ctx.renderOriginChunk);
+        cloudUbo_.UploadObject(BuildCloudParamsUbo(sh.clouds, ctx.renderOriginChunk));
+        cloudUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::VolumetricParams);
         p.Set("uCloudSteps", cloudSteps_);
         p.Set("uCloudLightSteps", cloudLightSteps_);
         // Ombre moyenne au sol : centre de la carte d'ombre = caméra (à un texel près), recalé si besoin.
@@ -458,6 +462,7 @@ private:
     bool                  displayValid_  = false;
     float                 blendResidual_ = 0.0f;  // part de l'ancien ciel restant dans le jeu publié
     gpu::Texture2D        brdfLut_;
+    gpu::GpuBuffer        cloudUbo_;
     bool                  brdfReady_ = false;
 
     // Machine à états

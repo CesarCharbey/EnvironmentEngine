@@ -210,6 +210,8 @@ public:
                                                     "render/water_surface.frag");
 
         ubo_.Create(sizeof(WaterParamsUbo), GL_DYNAMIC_STORAGE_BIT, nullptr, "water.params");
+        surfaceLightingUbo_.Create(sizeof(SurfaceLightingUbo), GL_DYNAMIC_STORAGE_BIT, nullptr,
+                                   "water.surfaceLightingUbo");
         emptyVao_.Create("water.emptyVao");
         BuildGrid(oceanGrid_, kOceanGridX, kOceanGridY,
                   glm::vec2(1.0f / kOceanGridX, 1.0f / kOceanGridY), "water.oceanGrid");
@@ -324,10 +326,13 @@ public:
         glBindTextureUnit(env::bind::tex::OceanDisplacement, oceanMaps_.Id());
         sceneCopy_.BindUnit(env::bind::tex::SceneColor);
         glDisable(GL_CULL_FACE);  // vagues vues de dos aux angles rasants
+        surfaceLightingUbo_.UploadObject(BuildSurfaceLightingUbo(ctx.renderOriginChunk));
+        surfaceLightingUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::PostParams);
+        const bool atmoAvailable = SharedLighting().atmoAvailable;
 
         if (wantOcean && oceanProg_->IsValid()) {
             const gpu::ShaderProgram& p = *oceanProg_;
-            SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
+            p.Set("uAtmoAvailable", atmoAvailable);
             p.Set("uKind", 0);
             p.Set("uGridMargin", 0.15f);
             p.Set("uGridCells", glm::vec2(kOceanGridX, kOceanGridY));
@@ -339,7 +344,7 @@ public:
 
         if (wantRivers && riverProg_->IsValid()) {
             const gpu::ShaderProgram& p = *riverProg_;
-            SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
+            p.Set("uAtmoAvailable", atmoAvailable);
             p.Set("uKind", 1);
             p.Set("uRivers", riversEnabled_);
             p.Set("uSwamps", swampsEnabled_);
@@ -370,6 +375,7 @@ public:
         spectrum_.Destroy();
         riverPool_.Destroy();
         ubo_.Destroy();
+        surfaceLightingUbo_.Destroy();
         sceneCopy_.Destroy();
         emptyVao_.Destroy();
         oceanGrid_ = Grid{};
@@ -645,6 +651,7 @@ private:
 
     // Ressources
     gpu::GpuBuffer   ubo_;
+    gpu::GpuBuffer   surfaceLightingUbo_;
     gpu::GpuBuffer   spectrum_;
     gpu::GpuBuffer   riverPool_;
     TextureArray2D   oceanMaps_;

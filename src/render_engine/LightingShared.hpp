@@ -20,6 +20,7 @@
 #include "contracts/GpuBindings.hpp"
 #include "contracts/WorldContracts.hpp"
 #include "core/RenderBlackboard.hpp"
+#include "core/gpu/GpuBuffer.hpp"
 #include "core/gpu/ShaderManager.hpp"
 
 namespace env::render {
@@ -130,69 +131,65 @@ inline void BindSurfaceLightingResources(const core::RenderBlackboard& bb) {
     bb.BindTexture(env::bb::VoxelGrid,              tex::VoxelGrid);
 }
 
-/// Renseigne les uniforms de surface_lighting.glsl (et uAtmoAvailable de sky_lighting.glsl).
-/// renderOriginChunk : origine de rendu de la frame courante (recalage de l'origine de l'ombre des nuages).
-inline void SetSurfaceLightingUniforms(const gpu::ShaderProgram& p, glm::ivec2 renderOriginChunk) {
-    const LightingShared& s = SharedLighting();
-    p.Set("uAtmoAvailable",        s.atmoAvailable);
-    p.Set("uGBufferAvailable",     s.gbufferAvailable);
-    p.Set("uIblAvailable",         s.iblAvailable);
-    p.Set("uCloudShadowAvailable", s.cloudShadowAvailable);
-    p.Set("uSpecularOcclusion",    s.specularOcclusion);
-    p.Set("uSunScale",             s.sunScale);
-    p.Set("uMoonScale",            s.moonScale);
-    p.Set("uIblScale",             s.iblScale);
-    p.Set("uVoxelAvailable",       s.voxelAvailable);
-    p.Set("uVoxelShadows",         s.voxelShadows);
-    p.Set("uVoxelGI",              s.voxelGI);
-    p.Set("uGiIntensity",          s.giIntensity);
-    p.Set("uVoxelShadowSoftness",  std::tan(glm::radians(s.voxelShadowSoftnessDeg)));
-    p.Set("uTerrainShadows",       s.terrainShadows);
-    p.Set("uContactShadows",       s.contactShadows);
-    p.Set("uFocusAvailable",       s.focusAvailable);
-    p.Set("uFocusChunkOrigin",     s.focusChunkOrigin);
-    p.Set("uShadowPenumbra",       glm::radians(s.shadowPenumbraDeg));
-    p.Set("uFogHeightFalloff",     s.fogHeightFalloff);
-    p.Set("uFogShadows",           s.fogShadows);
-    p.Set("uGodRayDistance",       s.godRayDistance);
-    p.Set("uCloudLayerAltitude",   s.cloudLayerAltitude);
-    p.Set("uCloudShadowExtent",    s.cloudShadowExtent);
-    // Origine exprimée dans le repère de rendu de la frame courante (exact : différence entière de chunks).
-    const glm::vec2 shift = glm::vec2(s.cloudShadowOriginChunk - renderOriginChunk) * kChunkSizeMeters;
-    p.Set("uCloudShadowOrigin",    s.cloudShadowOrigin + shift);
-    p.Set("uCloudShadowLight",     s.cloudShadowLight);
+/// Miroir std140 de SurfaceLightingBlock (shaders/render/surface_lighting.glsl), UBO_PostParams.
+struct alignas(16) SurfaceLightingUbo {
+    glm::ivec4 flags0{0};            ///< x=gbufferAvailable, y=iblAvailable, z=cloudShadowAvailable, w=specularOcclusion
+    glm::ivec4 flags1{0};            ///< x=voxelAvailable, y=voxelShadows, z=voxelGI, w=terrainShadows
+    glm::ivec4 flags2{0};            ///< x=contactShadows, y=focusAvailable, z=fogShadows, w=atmoAvailable
+    glm::vec4  scales{0.0f};         ///< x=sunScale, y=moonScale, z=iblScale, w=giIntensity
+    glm::vec4  shadowParams{0.0f};   ///< x=voxelShadowSoftness, y=shadowPenumbra, z=fogHeightFalloff, w=godRayDistance
+    glm::vec4  focusChunkOrigin{0.0f};  ///< xyz=focusChunkOrigin, w=0
+    glm::vec4  cloudShadow0{0.0f};   ///< xy=cloudShadowOrigin + shift, z=cloudLayerAltitude, w=cloudShadowExtent
+    glm::vec4  cloudShadow1{0.0f};   ///< xyz=cloudShadowLight, w=0
+};
+static_assert(sizeof(SurfaceLightingUbo) == 8 * 16, "SurfaceLightingUbo: layout std140");
+
+/// Construit l'UBO d'éclairage de surface pour la frame courante.
+inline SurfaceLightingUbo BuildSurfaceLightingUbo(glm::ivec2 renderOriginChunk) {
+    const LightingShared& s     = SharedLighting();
+    const glm::vec2       shift = glm::vec2(s.cloudShadowOriginChunk - renderOriginChunk) * kChunkSizeMeters;
+    SurfaceLightingUbo    u;
+    u.flags0 = {s.gbufferAvailable ? 1 : 0, s.iblAvailable ? 1 : 0, s.cloudShadowAvailable ? 1 : 0,
+                s.specularOcclusion ? 1 : 0};
+    u.flags1 = {s.voxelAvailable ? 1 : 0, s.voxelShadows ? 1 : 0, s.voxelGI ? 1 : 0, s.terrainShadows ? 1 : 0};
+    u.flags2 = {s.contactShadows ? 1 : 0, s.focusAvailable ? 1 : 0, s.fogShadows ? 1 : 0, s.atmoAvailable ? 1 : 0};
+    u.scales = {s.sunScale, s.moonScale, s.iblScale, s.giIntensity};
+    u.shadowParams = {std::tan(glm::radians(s.voxelShadowSoftnessDeg)), glm::radians(s.shadowPenumbraDeg),
+                      s.fogHeightFalloff, s.godRayDistance};
+    u.focusChunkOrigin = glm::vec4(s.focusChunkOrigin, 0.0f);
+    u.cloudShadow0     = glm::vec4(s.cloudShadowOrigin + shift, s.cloudLayerAltitude, s.cloudShadowExtent);
+    u.cloudShadow1     = glm::vec4(s.cloudShadowLight, 0.0f);
+    return u;
 }
 
-/// Uniforms de cloud_density.glsl et cloud_march.glsl. renderOriginChunk : origine de rendu de la frame qui
-/// dessine ; les positions de `c` (relatives à c.originChunk) y sont recalées exactement (différence entière).
-inline void SetCloudUniforms(const gpu::ShaderProgram& p, const CloudParams& c, glm::ivec2 renderOriginChunk) {
-    // Position relative à l'origine de calcul = position relative à l'origine courante - shift.
+/// Miroir std140 de CloudParamsBlock (shaders/render/cloud_density.glsl), UBO_VolumetricParams.
+struct alignas(16) CloudParamsUbo {
+    glm::vec4 layerAndScales{0.0f};      ///< x=bottom, y=top, z=shapeScale, w=detailScale
+    glm::vec4 detailAndSkew{0.0f};       ///< x=detailStrength, y=curl, z=skew.x, w=skew.y
+    glm::vec4 shapeOffset{0.0f};         ///< xyz=shapeOffset - shift, w=extinction
+    glm::vec4 detailOffset{0.0f};        ///< xyz=detailOffset - shift, w=weatherExtent
+    glm::vec4 weatherAndPhase{0.0f};     ///< xy=weatherOriginRel + shift, z=hgForward, w=hgBackward
+    glm::vec4 lightingAndDist{0.0f};     ///< x=silver, y=powder, z=maxDistance, w=fadeDistance
+    glm::vec4 cirrus0{0.0f};             ///< x=cirrusAltitude, y=cirrusCoverage, z=cirrusType, w=cirrusScale
+    glm::vec4 cirrusAndLightning{0.0f};  ///< xy=cirrusOffset - shift, z=lightningIntensity, w=0
+    glm::vec4 lightningPos{0.0f};        ///< xyz=lightningPosRel + shift, w=0
+};
+static_assert(sizeof(CloudParamsUbo) == 9 * 16, "CloudParamsUbo: layout std140");
+
+/// Construit l'UBO des nuages, recalé sur l'origine de rendu `renderOriginChunk`.
+inline CloudParamsUbo BuildCloudParamsUbo(const CloudParams& c, glm::ivec2 renderOriginChunk) {
     const glm::vec2 shift = glm::vec2(c.originChunk - renderOriginChunk) * kChunkSizeMeters;
-    p.Set("uCloudBottom",      c.bottom);
-    p.Set("uCloudTop",         c.top);
-    p.Set("uShapeScale",       c.shapeScale);
-    p.Set("uDetailScale",      c.detailScale);
-    p.Set("uDetailStrength",   c.detailStrength);
-    p.Set("uShapeOffset",      c.shapeOffset - glm::vec3(shift.x, 0.0f, shift.y));
-    p.Set("uDetailOffset",     c.detailOffset - glm::vec3(shift.x, 0.0f, shift.y));
-    p.Set("uWeatherOriginRel", c.weatherOriginRel + shift);
-    p.Set("uWeatherExtent",    c.weatherExtent);
-    p.Set("uSkew",             c.skew);
-    p.Set("uCurlStrength",     c.curl);
-    p.Set("uExtinction",       c.extinction);
-    p.Set("uHgForward",        c.hgForward);
-    p.Set("uHgBackward",       c.hgBackward);
-    p.Set("uSilver",           c.silver);
-    p.Set("uPowder",           c.powder);
-    p.Set("uMaxDistance",      c.maxDistance);
-    p.Set("uFadeDistance",     c.fadeDistance);
-    p.Set("uCirrusAltitude",   c.cirrusAltitude);
-    p.Set("uCirrusCoverage",   c.cirrusCoverage);
-    p.Set("uCirrusType",       c.cirrusType);
-    p.Set("uCirrusScale",      c.cirrusScale);
-    p.Set("uCirrusOffset",     c.cirrusOffset - shift);
-    p.Set("uLightningPos",       c.lightningPosRel + glm::vec3(shift.x, 0.0f, shift.y));
-    p.Set("uLightningIntensity", c.lightningIntensity);
+    CloudParamsUbo  u;
+    u.layerAndScales     = {c.bottom, c.top, c.shapeScale, c.detailScale};
+    u.detailAndSkew      = {c.detailStrength, c.curl, c.skew.x, c.skew.y};
+    u.shapeOffset        = glm::vec4(c.shapeOffset - glm::vec3(shift.x, 0.0f, shift.y), c.extinction);
+    u.detailOffset       = glm::vec4(c.detailOffset - glm::vec3(shift.x, 0.0f, shift.y), c.weatherExtent);
+    u.weatherAndPhase    = {c.weatherOriginRel.x + shift.x, c.weatherOriginRel.y + shift.y, c.hgForward, c.hgBackward};
+    u.lightingAndDist    = {c.silver, c.powder, c.maxDistance, c.fadeDistance};
+    u.cirrus0            = {c.cirrusAltitude, c.cirrusCoverage, c.cirrusType, c.cirrusScale};
+    u.cirrusAndLightning = {c.cirrusOffset.x - shift.x, c.cirrusOffset.y - shift.y, c.lightningIntensity, 0.0f};
+    u.lightningPos       = glm::vec4(c.lightningPosRel + glm::vec3(shift.x, 0.0f, shift.y), 0.0f);
+    return u;
 }
 
 /// Renseigne les uniforms d'exposure.glsl.

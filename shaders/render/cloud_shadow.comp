@@ -23,7 +23,6 @@ layout(r16f, binding = IMG_VolumetricOut) writeonly uniform image2D uShadowOut;
 uniform vec2  uShadowOrigin;    // m : centre de la carte (xz relatif à l'origine de rendu, calé sur un texel)
 uniform float uShadowExtent;    // m : côté de la carte
 uniform vec3  uLightDir;        // direction VERS l'astre dominant (unitaire)
-uniform float uExtinction;      // 1/m pour une densité de 1 (même valeur que le raymarching)
 uniform float uShadowStrength;  // multiplicateur de l'épaisseur optique
 uniform float uShadowOpacity;   // opacité maximale de l'ombre [0, 1]
 

@@ -18,33 +18,41 @@ layout(binding = TEX_IblBrdfLut)        uniform sampler2D   uIblBrdfLut;      //
 layout(binding = TEX_CloudShadow)       uniform sampler2D   uCloudShadow;     // transmittance des nuages
 layout(binding = TEX_HeightNormal)      uniform sampler2D   uFocusHeight;     // world.focus.heightNormal (R = hauteur)
 
-uniform bool  uGBufferAvailable;
-uniform bool  uIblAvailable;
-uniform bool  uCloudShadowAvailable;
-uniform bool  uSpecularOcclusion;
-uniform float uSunScale;
-uniform float uMoonScale;
-uniform float uIblScale;
-// VXGI (ADR-008)
-uniform bool  uVoxelAvailable;         // voxel.grid publiée (VoxelIlluminationSystem)
-uniform bool  uVoxelShadows;           // ombre lointaine par cône vers le soleil / la lune
-uniform bool  uVoxelGI;                // VXAO + rebond diffus (5 cônes)
-uniform float uGiIntensity;            // multiplicateur de la lumière indirecte des voxels
-uniform float uVoxelShadowSoftness;    // tangente du demi-angle du cône d'ombre (pénombre)
-// Ombres portées
-uniform bool  uTerrainShadows;         // heightfield du chunk focus
-uniform bool  uContactShadows;         // espace écran (gbuffer.depth)
-uniform bool  uFocusAvailable;         // world.focus.heightNormal publié ET chunk retrouvé dans l'ECS
-uniform vec3  uFocusChunkOrigin;       // coin du chunk focus relatif à l'origine de rendu (m)
-uniform float uShadowPenumbra;         // demi-angle (rad) de la pénombre des ombres du relief
-uniform float uFogHeightFalloff;       // 1/m : décroissance verticale du brouillard
-uniform bool  uFogShadows;             // ombre volumétrique du brouillard (grille VXGI)
-uniform float uGodRayDistance;         // m : 0 = pas de god rays ; sinon le soleil (ou la lune) diffusé par le
-                                       // brouillard sur [0, uGodRayDistance] est calculé par volumetric_godrays.comp
-uniform float uCloudLayerAltitude;     // m : plan de projection de l'ombre des nuages (base de la couche)
-uniform float uCloudShadowExtent;      // m : emprise de clouds.shadowMap
-uniform vec2  uCloudShadowOrigin;      // m : centre de la carte, xz relatif à l'origine de rendu courante
-uniform vec3  uCloudShadowLight;       // direction de l'astre pour lequel la carte a été calculée
+layout(std140, binding = UBO_PostParams) uniform SurfaceLightingBlock {
+    ivec4 flags0;
+    ivec4 flags1;
+    ivec4 flags2;
+    vec4  scales;
+    vec4  shadowParams;
+    vec4  focusChunkOrigin;
+    vec4  cloudShadow0;
+    vec4  cloudShadow1;
+} uLight;
+
+#define uGBufferAvailable     (uLight.flags0.x != 0)
+#define uIblAvailable         (uLight.flags0.y != 0)
+#define uCloudShadowAvailable (uLight.flags0.z != 0)
+#define uSpecularOcclusion    (uLight.flags0.w != 0)
+#define uVoxelAvailable       (uLight.flags1.x != 0)
+#define uVoxelShadows         (uLight.flags1.y != 0)
+#define uVoxelGI              (uLight.flags1.z != 0)
+#define uTerrainShadows       (uLight.flags1.w != 0)
+#define uContactShadows       (uLight.flags2.x != 0)
+#define uFocusAvailable       (uLight.flags2.y != 0)
+#define uFogShadows           (uLight.flags2.z != 0)
+#define uSunScale             (uLight.scales.x)
+#define uMoonScale            (uLight.scales.y)
+#define uIblScale             (uLight.scales.z)
+#define uGiIntensity          (uLight.scales.w)
+#define uVoxelShadowSoftness  (uLight.shadowParams.x)
+#define uShadowPenumbra       (uLight.shadowParams.y)
+#define uFogHeightFalloff     (uLight.shadowParams.z)
+#define uGodRayDistance       (uLight.shadowParams.w)
+#define uFocusChunkOrigin     (uLight.focusChunkOrigin.xyz)
+#define uCloudShadowOrigin    (uLight.cloudShadow0.xy)
+#define uCloudLayerAltitude   (uLight.cloudShadow0.z)
+#define uCloudShadowExtent    (uLight.cloudShadow0.w)
+#define uCloudShadowLight     (uLight.cloudShadow1.xyz)
 
 const float kHalfMax = 65000.0;  // borne du RGBA16F de scene.color
 

@@ -10,17 +10,43 @@ layout(binding = TEX_CloudShapeNoise)  uniform sampler3D uShapeNoise;
 layout(binding = TEX_CloudDetailNoise) uniform sampler3D uDetailNoise;
 layout(binding = TEX_CloudWeatherMap)  uniform sampler2D uWeatherMap;
 
-uniform float uCloudBottom;       // m (altitude)
-uniform float uCloudTop;          // m
-uniform float uShapeScale;        // m : côté d'une répétition du bruit de forme
-uniform float uDetailScale;       // m
-uniform float uDetailStrength;    // [0, 1]
-uniform vec3  uShapeOffset;       // m : (origine de rendu absolue - vent) mod uShapeScale (double côté C++)
-uniform vec3  uDetailOffset;      // m : idem mod uDetailScale
-uniform vec2  uWeatherOriginRel;  // m : centre de la fenêtre météo, relatif à l'origine de rendu
-uniform float uWeatherExtent;     // m
-uniform vec2  uSkew;              // m : décalage horizontal au sommet de la couche (vent, Nubis)
-uniform float uCurlStrength;      // torsion du détail (en périodes du bruit de détail)
+layout(std140, binding = UBO_VolumetricParams) uniform CloudParamsBlock {
+    vec4 layerAndScales;
+    vec4 detailAndSkew;
+    vec4 shapeOffset;
+    vec4 detailOffset;
+    vec4 weatherAndPhase;
+    vec4 lightingAndDist;
+    vec4 cirrus0;
+    vec4 cirrusAndLightning;
+    vec4 lightningPos;
+} uCloud;
+
+#define uCloudBottom        (uCloud.layerAndScales.x)
+#define uCloudTop           (uCloud.layerAndScales.y)
+#define uShapeScale         (uCloud.layerAndScales.z)
+#define uDetailScale        (uCloud.layerAndScales.w)
+#define uDetailStrength     (uCloud.detailAndSkew.x)
+#define uCurlStrength       (uCloud.detailAndSkew.y)
+#define uSkew               (uCloud.detailAndSkew.zw)
+#define uShapeOffset        (uCloud.shapeOffset.xyz)
+#define uExtinction         (uCloud.shapeOffset.w)
+#define uDetailOffset       (uCloud.detailOffset.xyz)
+#define uWeatherExtent      (uCloud.detailOffset.w)
+#define uWeatherOriginRel   (uCloud.weatherAndPhase.xy)
+#define uHgForward          (uCloud.weatherAndPhase.z)
+#define uHgBackward         (uCloud.weatherAndPhase.w)
+#define uSilver             (uCloud.lightingAndDist.x)
+#define uPowder             (uCloud.lightingAndDist.y)
+#define uMaxDistance        (uCloud.lightingAndDist.z)
+#define uFadeDistance       (uCloud.lightingAndDist.w)
+#define uCirrusAltitude     (uCloud.cirrus0.x)
+#define uCirrusCoverage     (uCloud.cirrus0.y)
+#define uCirrusType         (uCloud.cirrus0.z)
+#define uCirrusScale        (uCloud.cirrus0.w)
+#define uCirrusOffset       (uCloud.cirrusAndLightning.xy)
+#define uLightningIntensity (uCloud.cirrusAndLightning.z)
+#define uLightningPos       (uCloud.lightningPos.xyz)
 
 float Remap(float v, float a, float b, float c, float d) { return c + (v - a) / max(b - a, 1e-5) * (d - c); }
 

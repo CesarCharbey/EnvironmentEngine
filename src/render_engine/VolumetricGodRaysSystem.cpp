@@ -82,6 +82,9 @@ public:
         shadowProg_  = &ctx.shaders.LoadCompute("render.cloud_shadow", "render/cloud_shadow.comp");
         reprojectProg_ = &ctx.shaders.LoadCompute("render.cloud_reproject", "render/cloud_reproject.comp");
         godRaysProg_   = &ctx.shaders.LoadCompute("render.volumetric_godrays", "render/volumetric_godrays.comp");
+        cloudUbo_.Create(sizeof(CloudParamsUbo), GL_DYNAMIC_STORAGE_BIT, nullptr, "clouds.paramsUbo");
+        surfaceLightingUbo_.Create(sizeof(SurfaceLightingUbo), GL_DYNAMIC_STORAGE_BIT, nullptr,
+                                   "godrays.surfaceLightingUbo");
         // Les textures sont allouées au premier Render() (Init n'émet aucune commande GPU).
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : shaders à créer dans shaders/render/ ; slots du contrat UBO_VolumetricParams,
@@ -348,6 +351,8 @@ public:
         godRays_.Destroy();
         SharedLighting().godRayDistance = 0.0f;
         shadowMap_.Destroy();
+        cloudUbo_.Destroy();
+        surfaceLightingUbo_.Destroy();
         tonemapProg_ = noiseProg_ = weatherProg_ = cloudsProg_ = shadowProg_ = reprojectProg_ = godRaysProg_ = nullptr;
         // [DEV 2 WORKSPACE] — Spécification fonctionnelle
         // Entrées  : ressources créées par Init.
@@ -537,6 +542,8 @@ private:
         // (DynamicIBLSystem, stage AtmosphereIBL : il lit la carte météo et les bruits publiés ici).
         cloudParams_ = MakeCloudParams(ctx.renderOriginChunk);
         SharedLighting().clouds = cloudParams_;
+        cloudUbo_.UploadObject(BuildCloudParamsUbo(cloudParams_, cloudParams_.originChunk));
+        cloudUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::VolumetricParams);
 
         // Ressources du modèle de densité, communes aux passes 2 (ombre) et 3 (raymarching).
         shapeNoise_.BindUnit(env::bind::tex::CloudShapeNoise);
@@ -553,7 +560,6 @@ private:
             bb.BindTexture(env::bb::AtmoTransmittanceLUT, env::bind::tex::AtmoTransmittance);
             bb.BindTexture(env::bb::AtmoSkyViewLUT, env::bind::tex::AtmoSkyView);
             const gpu::ShaderProgram& p = *cloudsProg_;
-            SetDensityUniforms(p);
             p.Set("uAtmoAvailable", sh.atmoAvailable);
             p.Set("uGBufferAvailable", sh.gbufferAvailable);
             p.Set("uPrimarySteps", primarySteps_);
@@ -574,7 +580,6 @@ private:
             // --- Passe 4 : résolution temporelle (pixels non raymarchés) ---
             if (block > 1) {
                 const gpu::ShaderProgram& r = *reprojectProg_;
-                SetDensityUniforms(r);
                 SetTemporalUniforms(r, ctx, block, offset);
                 r.Set("uAtmoAvailable", sh.atmoAvailable);
                 cloudTargets_[current_].BindImage(env::bind::image::VolumetricOut, GL_READ_WRITE);
@@ -596,7 +601,9 @@ private:
         BindSurfaceLightingResources(bb);  // ombre des nuages, grille VXGI, transmittance, ciel
         bb.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
         const gpu::ShaderProgram& p = *godRaysProg_;
-        SetSurfaceLightingUniforms(p, ctx.renderOriginChunk);
+        surfaceLightingUbo_.UploadObject(BuildSurfaceLightingUbo(ctx.renderOriginChunk));
+        surfaceLightingUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::PostParams);
+        p.Set("uAtmoAvailable", SharedLighting().atmoAvailable);
         p.Set("uSteps", godRaySteps_);
         p.Set("uMaxDistance", godRayMaxDistance_);
         p.Set("uIntensity", godRayIntensity_);
@@ -668,9 +675,6 @@ private:
         return c;
     }
 
-    /// Uniforms des nuages (raymarching, ombre, résolution : mêmes nuages que la capture de l'IBL).
-    void SetDensityUniforms(const gpu::ShaderProgram& p) const { SetCloudUniforms(p, cloudParams_, cloudParams_.originChunk); }
-
     /// Carte d'ombre : astre dominant (soleil, sinon lune) ; sans astre levé ou ombres coupées, la carte
     /// est déclarée invalide et l'éclairage n'ombre pas (CloudShadow() renvoie 1).
     void RenderCloudShadow(EngineContext& ctx, bool weatherUpdated) {
@@ -699,7 +703,6 @@ private:
         if (!dirty) return;
 
         const gpu::ShaderProgram& p = *shadowProg_;
-        SetDensityUniforms(p);
         p.Set("uShadowOrigin", shadowOriginRel_);
         p.Set("uShadowExtent", cloudShadowExtent_);
         p.Set("uLightDir", shadowLight_);
@@ -762,6 +765,8 @@ private:
     gpu::ShaderProgram* tonemapProg_  = nullptr;
     gpu::VertexArray    emptyVao_;
     gpu::Framebuffer    display_;
+    gpu::GpuBuffer      cloudUbo_;
+    gpu::GpuBuffer      surfaceLightingUbo_;
     bool                displayDirty_ = true;  ///< scene.display à (re)publier
 
     // Nuages
