@@ -16,10 +16,11 @@ in vec2 vUv;
 flat in float vExposure;  // calculée par tonemap.vert
 layout(location = 0) out vec4 oColor;
 
-layout(binding = TEX_SceneColor) uniform sampler2D uSceneColor;
-layout(binding = TEX_SceneDepth) uniform sampler2D uSceneDepth;  // opaque + eau (WaterOceanRiverSystem)
+layout(binding = TEX_SceneColor)    uniform sampler2D uSceneColor;
+layout(binding = TEX_SceneDepth)    uniform sampler2D uSceneDepth;  // opaque + eau (WaterOceanRiverSystem)
 // Nuages (volumetric_clouds.comp, résolution réduite) : rgb = luminance, a = transmittance.
-layout(rgba16f, binding = IMG_VolumetricOut) readonly uniform image2D uClouds;
+// Liée sur TEX_CloudWeatherMap (inutilisée par le tonemap) pour bénéficier du filtrage bilinéaire matériel.
+layout(binding = TEX_CloudWeatherMap) uniform sampler2D uCloudsTex;
 
 uniform bool  uCloudsAvailable;
 uniform bool  uGodRaysAvailable;
@@ -69,21 +70,8 @@ vec3 PbrNeutral(vec3 c) {
     return mix(c, vec3(newPeak), g);
 }
 
-// Suréchantillonnage bilinéaire de la cible des nuages (imageLoad : pas de filtrage matériel).
-vec4 CloudsAt(vec2 uv) {
-    ivec2 size = imageSize(uClouds);
-    vec2  st   = uv * vec2(size) - 0.5;
-    ivec2 i0   = ivec2(floor(st));
-    vec2  f    = st - vec2(i0);
-    ivec2 hi   = size - 1;
-    vec4 a = imageLoad(uClouds, clamp(i0, ivec2(0), hi)), b = imageLoad(uClouds, clamp(i0 + ivec2(1, 0), ivec2(0), hi));
-    vec4 c = imageLoad(uClouds, clamp(i0 + ivec2(0, 1), ivec2(0), hi)), d = imageLoad(uClouds, clamp(i0 + 1, ivec2(0), hi));
-    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
-}
-
 // Le relief (ou l'eau) situé devant la base des nuages les cache, au pixel près.
-bool GeometryInFrontOfClouds(vec2 uv) {
-    float d = texture(uSceneDepth, uv).r;
+bool GeometryInFrontOfClouds(vec2 uv, float d) {
     if (envIsSky(d)) return false;
     vec3  cam  = envCameraPosition();
     if (cam.y >= uCloudBottom) return false;  // caméra dans / au-dessus de la couche : la marche a borné
@@ -101,24 +89,25 @@ float LinearSceneDepth(vec2 uv) {
     return envIsSky(d) ? 1.0e7 : envLinearDepth(d);
 }
 
-// Suréchantillonnage bilatéral 3 × 3 des god rays : poids spatial × ressemblance de profondeur (pas de
-// halo autour des montagnes), et lissage du jitter IGN de la marche.
-vec4 GodRaysAt(vec2 uv) {
+// Suréchantillonnage bilatéral en croix (5 taps) des god rays : poids spatial × ressemblance de profondeur
+// (pas de halo autour des montagnes), et lissage du jitter IGN de la marche.
+vec4 GodRaysAt(vec2 uv, float centerDepth) {
     ivec2 size = textureSize(uGodRays, 0);
     vec2  st   = uv * vec2(size) - 0.5;
     ivec2 c    = ivec2(floor(st + 0.5));
-    float z0   = LinearSceneDepth(uv);
+    float z0   = envIsSky(centerDepth) ? 1.0e7 : envLinearDepth(centerDepth);
     vec4  acc  = vec4(0.0);
     float wsum = 0.0;
-    for (int y = -1; y <= 1; ++y)
-        for (int x = -1; x <= 1; ++x) {
-            ivec2 q  = clamp(c + ivec2(x, y), ivec2(0), size - 1);
-            vec2  dq = vec2(q) - st;
-            float zq = LinearSceneDepth((vec2(q) + 0.5) / vec2(size));
-            float w  = exp(-dot(dq, dq) * 0.9) * exp(-abs(log(zq / z0)) * 12.0) + 1e-5;
-            acc  += texelFetch(uGodRays, q, 0) * w;
-            wsum += w;
-        }
+    const ivec2 kOffsets[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    for (int i = 0; i < 5; ++i) {
+        ivec2 q  = clamp(c + kOffsets[i], ivec2(0), size - 1);
+        vec2  dq = vec2(q) - st;
+        float zq = LinearSceneDepth((vec2(q) + 0.5) / vec2(size));
+        float dz = abs(zq - z0) / max(min(z0, zq), 1e-3);
+        float w  = exp(-dot(dq, dq) * 0.9 - min(dz, 4.0) * 6.0) + 1e-5;
+        acc  += texelFetch(uGodRays, q, 0) * w;
+        wsum += w;
+    }
     return acc / wsum;
 }
 
@@ -128,11 +117,12 @@ void main() {
         oColor = vec4(LinearToSrgb(hdr), 1.0);
         return;
     }
-    bool skyPixel = envIsSky(texture(uSceneDepth, vUv).r);
-    vec4 gr = uGodRaysAvailable ? GodRaysAt(vUv) : vec4(0.0, 0.0, 0.0, 1.0);
+    float sceneDepth = textureLod(uSceneDepth, vUv, 0.0).r;
+    bool  skyPixel   = envIsSky(sceneDepth);
+    vec4  gr         = uGodRaysAvailable ? GodRaysAt(vUv, sceneDepth) : vec4(0.0, 0.0, 0.0, 1.0);
     if (skyPixel) hdr *= gr.a;  // rayons crépusculaires dans la brume (sky-view seule, avant les nuages)
-    if (uCloudsAvailable && !GeometryInFrontOfClouds(vUv)) {
-        vec4 cl = CloudsAt(vUv);
+    if (uCloudsAvailable && !GeometryInFrontOfClouds(vUv, sceneDepth)) {
+        vec4 cl = textureLod(uCloudsTex, vUv, 0.0);
         hdr = hdr * cl.a + cl.rgb;
     }
     hdr += gr.rgb;  // soleil diffusé par le brouillard, ombré par les nuages et le relief (géométrie)

@@ -80,26 +80,33 @@ bool CloudSegment(vec3 cam, vec3 dir, float geomDist, out float tA, out float tB
 float SampleCirrusDensity(vec2 xz) {
     vec2 uv = (xz + uCirrusOffset) / max(uCirrusScale, 1.0);
 
-    // 1. Streaky : stries étirées dans le sens du vent (ou axe X par défaut).
-    vec2 windDir = length(uSkew) > 1e-3 ? normalize(uSkew) : vec2(1.0, 0.0);
-    vec2 windPerp = vec2(-windDir.y, windDir.x);
-    vec2 uvStretch = vec2(dot(uv, windDir) * 0.35, dot(uv, windPerp) * 2.2);
-    float sShape   = textureLod(uShapeNoise, vec3(uvStretch, 0.25), 0.0).r;
-    float sFine    = textureLod(uDetailNoise, vec3(uvStretch * 3.0, 0.5), 0.0).r;
-    float streaky  = clamp(sShape * 0.75 + sFine * 0.25, 0.0, 1.0);
-
-    // 2. Wispy : filaments fins tordus par le curl de uDetailNoise.
-    vec2 curl   = textureLod(uDetailNoise, vec3(uv * 2.0, 0.35), 0.0).gb * 2.0 - 1.0;
-    float wispy = textureLod(uShapeNoise, vec3(uv * 1.4 + curl * 0.12, 0.65), 0.0).r;
-
-    // 3. Round : cirrocumulus (ciel pommelé) basé sur les cellules Worley.
-    vec4  rTex  = textureLod(uShapeNoise, vec3(uv * 2.2, 0.85), 0.0);
-    float round = clamp(rTex.g * 0.7 + rTex.b * 0.3, 0.0, 1.0);
-
-    // Mélange des 3 motifs selon uCirrusType (0 -> 0.5 -> 1).
-    float pattern = uCirrusType < 0.5
-        ? mix(streaky, wispy, uCirrusType * 2.0)
-        : mix(wispy, round, uCirrusType * 2.0 - 1.0);
+    // Mélange des 3 motifs selon uCirrusType (0 -> 0.5 -> 1), en n'évaluant que ceux utilisés.
+    float pattern;
+    if (uCirrusType < 0.5) {
+        vec2  windDir   = length(uSkew) > 1e-3 ? normalize(uSkew) : vec2(1.0, 0.0);
+        vec2  windPerp  = vec2(-windDir.y, windDir.x);
+        vec2  uvStretch = vec2(dot(uv, windDir) * 0.35, dot(uv, windPerp) * 2.2);
+        float sShape    = textureLod(uShapeNoise, vec3(uvStretch, 0.25), 0.0).r;
+        float sFine     = textureLod(uDetailNoise, vec3(uvStretch * 3.0, 0.5), 0.0).r;
+        float streaky   = clamp(sShape * 0.75 + sFine * 0.25, 0.0, 1.0);
+        if (uCirrusType <= 0.001) {
+            pattern = streaky;
+        } else {
+            vec2  curl  = textureLod(uDetailNoise, vec3(uv * 2.0, 0.35), 0.0).gb * 2.0 - 1.0;
+            float wispy = textureLod(uShapeNoise, vec3(uv * 1.4 + curl * 0.12, 0.65), 0.0).r;
+            pattern = mix(streaky, wispy, uCirrusType * 2.0);
+        }
+    } else {
+        vec4  rTex  = textureLod(uShapeNoise, vec3(uv * 2.2, 0.85), 0.0);
+        float round = clamp(rTex.g * 0.7 + rTex.b * 0.3, 0.0, 1.0);
+        if (uCirrusType >= 0.999) {
+            pattern = round;
+        } else {
+            vec2  curl  = textureLod(uDetailNoise, vec3(uv * 2.0, 0.35), 0.0).gb * 2.0 - 1.0;
+            float wispy = textureLod(uShapeNoise, vec3(uv * 1.4 + curl * 0.12, 0.65), 0.0).r;
+            pattern = mix(wispy, round, uCirrusType * 2.0 - 1.0);
+        }
+    }
 
     // Découpe par la couverture locale (modulation douce par la météo globale).
     float cov = clamp(uCirrusCoverage, 0.0, 1.0);
@@ -153,6 +160,8 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
     float angR    = sunMain ? SunAngularRadius() : MoonAngularRadius();
     float cosT    = dot(dir, L);
     float phase   = mix(HenyeyGreenstein(cosT, uHgForward), HenyeyGreenstein(cosT, uHgBackward), 0.3);
+    float phase1  = mix(HenyeyGreenstein(cosT, uHgForward * 0.5),  HenyeyGreenstein(cosT, uHgBackward * 0.5),  0.3);
+    float phase2  = mix(HenyeyGreenstein(cosT, uHgForward * 0.25), HenyeyGreenstein(cosT, uHgBackward * 0.25), 0.3);
     float silver  = uSilver * 0.1 * HenyeyGreenstein(cosT, 0.95);
 
     steps        = max(steps, 4);
@@ -171,6 +180,7 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
     vec3  Lsum = vec3(0.0);
     float T    = 1.0;
     float tWeighted = 0.0, wSum = 0.0;
+    int   zeroCount = 0;
 
     for (int i = 0; i < steps; ++i) {
         if (t >= tB || T < 0.01) break;  // opaque ou fin de segment : arrêt anticipé
@@ -183,6 +193,12 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
         float dimProfile = 0.0;
         float den = CloudDensity(p, alt, detail, dimProfile);
         if (den > 0.0) {
+            if (zeroCount >= 2) {
+                t = max(tA, t - dt);
+                zeroCount = 0;
+                continue;
+            }
+            zeroCount = 0;
             float sigma = den * uExtinction;
             vec3  up    = pp / max(length(pp), 1.0);
 
@@ -214,15 +230,10 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
             float vertP    = pow(clamp(Remap(hFrac, 0.07, 0.14, 0.1, 1.0), 0.1, 1.0), 0.8);
             float inscatter = mix(1.0, depthP * vertP, clamp(uPowder * 0.5, 0.0, 1.0));
 
-            // Diffusion simple + diffusion multiple approchée (octaves de Wrenninge : extinction,
-            // contribution et anisotropie réduites) ; les octaves multiples subissent l'in-scattering.
+            // Diffusion simple + diffusion multiple approchée (octaves de Wrenninge : fonctions de phase
+            // précalculées hors boucle) ; les octaves multiples subissent l'in-scattering.
             float ms = phase * exp(-od) + silver * exp(-od) * (1.0 - clamp(den, 0.0, 1.0));
-            float a = 0.25, b = 0.5, c = 0.5;
-            for (int o = 1; o < 3; ++o) {
-                float ph = mix(HenyeyGreenstein(cosT, uHgForward * c), HenyeyGreenstein(cosT, uHgBackward * c), 0.3);
-                ms += b * exp(-od * a) * ph * inscatter;
-                a *= 0.25; b *= 0.5; c *= 0.5;
-            }
+            ms += (0.5 * exp(-od * 0.25) * phase1 + 0.25 * exp(-od * 0.0625) * phase2) * inscatter;
             // Transmission diffuse des nuages épais (approximation de diffusion, 1 / (1 + 0,75 τ (1 - g))).
             ms += (1.0 - exp(-0.5 * od)) / (1.0 + 0.75 * (1.0 - 0.85) * od) * (1.0 / PI) * inscatter;
 
@@ -256,8 +267,11 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
             tWeighted += T * (1.0 - Tstep) * t;
             wSum      += T * (1.0 - Tstep);
             T *= Tstep;
+            t += dt;
+        } else {
+            ++zeroCount;
+            t += (zeroCount >= 2) ? (2.0 * dt) : dt;
         }
-        t += dt;
     }
 
     // Marche arrêtée sous 1 % de transmittance : le nuage est opaque.

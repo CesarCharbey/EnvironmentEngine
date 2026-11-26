@@ -65,10 +65,10 @@ constexpr int              kFrontPeriodCells = 128;  ///< période des fronts = 
 /// x mod period dans [0, period), en double (positions absolues d'un monde infini).
 double WrapPositive(double x, double period) { return x - std::floor(x / period) * period; }
 
-void TodoBanner(const char* scope) {
-    ImGui::TextColored(ImVec4(0.35f, 0.80f, 1.0f, 1.0f), "TODO Dev 2");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", scope);
+float WrappedDelta2D(glm::vec2 a, glm::vec2 b, float period) {
+    glm::vec2 d = glm::abs(a - b);
+    if (period > 0.0f) d = glm::min(d, glm::vec2(period) - d);
+    return glm::length(d);
 }
 
 class VolumetricGodRaysSystem final : public ISystemModule {
@@ -149,6 +149,11 @@ public:
                                   static_cast<float>(WrapPositive(originZ - 1.6 * windOffset_[1], dc)));
 
         // --- Éclairs internes (orage : forte pluie + couverture, ou bouton manuel) ---
+        if (hasPrevFrame_ && ctx.renderOriginShifted && lightningTimer_ > 0.0f) {
+            const glm::vec2 shift = glm::vec2(lastOriginChunk_ - ctx.renderOriginChunk) * kChunkSizeMeters;
+            lightningPosRel_.x += shift.x;
+            lightningPosRel_.z += shift.y;
+        }
         lightningIntensity_ = 0.0f;
         if (lightningEnabled_) {
             const float dt    = static_cast<float>(ctx.time.dt);
@@ -300,10 +305,7 @@ public:
         ctx.blackboard.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
         // Le slot TEX_GodRays porte l'historique des nuages pendant leurs passes ; ici, les god rays.
         if (godRays) godRays_.BindUnit(env::bind::tex::GodRays);
-        if (clouds) {
-            glBindImageTexture(env::bind::image::VolumetricOut, cloudTargets_[current_].Id(), 0, GL_FALSE, 0, GL_READ_ONLY,
-                               GL_RGBA16F);
-        }
+        if (clouds)  cloudTargets_[current_].BindUnit(env::bind::tex::CloudWeatherMap);
         p.Use();
         emptyVao_.Bind();
         glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -355,8 +357,6 @@ public:
     }
 
     void OnGui(EngineContext&) override {
-        TodoBanner("reprojection temporelle, ombre des nuages, god rays");
-
         ImGui::SeparatorText("Nuages volumetriques");
         ImGui::Checkbox("Nuages", &cloudsEnabled_);
         ImGui::TextDisabled("Couverture, densite, pluie : panneau Celestial");
@@ -492,21 +492,46 @@ private:
         }
         if (!cloudTargets_[0].IsValid() || !reprojectProg_->IsValid()) return false;
 
-        // --- Passe 1 : carte météo glissante ---
+        // --- Passe 1 : carte météo glissante (recalculée uniquement si dérive / paramètres / shader changent) ---
+        bool weatherUpdated = false;
         {
-            const gpu::ShaderProgram& p = *weatherProg_;
-            p.Set("uCenterMod", weatherCenterMod_);
-            p.Set("uPeriod", static_cast<float>(frontPeriod_));
-            p.Set("uExtent", weatherMapExtent_);
-            p.Set("uFrontScale", frontScale_);
-            p.Set("uLocalVariation", localVariation_);
-            // Empreintes : nombre entier de cellules sur la période (bruit périodique, sans couture).
-            const int cells = std::max(1, static_cast<int>(std::lround(frontPeriod_ / cloudSize_)));
-            p.Set("uCloudCells", cells);
-            weatherMap_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
-            p.Use();
-            glDispatchCompute(kWeatherSize / 8, kWeatherSize / 8, 1);
-            glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+            const std::uint32_t wGen = weatherProg_->Generation();
+            const glm::vec3 wEnv(ctx.environment.weatherExtra.x, ctx.environment.weatherExtra.y, ctx.environment.weather.x);
+            const float     wTol = 0.125f * (weatherMapExtent_ / static_cast<float>(kWeatherSize));
+            const bool dirty = weatherMapDirty_ || wGen != lastWeatherGen_ ||
+                               std::abs(weatherMapExtent_ - lastWeatherExtent_) > 1e-2f ||
+                               std::abs(frontScale_ - lastFrontScale_) > 1e-2f ||
+                               std::abs(cloudSize_ - lastCloudSize_) > 1e-2f ||
+                               std::abs(static_cast<float>(frontPeriod_) - lastFrontPeriod_) > 1.0f ||
+                               localVariation_ != lastLocalVariation_ ||
+                               glm::any(glm::greaterThan(glm::abs(wEnv - lastWeatherEnv_), glm::vec3(1e-4f))) ||
+                               WrappedDelta2D(weatherCenterMod_, lastWeatherCenterMod_, static_cast<float>(frontPeriod_)) > wTol;
+            if (dirty) {
+                const gpu::ShaderProgram& p = *weatherProg_;
+                p.Set("uCenterMod", weatherCenterMod_);
+                p.Set("uPeriod", static_cast<float>(frontPeriod_));
+                p.Set("uExtent", weatherMapExtent_);
+                p.Set("uFrontScale", frontScale_);
+                p.Set("uLocalVariation", localVariation_);
+                // Empreintes : nombre entier de cellules sur la période (bruit périodique, sans couture).
+                const int cells = std::max(1, static_cast<int>(std::lround(frontPeriod_ / cloudSize_)));
+                p.Set("uCloudCells", cells);
+                weatherMap_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
+                p.Use();
+                glDispatchCompute(kWeatherSize / 8, kWeatherSize / 8, 1);
+                glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
+
+                weatherMapDirty_      = false;
+                lastWeatherGen_       = wGen;
+                lastWeatherCenterMod_ = weatherCenterMod_;
+                lastWeatherExtent_    = weatherMapExtent_;
+                lastFrontScale_       = frontScale_;
+                lastCloudSize_        = cloudSize_;
+                lastFrontPeriod_      = static_cast<float>(frontPeriod_);
+                lastLocalVariation_   = localVariation_;
+                lastWeatherEnv_       = wEnv;
+                weatherUpdated        = true;
+            }
         }
         // Mêmes paramètres pour toutes les passes de cette frame, et pour la capture de l'IBL de la suivante
         // (DynamicIBLSystem, stage AtmosphereIBL : il lit la carte météo et les bruits publiés ici).
@@ -519,7 +544,7 @@ private:
         weatherMap_.BindUnit(env::bind::tex::CloudWeatherMap);
 
         // --- Passe 2 : carte d'ombre des nuages au sol (lue par l'éclairage à la frame suivante) ---
-        RenderCloudShadow(ctx);
+        RenderCloudShadow(ctx, weatherUpdated);
 
         // --- Passe 3 : raymarching en résolution réduite ---
         {
@@ -648,12 +673,31 @@ private:
 
     /// Carte d'ombre : astre dominant (soleil, sinon lune) ; sans astre levé ou ombres coupées, la carte
     /// est déclarée invalide et l'éclairage n'ombre pas (CloudShadow() renvoie 1).
-    void RenderCloudShadow(EngineContext& ctx) {
+    void RenderCloudShadow(EngineContext& ctx, bool weatherUpdated) {
         LightingShared& sh = SharedLighting();
         if (!cloudShadowsEnabled_ || !shadowProg_->IsValid() || !shadowLightUp_) {
             sh.cloudShadowValid = false;
             return;
         }
+        const std::uint32_t sGen = shadowProg_->Generation();
+        const float         sTol = 0.125f * (cloudShadowExtent_ / static_cast<float>(kShadowSize));
+        const glm::vec2     skew = windDirXZ_ * skew_;
+        const bool dirty = shadowMapDirty_ || weatherUpdated || !sh.cloudShadowValid || ctx.renderOriginShifted ||
+                           sGen != lastShadowGen_ ||
+                           glm::length(shadowOriginRel_ - lastShadowOriginRel_) > 1e-2f ||
+                           glm::dot(shadowLight_, lastShadowLight_) < 0.999999f ||
+                           WrappedDelta2D(glm::vec2(shapeOffset_.x, shapeOffset_.z),
+                                          glm::vec2(lastShapeOffset_.x, lastShapeOffset_.z), shapeScale_) > sTol ||
+                           std::abs(cloudBottom_ - lastShadowBottom_) > 1e-2f ||
+                           std::abs(cloudTop_ - lastShadowTop_) > 1e-2f ||
+                           std::abs(shapeScale_ - lastShadowShapeScale_) > 1e-2f ||
+                           glm::length(skew - lastShadowSkew_) > 1e-2f ||
+                           std::abs(extinction_ - lastShadowExtinction_) > 1e-5f ||
+                           std::abs(cloudShadowExtent_ - lastShadowExtent_) > 1e-2f ||
+                           std::abs(cloudShadowStrength_ - lastShadowStrength_) > 1e-4f ||
+                           std::abs(cloudShadowOpacity_ - lastShadowOpacity_) > 1e-4f;
+        if (!dirty) return;
+
         const gpu::ShaderProgram& p = *shadowProg_;
         SetDensityUniforms(p);
         p.Set("uShadowOrigin", shadowOriginRel_);
@@ -674,6 +718,20 @@ private:
         sh.cloudShadowOrigin      = shadowOriginRel_;
         sh.cloudShadowOriginChunk = ctx.renderOriginChunk;
         sh.cloudShadowLight       = shadowLight_;
+
+        shadowMapDirty_       = false;
+        lastShadowGen_        = sGen;
+        lastShadowOriginRel_  = shadowOriginRel_;
+        lastShadowLight_      = shadowLight_;
+        lastShapeOffset_      = shapeOffset_;
+        lastShadowBottom_     = cloudBottom_;
+        lastShadowTop_        = cloudTop_;
+        lastShadowShapeScale_ = shapeScale_;
+        lastShadowSkew_       = skew;
+        lastShadowExtinction_ = extinction_;
+        lastShadowExtent_     = cloudShadowExtent_;
+        lastShadowStrength_   = cloudShadowStrength_;
+        lastShadowOpacity_    = cloudShadowOpacity_;
     }
 
     /// Bruits 3D périodiques, une seule fois (quelques ms). Mips par le pilote : RGBA8 128³ généré une fois.
@@ -719,6 +777,28 @@ private:
     float               cloudShadowExtent_   = 20000.0f;
     float               cloudShadowStrength_ = 1.0f;
     float               cloudShadowOpacity_  = 1.0f;
+    bool                weatherMapDirty_     = true;
+    std::uint32_t       lastWeatherGen_      = 0;
+    glm::vec2           lastWeatherCenterMod_{0.0f};
+    float               lastWeatherExtent_   = -1.0f;
+    float               lastFrontScale_      = -1.0f;
+    float               lastCloudSize_       = -1.0f;
+    float               lastFrontPeriod_     = -1.0f;
+    bool                lastLocalVariation_  = true;
+    glm::vec3           lastWeatherEnv_{-1.0f};
+    bool                shadowMapDirty_      = true;
+    std::uint32_t       lastShadowGen_       = 0;
+    glm::vec2           lastShadowOriginRel_{0.0f};
+    glm::vec3           lastShadowLight_{0.0f, 1.0f, 0.0f};
+    glm::vec3           lastShapeOffset_{0.0f};
+    float               lastShadowBottom_    = -1.0f;
+    float               lastShadowTop_       = -1.0f;
+    float               lastShadowShapeScale_= -1.0f;
+    glm::vec2           lastShadowSkew_{0.0f};
+    float               lastShadowExtinction_= -1.0f;
+    float               lastShadowExtent_    = -1.0f;
+    float               lastShadowStrength_  = -1.0f;
+    float               lastShadowOpacity_   = -1.0f;
     gpu::Texture3D      shapeNoise_;
     gpu::Texture3D      detailNoise_;
     gpu::Texture2D      weatherMap_;

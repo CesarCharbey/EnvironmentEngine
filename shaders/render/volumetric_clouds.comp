@@ -63,11 +63,13 @@ void main() {
     // composition rejette ensuite, par pixel, le relief situé devant la couche).
     float geomDist = 1e30;
     if (uGBufferAvailable) {
-        vec2  texel = 0.5 / vec2(size);
-        float dMin  = 1.0;
+        vec2  halfCell = 0.5 / vec2(size);
+        vec2  gTexel   = 1.0 / vec2(textureSize(uGDepth, 0));
+        vec2  stepUv   = max(0.5 * halfCell, 0.5 * gTexel);
+        float dMin     = 1.0;
         for (int i = 0; i < 4; ++i) {
             vec2 o = vec2(i & 1, i >> 1) * 2.0 - 1.0;
-            dMin = min(dMin, textureLod(uGDepth, uv + o * texel * 0.5, 0.0).r);
+            dMin = min(dMin, textureLod(uGDepth, uv + o * stepUv, 0.0).r);
         }
         if (!envIsSky(dMin)) geomDist = length(envWorldPosFromDepth(uv, dMin) - cam);
     }
