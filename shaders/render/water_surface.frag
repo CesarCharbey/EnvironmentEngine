@@ -88,16 +88,16 @@ float OceanFilteredSlopeVariance(float footprint, int c0, int c1) {
 // manquer les détails fins d'un pixel à l'autre (scintillement) ; le raffinement binaire corrige la
 // position des impacts trouvés. Longueur du rayon proportionnelle à la distance de l'eau.
 vec4 TraceScreenReflection(vec3 P, vec3 R, float distToCam) {
-    const int kSteps  = 40;
-    const int kRefine = 6;
+    const int kRefine = 4;
+    int   steps   = int(mix(32.0, 12.0, clamp(distToCam / 400.0, 0.0, 1.0)));
     float maxDist = clamp(2.0 * distToCam + 40.0, 60.0, 600.0);
     vec4  c0 = uEnv.viewProj * vec4(P, 1.0);
     vec4  c1 = uEnv.viewProj * vec4(P + R * maxDist, 1.0);
     if (c1.w < 0.05) c1 = mix(c0, c1, (c0.w - 0.05) / max(c0.w - c1.w, 1e-6));  // ne pas passer derrière l'œil
 
     float fPrev = 0.0;
-    for (int i = 0; i < kSteps; ++i) {
-        float f  = (float(i) + 1.0) / float(kSteps);
+    for (int i = 0; i < steps; ++i) {
+        float f  = (float(i) + 1.0) / float(steps);
         f = pow(f, 1.6);  // pas resserrés près du départ (les reflets proches sont les plus visibles)
         vec4  c  = mix(c0, c1, f);
         vec2  uv = c.xy / c.w * 0.5 + 0.5;
@@ -252,7 +252,7 @@ void main() {
     //    du ciel, ils ne traversent presque que du ciel à l'écran (coût sans gain).
     float ssrConf = 0.0;
     vec3  ssrRgb  = vec3(0.0);
-    if (uWater.riverParams.w > 0.5 && uGBufferAvailable && dist < 400.0) {
+    if (uWater.riverParams.w > 0.5 && uGBufferAvailable && dist < 400.0 && roughness <= 0.35) {
         // Rayon SSR selon une normale adoucie : des rayons cohérents d'un pixel à l'autre donnent un reflet
         // stable (miroir ondulé) au lieu d'impacts épars ; la rugosité fine reste dans le spéculaire.
         vec3 Rs = reflect(rayDir, normalize(mix(N, up, 0.6)));

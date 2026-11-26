@@ -58,6 +58,7 @@ namespace {
 constexpr int           kCascades     = 3;
 constexpr int           kRiverVerts   = 129;  ///< sommets par côté de la grille d'un chunk (2 m)
 constexpr int           kRiverSlots   = 81;   ///< chunks porteurs d'eau simultanés (9 × 9)
+constexpr int           kRiverCmdVec4s = kRiverSlots * 2;  ///< en-tête de commandes indirectes (32 o / slot)
 constexpr GLsizeiptr    kRiverSlotBytes = static_cast<GLsizeiptr>(kRiverVerts) * kRiverVerts * 16;
 constexpr int           kRiverJobsPerFrame = 2;
 constexpr float         kPi = 3.14159265358979f;
@@ -169,17 +170,29 @@ void BuildGrid(Grid& grid, int cx, int cy, glm::vec2 scale, const char* name) {
     grid.indexCount = static_cast<GLsizei>(idx.size());
 }
 
-std::array<glm::vec4, 4> FrustumPlanes(const glm::mat4& m) {
+std::array<glm::vec4, 5> FrustumPlanes(const glm::mat4& m) {
     auto row = [&](int r) { return glm::vec4(m[0][r], m[1][r], m[2][r], m[3][r]); };
-    return {row(3) + row(0), row(3) - row(0), row(3) + row(1), row(3) - row(1)};
+    return {row(3) + row(0), row(3) - row(0), row(3) + row(1), row(3) - row(1), row(3) - row(2)};
 }
 
-bool AabbInFrustum(const std::array<glm::vec4, 4>& planes, const glm::vec3& mn, const glm::vec3& mx) {
+bool AabbInFrustum(const std::array<glm::vec4, 5>& planes, const glm::vec3& mn, const glm::vec3& mx) {
     for (const glm::vec4& p : planes) {
         const glm::vec3 positive(p.x >= 0.0f ? mx.x : mn.x, p.y >= 0.0f ? mx.y : mn.y, p.z >= 0.0f ? mx.z : mn.z);
         if (glm::dot(glm::vec3(p), positive) + p.w < 0.0f) return false;
     }
     return true;
+}
+
+bool OceanPotentiallyVisible(const GlobalEnvironmentUBO& env) {
+    if (env.cameraPosition.y <= env.waterTime.x + 15.0f) return true;
+    const glm::mat3 invRot(env.invView);
+    static constexpr glm::vec2 kCorners[4] = {{-1.15f, -1.15f}, {1.15f, -1.15f}, {-1.15f, 1.15f}, {1.15f, 1.15f}};
+    for (const glm::vec2& ndc : kCorners) {
+        const glm::vec4 nearP = env.invProj * glm::vec4(ndc, 1.0f, 1.0f);
+        const glm::vec3 dir   = glm::normalize(invRot * (glm::vec3(nearP) / nearP.w));
+        if (dir.y <= 0.01f) return true;
+    }
+    return false;
 }
 
 class WaterOceanRiverSystem final : public ISystemModule {
@@ -201,7 +214,8 @@ public:
         BuildGrid(oceanGrid_, kOceanGridX, kOceanGridY,
                   glm::vec2(1.0f / kOceanGridX, 1.0f / kOceanGridY), "water.oceanGrid");
         BuildGrid(riverGrid_, kRiverVerts - 1, kRiverVerts - 1, glm::vec2(1.0f), "water.riverGrid");
-        riverPool_.Create(kRiverSlotBytes * (kRiverSlots + 1), GL_DYNAMIC_STORAGE_BIT, nullptr, "water.riverPool");
+        riverPool_.Create(static_cast<GLsizeiptr>(kRiverCmdVec4s) * 16 + kRiverSlotBytes * (kRiverSlots + 1),
+                          GL_DYNAMIC_STORAGE_BIT, nullptr, "water.riverPool");
         freeSlots_.clear();
         for (int i = kRiverSlots - 1; i >= 0; --i) freeSlots_.push_back(i);
     }
@@ -210,15 +224,18 @@ public:
         // --- Océan : (ré)allocation selon la résolution FFT, spectre à refaire si le vent change ---
         const int n = kFftSizes[std::clamp(fftSizeIndex_, 0, 2)];
         if (n != allocatedN_) {
-            allocatedN_ = n;
-            needsAlloc_ = true;
+            allocatedN_    = n;
+            needsAlloc_    = true;
             spectrumDirty_ = true;
         }
         const glm::vec2 wind  = glm::vec2(ctx.environment.windDirSpeed);
         const float     speed = ctx.environment.windDirSpeed.z;
         if (std::abs(speed - spectrumWindSpeed_) > 0.05f * std::max(1.0f, spectrumWindSpeed_) ||
-            glm::dot(wind, spectrumWindDir_) < 0.995f)
-            spectrumDirty_ = true;
+            glm::dot(wind, spectrumWindDir_) < 0.995f) {
+            spectrumDirty_      = true;
+            slopeVarianceDirty_ = true;
+        }
+        if (spectrumDirty_) slopeVarianceDirty_ = true;
 
         // --- Copie de scene.color pour la réfraction (taille du viewport) ---
         const glm::ivec2 vp = glm::max(ctx.viewportSize, glm::ivec2(1));
@@ -248,11 +265,22 @@ public:
     void Render(EngineContext& ctx) override {
         const std::uint64_t frame = ctx.time.frameIndex;
         if (!SceneColorIsHdr(frame)) return;  // repli LDR : pas d'eau sur une image déjà exposée
-        const bool wantOcean  = oceanEnabled_;
+        const bool wantOcean  = oceanEnabled_ && OceanPotentiallyVisible(ctx.environment);
         const bool wantRivers = (riversEnabled_ || swampsEnabled_) && !riverDraws_.empty();
         if (!wantOcean && !wantRivers && riverJobs_.empty()) return;
 
         const core::RenderBlackboard& bb = ctx.blackboard;
+        if (spectrumDirty_ || slopeVarianceDirty_) {
+            const glm::vec2 wind = glm::vec2(ctx.environment.windDirSpeed);
+            spectrumWindDir_     = glm::length(wind) > 1e-4f ? glm::normalize(wind) : glm::vec2(1.0f, 0.0f);
+            spectrumWindSpeed_   = ctx.environment.windDirSpeed.z;
+            for (int c = 0; c < kCascades; ++c) {
+                const float lo = c == 0 ? 0.0f : 2.0f * kPi / cascadeSizes_[c] * 6.0f;
+                const float hi = c == kCascades - 1 ? 1.0e9f : 2.0f * kPi / cascadeSizes_[c + 1] * 6.0f;
+                cachedSlopeVariance_[c] = SlopeVariance(spectrumWindSpeed_, fetchKm_ * 1000.0f, amplitude_, lo, hi);
+            }
+            slopeVarianceDirty_ = false;
+        }
         UploadParams();
         ubo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::WaterParams);
 
@@ -262,7 +290,7 @@ public:
 
         // --- 2. Surfaces de rivière des chunks nouveaux / régénérés ---
         BakeRiverChunks(ctx);
-        if (!mapsReady) return;
+        if (!mapsReady || (!wantOcean && !wantRivers)) return;
 
         // --- 3. Copie de scene.color (réfraction, SSR) et profondeur opaque dans scene.depth ---
         const core::TextureRef color = bb.GetTexture(env::bb::SceneColor);
@@ -272,17 +300,25 @@ public:
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
 
         BindSurfaceLightingResources(bb);
-        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_ALWAYS);
-        glDepthMask(GL_TRUE);
-        if (depthProg_->IsValid() && SharedLighting().gbufferAvailable) {
-            depthProg_->Use();
-            emptyVao_.Bind();
-            glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (SharedLighting().gbufferAvailable) {
+            const core::TextureRef gDepth = bb.GetTexture(env::bb::GBufferDepth);
+            const core::TextureRef sDepth = bb.GetTexture(env::bb::SceneDepth);
+            if (gDepth.size.x == sDepth.size.x && gDepth.size.y == sDepth.size.y) {
+                glCopyImageSubData(gDepth.id, GL_TEXTURE_2D, 0, 0, 0, 0, sDepth.id, GL_TEXTURE_2D, 0, 0, 0, 0,
+                                   sDepth.size.x, sDepth.size.y, 1);
+                glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+            } else if (depthProg_->IsValid()) {
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                glEnable(GL_DEPTH_TEST);
+                glDepthFunc(GL_ALWAYS);
+                glDepthMask(GL_TRUE);
+                depthProg_->Use();
+                emptyVao_.Bind();
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glDepthFunc(GL_GREATER);  // Reverse-Z
+            }
         }
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glDepthFunc(GL_GREATER);  // Reverse-Z
 
         // --- 4. Surfaces : ressources communes ---
         glBindTextureUnit(env::bind::tex::OceanDisplacement, oceanMaps_.Id());
@@ -308,6 +344,7 @@ public:
             p.Set("uRivers", riversEnabled_);
             p.Set("uSwamps", swampsEnabled_);
             riverPool_.BindBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::Dev2Scratch);
+            glBindBuffer(GL_DRAW_INDIRECT_BUFFER, riverPool_.Id());
             // Pas d'écriture de profondeur : early_fragment_tests l'écrirait aussi pour les fragments rejetés
             // (hors de l'eau). Rivières et marais sont peu profonds : scene.depth garde leur fond.
             glDepthMask(GL_FALSE);
@@ -316,10 +353,12 @@ public:
             for (const RiverDraw& d : riverDraws_) {
                 const auto it = riverChunks_.find(d.entity);
                 if (it == riverChunks_.end() || !it->second.baked) continue;
-                p.Set("uSlotBase", static_cast<std::uint32_t>(it->second.slot * kRiverVerts * kRiverVerts));
+                p.Set("uSlotBase", static_cast<std::uint32_t>(kRiverCmdVec4s + it->second.slot * kRiverVerts * kRiverVerts));
                 p.Set("uChunkOffset", d.offset);
-                glDrawElements(GL_TRIANGLES, riverGrid_.indexCount, GL_UNSIGNED_INT, nullptr);
+                glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
+                                       reinterpret_cast<const void*>(static_cast<std::uintptr_t>(it->second.slot * 32)));
             }
+            glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
             glDepthMask(GL_TRUE);
         }
 
@@ -424,7 +463,7 @@ private:
         u.originModX  = glm::vec4(originMod_[0][0], originMod_[0][1], originMod_[0][2], 0.0f);
         u.originModZ  = glm::vec4(originMod_[1][0], originMod_[1][1], originMod_[1][2], 0.0f);
         for (int c = 0; c < kCascades; ++c)
-            u.slopeVariance[c] = SlopeVariance(spectrumWindSpeed_, fetchKm_ * 1000.0f, amplitude_, u.cutLow[c], u.cutHigh[c]);
+            u.slopeVariance[c] = cachedSlopeVariance_[c];
         ubo_.UploadObject(u);
     }
 
@@ -443,9 +482,6 @@ private:
         spectrum_.BindBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::OceanSpectrum);
 
         if (spectrumDirty_) {
-            const glm::vec2 wind = glm::vec2(ctx.environment.windDirSpeed);
-            spectrumWindDir_     = glm::length(wind) > 1e-4f ? glm::normalize(wind) : glm::vec2(1.0f, 0.0f);
-            spectrumWindSpeed_   = ctx.environment.windDirSpeed.z;
             const gpu::ShaderProgram& p = *spectrumProg_;
             p.Set("uWindDir", spectrumWindDir_);
             p.Set("uWindSpeed", spectrumWindSpeed_);
@@ -462,11 +498,13 @@ private:
         f.Set("uDt", ctx.time.dt);
         glBindImageTexture(env::bind::image::WaterOut, oceanMaps_.Id(), 0, GL_TRUE, 0, GL_READ_WRITE, GL_RGBA16F);
         f.Use();
+        const int linesPerGroup = 256 / (n / 2);
+        const GLuint groupsX = static_cast<GLuint>(n / linesPerGroup);
         f.Set("uPass", 0);
-        glDispatchCompute(static_cast<GLuint>(n), kCascades, 1);
+        glDispatchCompute(groupsX, kCascades, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         f.Set("uPass", 1);
-        glDispatchCompute(static_cast<GLuint>(n), kCascades, 1);
+        glDispatchCompute(groupsX, kCascades, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
         GenerateOceanMips();
         glBindImageTexture(env::bind::image::WaterOut, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16F);
@@ -569,11 +607,15 @@ private:
         riverPool_.BindBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::Dev2Scratch);
         p.Use();
         const GLuint groups  = static_cast<GLuint>((kRiverVerts + 7) / 8);
-        const auto   tmpBase = static_cast<std::uint32_t>(kRiverSlots * kRiverVerts * kRiverVerts);
+        const auto   tmpBase = static_cast<std::uint32_t>(kRiverCmdVec4s + kRiverSlots * kRiverVerts * kRiverVerts);
         for (const entt::entity e : riverJobs_) {
             auto it = riverChunks_.find(e);
             if (it == riverChunks_.end() || !ctx.registry.valid(e)) continue;
             RiverChunk& rc = it->second;
+            // Commande indirecte : instanceCount = 0 tant que le compute shader n'a pas détecté d'eau.
+            const DrawElementsIndirectCommand cmd{
+                static_cast<std::uint32_t>(riverGrid_.indexCount), 0u, 0u, 0u, 0u};
+            riverPool_.Upload(&cmd, sizeof(cmd), static_cast<GLintptr>(rc.slot) * 32);
             // Lecture seule des textures du chunk (slots Dev 1 existants).
             glBindTextureUnit(env::bind::tex::HeightNormal, rc.heightTex);
             glBindTextureUnit(env::bind::tex::BiomeHydro, rc.biomeTex);
@@ -583,9 +625,10 @@ private:
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             p.Set("uPass", 1);
             p.Set("uSrcBase", tmpBase);
-            p.Set("uDstBase", static_cast<std::uint32_t>(rc.slot * kRiverVerts * kRiverVerts));
+            p.Set("uDstBase", static_cast<std::uint32_t>(kRiverCmdVec4s + rc.slot * kRiverVerts * kRiverVerts));
+            p.Set("uCmdVec4Idx", static_cast<std::uint32_t>(rc.slot * 2));
             glDispatchCompute(groups, groups, 1);
-            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
             rc.baked = true;
         }
         riverJobs_.clear();
@@ -615,6 +658,8 @@ private:
     int       allocatedN_        = 0;
     bool      needsAlloc_        = true;
     bool      spectrumDirty_     = true;
+    bool      slopeVarianceDirty_ = true;
+    float     cachedSlopeVariance_[kCascades] = {};
     glm::vec2 spectrumWindDir_{1.0f, 0.0f};
     float     spectrumWindSpeed_ = -1.0f;
     float     originMod_[2][kCascades] = {};
