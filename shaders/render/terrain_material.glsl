@@ -42,13 +42,13 @@ int BiomeAt(sampler2D biomeHydro, ivec2 texel) {
 
 // Fondu bilinéaire des matériaux des 4 texels voisins (évite les transitions en escalier de 1 m).
 vec4 BlendedGround(sampler2D biomeHydro, vec2 uv) {
-    vec2  st = uv * vec2(textureSize(biomeHydro, 0)) - 0.5;  // centres de texels (contrat)
-    ivec2 i0 = ivec2(floor(st));
-    vec2  f  = fract(st);
-    vec4 a = BiomeGround(BiomeAt(biomeHydro, i0));
-    vec4 b = BiomeGround(BiomeAt(biomeHydro, i0 + ivec2(1, 0)));
-    vec4 c = BiomeGround(BiomeAt(biomeHydro, i0 + ivec2(0, 1)));
-    vec4 d = BiomeGround(BiomeAt(biomeHydro, i0 + ivec2(1, 1)));
+    vec2 st = uv * vec2(textureSize(biomeHydro, 0)) - 0.5;  // centres de texels (contrat)
+    vec2 f  = fract(st);
+    vec4 g  = textureGather(biomeHydro, uv, 0);
+    vec4 a  = BiomeGround(int(g.w + 0.5));
+    vec4 b  = BiomeGround(int(g.z + 0.5));
+    vec4 c  = BiomeGround(int(g.x + 0.5));
+    vec4 d  = BiomeGround(int(g.y + 0.5));
     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
@@ -58,6 +58,7 @@ struct TerrainMaterial {
     float wetness;    // humidité de surface [0, 1] (berges + pluie) ; gbuffer.material.b
     float porosity;   // [0, 1] : 1 = terre, ~0,25 = roche
     float snow;       // couverture neigeuse [0, 1]
+    float waterSdf;   // min(SDF rivière, SDF marais)
     int   biome;      // id BIOME_* du texel
 };
 
@@ -87,6 +88,7 @@ TerrainMaterial EvaluateTerrainMaterial(sampler2D biomeHydro, vec2 uv, vec3 N, f
 
     // --- Hydrologie : lit boueux et berges mouillées ---
     float waterSdf = min(riverSdf, marshSdf);
+    m.waterSdf     = waterSdf;
     float bed      = 1.0 - smoothstep(-0.5, 1.0, waterSdf);
     m.albedo       = mix(m.albedo, vec3(0.10, 0.09, 0.07), bed);
     m.porosity     = mix(mix(BiomePorosity(m.biome), 0.25, rock), 0.6, bed);  // vase : à demi saturée

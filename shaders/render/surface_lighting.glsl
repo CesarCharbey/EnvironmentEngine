@@ -176,11 +176,14 @@ float ContactShadow(vec3 P, vec3 N, vec3 L, float dist, float noise) {
     // Anti-acné : le maillage rendu (grille de 2 m) et la normale lisse de la carte de hauteur divergent
     // de quelques cm, et un pixel couvre plus de terrain avec la distance -> départ décalé le long de la
     // normale et seuil de détection proportionnels à la distance.
-    float bias = 0.05 + 0.004 * dist;
+    float bias  = 0.05 + 0.004 * dist;
     vec3  start = P + N * bias;
+    vec4  c0    = uEnv.viewProj * vec4(start, 1.0);
+    if (c0.w <= 0.0) return 1.0;
+    vec4  c1    = uEnv.viewProj * vec4(start + L * len, 1.0);
     for (int i = 0; i < kSteps; ++i) {
-        float t    = len * (float(i) + 0.5 + 0.5 * noise) / float(kSteps);
-        vec4  clip = uEnv.viewProj * vec4(start + L * t, 1.0);
+        float frac = (float(i) + 0.5 + 0.5 * noise) / float(kSteps);
+        vec4  clip = mix(c0, c1, frac);
         if (clip.w <= 0.0) break;
         vec2 uv = clip.xy / clip.w * 0.5 + 0.5;
         if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) break;
@@ -198,9 +201,12 @@ float ContactShadow(vec3 P, vec3 N, vec3 L, float dist, float noise) {
 // worldPos : position reconstruite du G-Buffer ; normal : normale monde (décalages anti-acné).
 float ComputeTerrainAndContactShadow(vec3 worldPos, vec3 normal, vec3 lightDir, vec2 screenUv) {
     float noise = InterleavedGradientNoise(screenUv * uEnv.viewportSize.xy);
-    float dist  = length(envCameraPosition() - worldPos);
-    return min(HeightfieldShadow(worldPos + normal * 0.15, lightDir, noise),
-               ContactShadow(worldPos, normal, lightDir, dist, noise));
+    float s     = HeightfieldShadow(worldPos + normal * 0.15, lightDir, noise);
+    if (s > 0.001) {
+        float dist = length(envCameraPosition() - worldPos);
+        s = min(s, ContactShadow(worldPos, normal, lightDir, dist, noise));
+    }
+    return s;
 }
 
 // =============================================================================
@@ -353,17 +359,20 @@ float FogOpticalDepth(float t, float dirY) {
 // dans la grille VXGI ; hors grille, l'air est considéré éclairé. 4 points × 20 pas : écart moyen
 // < 0,5/255 contre une référence à 12 points × 48 pas (cône 0,08), pour ~1/10 du coût.
 const int kFogShadowSamples = 4;
-float FogLightVisibility(vec3 rayDir, float dist, vec3 L) {
-    if (!uFogShadows || !uVoxelAvailable || uVoxel.uGridExtent.w < 0.5) return 1.0;
+float FogLightVisibility(vec3 rayDir, float startDist, float dist, vec3 L) {
+    if (!uFogShadows || !uVoxelAvailable || uVoxel.uGridExtent.w < 0.5 || dist <= startDist + 1e-3) return 1.0;
     vec3  cam   = envCameraPosition();
     float voxel = VoxelSize();
-    float Tprev = 1.0, acc = 0.0, wsum = 0.0;
+    float Tprev = startDist > 0.0 ? exp(-max(FogOpticalDepth(startDist, rayDir.y), 0.0)) : 1.0;
+    float acc   = 0.0, wsum = 0.0;
     for (int i = 0; i < kFogShadowSamples; ++i) {
-        float T1 = exp(-FogOpticalDepth(dist * float(i + 1) / float(kFogShadowSamples), rayDir.y));
+        float t1 = mix(startDist, dist, float(i + 1) / float(kFogShadowSamples));
+        float tm = mix(startDist, dist, (float(i) + 0.5) / float(kFogShadowSamples));
+        float T1 = exp(-max(FogOpticalDepth(t1, rayDir.y), 0.0));
         float w  = Tprev - T1;
         Tprev    = T1;
         if (w <= 0.0) continue;
-        vec3 p = cam + rayDir * (dist * (float(i) + 0.5) / float(kFogShadowSamples));
+        vec3 p = cam + rayDir * tm;
         acc  += w * VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.12, 0.5 * voxel, 1500.0, 20);
         wsum += w;
     }
@@ -379,25 +388,26 @@ vec3 ApplyHeightFog(vec3 color, vec3 P, vec3 rayDir, float dist, float sunShadow
 
     vec3 sunTerm, moonTerm;
     vec3 ambient = FogInscatter(P, rayDir, sunTerm, moonTerm);
+    // Part de l'astre dominant : tronçon [0, dist] entier, ou seulement [uGodRayDistance, dist] quand les god
+    // rays (ombres des nuages et du relief) calculent déjà le premier tronçon (pas de double compte).
+    float mainWeight = fog;
+    float fogStart   = 0.0;
+    if (uGodRayDistance > 0.0) {
+        fogStart   = min(uGodRayDistance, dist);
+        float Tm   = exp(-max(FogOpticalDepth(fogStart, rayDir.y), 0.0));
+        mainWeight = max(Tm - (1.0 - fog), 0.0);
+    }
+
     // Ombre volumétrique pour l'astre dominant (le soleil tant qu'il est levé, sinon la lune). Calculée
-    // seulement si le point visé n'est pas en plein soleil (ombré ou face dos à l'astre) : devant une
-    // surface éclairée, l'air l'est aussi en pratique, et c'est devant les reliefs à l'ombre que le voile
-    // fuyait. Ignorée aussi quand elle ne changerait pas le pixel de plus de 3 %.
+    // seulement si le tronçon restant contribue et si le point visé n'est pas en plein soleil.
     bool  sunUp      = envSunDirection().y > -0.02;
     vec3  mainTerm   = sunUp ? sunTerm : moonTerm;
     float surfShadow = sunUp ? sunShadow : moonShadow;
     float vis        = 1.0;
-    if (surfShadow < 0.99 && fog > 0.002 &&
-        fog * Luminance(mainTerm) > 0.03 * Luminance(mix(color, ambient, fog)))
-        vis = FogLightVisibility(rayDir, dist, normalize(sunUp ? envSunDirection() : envMoonDirection()));
+    if (mainWeight > 0.002 && surfShadow < 0.99 &&
+        mainWeight * Luminance(mainTerm) > 0.03 * Luminance(mix(color, ambient, fog)))
+        vis = FogLightVisibility(rayDir, fogStart, dist, normalize(sunUp ? envSunDirection() : envMoonDirection()));
     vec3 otherTerm = sunUp ? moonTerm : sunTerm;
-    // Part de l'astre dominant : tronçon [0, dist] entier, ou seulement [uGodRayDistance, dist] quand les god
-    // rays (ombres des nuages et du relief) calculent déjà le premier tronçon (pas de double compte).
-    float mainWeight = fog;
-    if (uGodRayDistance > 0.0) {
-        float Tm = exp(-max(FogOpticalDepth(min(uGodRayDistance, dist), rayDir.y), 0.0));
-        mainWeight = max(Tm - (1.0 - fog), 0.0);
-    }
 
     // Atténuation macro par la couverture nuageuse sur le brouillard lointain (au-delà des god rays) :
     // sous un plafond couvert, le soleil ne peut plus illuminer le brouillard de hauteur à l'horizon.

@@ -72,7 +72,7 @@ void BuildTerrainGrid(TerrainGrid& grid, int res, const char* debugName) {
     std::vector<glm::vec3>     v;
     std::vector<std::uint32_t> idx;
     v.reserve(static_cast<std::size_t>((res + 1) * (res + 1) + 4 * (res + 1)));
-    idx.reserve(static_cast<std::size_t>(res * res * 6 + 4 * res * 12));
+    idx.reserve(static_cast<std::size_t>(res * res * 6 + 4 * res * 6));
 
     for (int j = 0; j <= res; ++j)
         for (int i = 0; i <= res; ++i)
@@ -85,8 +85,8 @@ void BuildTerrainGrid(TerrainGrid& grid, int res, const char* debugName) {
             idx.insert(idx.end(), {a, c, b, b, c, d});  // CCW vu de +Y
         }
 
-    // Jupes : quads verticaux le long des 4 bords, émis dans les deux sens (pas de souci de culling).
-    auto addSkirt = [&](auto edgeVertex) {
+    // Jupes : quads verticaux orientés vers l'extérieur le long des 4 bords.
+    auto addSkirt = [&](auto edgeVertex, bool flip) {
         const auto base = static_cast<std::uint32_t>(v.size());
         for (int k = 0; k <= res; ++k) {
             glm::vec3 p = v[edgeVertex(k)];
@@ -96,13 +96,16 @@ void BuildTerrainGrid(TerrainGrid& grid, int res, const char* debugName) {
         for (int k = 0; k < res; ++k) {
             const std::uint32_t e0 = edgeVertex(k), e1 = edgeVertex(k + 1);
             const std::uint32_t s0 = base + static_cast<std::uint32_t>(k), s1 = s0 + 1;
-            idx.insert(idx.end(), {e0, s0, e1, e1, s0, s1, e0, e1, s0, e1, s1, s0});
+            if (flip)
+                idx.insert(idx.end(), {e0, e1, s0, e1, s1, s0});
+            else
+                idx.insert(idx.end(), {e0, s0, e1, e1, s0, s1});
         }
     };
-    addSkirt([&](int k) { return at(k, 0); });
-    addSkirt([&](int k) { return at(k, res); });
-    addSkirt([&](int k) { return at(0, k); });
-    addSkirt([&](int k) { return at(res, k); });
+    addSkirt([&](int k) { return at(k, 0); }, true);     // -Z
+    addSkirt([&](int k) { return at(k, res); }, false);  // +Z
+    addSkirt([&](int k) { return at(0, k); }, false);    // -X
+    addSkirt([&](int k) { return at(res, k); }, true);   // +X
 
     grid.vertices.CreateFrom(std::span<const glm::vec3>(v), 0, debugName);
     grid.indices.CreateFrom(std::span<const std::uint32_t>(idx), 0, debugName);
@@ -114,14 +117,13 @@ void BuildTerrainGrid(TerrainGrid& grid, int res, const char* debugName) {
     grid.resolution = res;
 }
 
-/// Plans gauche / droite / bas / haut de viewProj (Gribb-Hartmann). Le plan lointain est infini et
-/// le plan proche négligeable pour des chunks de 256 m : 4 plans suffisent.
-std::array<glm::vec4, 4> FrustumPlanes(const glm::mat4& m) {
+/// Plans gauche / droite / bas / haut / proche de viewProj (Gribb-Hartmann, Reverse-Z infini).
+std::array<glm::vec4, 5> FrustumPlanes(const glm::mat4& m) {
     auto row = [&](int r) { return glm::vec4(m[0][r], m[1][r], m[2][r], m[3][r]); };
-    return {row(3) + row(0), row(3) - row(0), row(3) + row(1), row(3) - row(1)};
+    return {row(3) + row(0), row(3) - row(0), row(3) + row(1), row(3) - row(1), row(3) - row(2)};
 }
 
-bool AabbInFrustum(const std::array<glm::vec4, 4>& planes, const glm::vec3& mn, const glm::vec3& mx) {
+bool AabbInFrustum(const std::array<glm::vec4, 5>& planes, const glm::vec3& mn, const glm::vec3& mx) {
     for (const glm::vec4& p : planes) {
         const glm::vec3 positive(p.x >= 0.0f ? mx.x : mn.x, p.y >= 0.0f ? mx.y : mn.y, p.z >= 0.0f ? mx.z : mn.z);
         if (glm::dot(glm::vec3(p), positive) + p.w < 0.0f) return false;
@@ -199,12 +201,15 @@ public:
             DrawItem item;
             item.entity  = e;
             item.offset  = offset;
+            item.dist    = dist;
             item.lod     = lod;
             item.foliage = (state.readyMask & ChunkReady::Foliage) != 0 && res.foliageInstanceSSBO != 0 &&
                            res.foliageIndirectCmdBuffer != 0 && res.foliageCommandCount > 0 &&
                            dist <= foliageDrawDistance_;
             drawList_.push_back(item);
         }
+        std::sort(drawList_.begin(), drawList_.end(),
+                  [](const DrawItem& a, const DrawItem& b) { return a.dist < b.dist; });
     }
 
     void Render(EngineContext& ctx) override {
@@ -319,6 +324,7 @@ private:
     struct DrawItem {
         entt::entity entity = entt::null;
         glm::vec3    offset{0.0f};
+        float        dist    = 0.0f;
         int          lod     = 0;
         bool         foliage = false;
     };

@@ -40,8 +40,7 @@ void main() {
     WetSurface ws = WetSurface(N, m.roughness, m.wetness, m.albedo);
     if (uEnv.weatherExtra.w > 0.35) {
         ivec2 chunk = ivec2(round(uChunkOffset.xz / CHUNK_SIZE_METERS)) + uEnv.originChunk.xy;
-        vec4 bh = textureLod(uBiomeHydro, fsIn.uv, 0.0);
-        ws = ApplyPuddlesAndRipples(ws, uHeightNormal, chunk, fsIn.uv, hn.r, m.biome, min(bh.g, bh.b), m.snow,
+        ws = ApplyPuddlesAndRipples(ws, uHeightNormal, chunk, fsIn.uv, hn.r, m.biome, m.waterSdf, m.snow,
                                     footprint);
     }
 

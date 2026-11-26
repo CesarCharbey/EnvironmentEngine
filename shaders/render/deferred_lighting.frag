@@ -211,14 +211,23 @@ void main() {
         // est nulle de toute façon. La lune n'a son cône voxel que la nuit (de jour, elle est négligeable).
         bool  sunLit     = sunDir.y  > -0.01 && dot(s.N, sunDir)  > 0.0;
         bool  moonLit    = moonDir.y > -0.01 && dot(s.N, moonDir) > 0.0;
-        float sunShadow  = sunLit  ? min(ComputeTerrainAndContactShadow(P, s.N, sunDir, vUv),
-                                         VoxelShadow(P, s.N, sunDir)) : 0.0;
-        float moonShadow = moonLit ? ComputeTerrainAndContactShadow(P, s.N, moonDir, vUv) : 0.0;
-        if (moonLit && sunDir.y < 0.05) moonShadow = min(moonShadow, VoxelShadow(P, s.N, moonDir));
+        float sunCloud   = sunLit  ? CloudShadow(P, sunDir)  : 0.0;
+        float moonCloud  = moonLit ? CloudShadow(P, moonDir) : 0.0;
+        float sunShadow  = 0.0;
+        if (sunLit && (sunCloud > 0.001 || uDebugView == 9)) {
+            sunShadow = ComputeTerrainAndContactShadow(P, s.N, sunDir, vUv);
+            if (sunShadow > 0.001) sunShadow = min(sunShadow, VoxelShadow(P, s.N, sunDir));
+        }
+        float moonShadow = 0.0;
+        bool  moonRelevant = moonLit && (sunDir.y < 0.05 || uDebugView == 9) && (moonCloud > 0.001 || uDebugView == 9);
+        if (moonRelevant) {
+            moonShadow = ComputeTerrainAndContactShadow(P, s.N, moonDir, vUv);
+            if (moonShadow > 0.001) moonShadow = min(moonShadow, VoxelShadow(P, s.N, moonDir));
+        }
         vec3 sunE  = SunIlluminanceTOA()  * LightTransmittance(P.y, sunDir, SunAngularRadius())
-                   * CloudShadow(P, sunDir) * sunShadow * uSunScale;
+                   * sunCloud * sunShadow * uSunScale;
         vec3 moonE = MoonIlluminanceTOA() * LightTransmittance(P.y, moonDir, MoonAngularRadius())
-                   * CloudShadow(P, moonDir) * moonShadow * uMoonScale;
+                   * moonCloud * moonShadow * uMoonScale;
         vec3 sunL  = DirectLight(s, V, sunDir, sunE);
         vec3 moonL = DirectLight(s, V, moonDir, moonE);
 
