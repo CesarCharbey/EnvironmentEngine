@@ -110,23 +110,26 @@ void main() {
     float rain  = clamp(uEnv.weather.x, 0.0, 1.0);
 
     // Fronts (0,5 = neutre) : régions où l'air permet aux nuages de se former, et type de nuages.
-    float front = uLocalVariation ? FrontsFbm(world, 3u) : 0.5;
-    float conv  = uLocalVariation ? FrontsFbm(world * 2.0, 17u) : 0.5;
-    float fp    = CloudFootprints(world);
+    float front       = uLocalVariation ? FrontsFbm(world, 3u) : 0.5;
+    float conv        = uLocalVariation ? FrontsFbm(world * 2.0, 17u) : 0.5;
+    float frontSpread = clamp((front - 0.28) / 0.44, 0.0, 1.0);
+    float convSpread  = clamp((conv - 0.28) / 0.44, 0.0, 1.0);
+    float fp          = CloudFootprints(world);
 
     // Couverture régionale : la valeur globale, répartie par les fronts (zones dégagées / bouchées).
-    float regional = clamp(cover + (front - 0.5) * (uLocalVariation ? 1.0 : 0.0), 0.0, 1.0);
-    // Couverture locale : les empreintes gonflent avec la couverture régionale ; à 1, ciel bouché.
-    float coverage = clamp((fp - (1.0 - regional)) / 0.35 + regional * regional * 0.5, 0.0, 1.0);
+    float regional = clamp(cover + (frontSpread - 0.5) * (uLocalVariation ? 0.9 : 0.0), 0.0, 1.0);
+    // Couverture locale : évite un plafond plat à 1,0 partout sous forte couverture pour garder du relief.
+    float covBase  = clamp((fp - (1.0 - regional)) / 0.45 + regional * regional * 0.35, 0.0, 1.0);
+    float coverage = mix(covBase, mix(0.55 + 0.45 * fp, 1.0, smoothstep(0.92, 1.0, regional)),
+                         smoothstep(0.72, 0.96, regional));
     coverage *= smoothstep(0.0, 0.08, regional);
     // Pluie concentrée au cœur des fronts (là où la couverture est forte), toujours pilotée par le curseur.
-    float precip = rain * clamp(0.35 + (front - 0.45) * 3.0, 0.0, 1.0) * smoothstep(0.4, 0.8, regional);
-    // Type (Nubis : 0 stratus, 0,5 stratocumulus, 1 cumulus) : bruit basse fréquence, cumulus plus
-    // probables sous les orages ; ciel bouché sans pluie -> stratus.
-    float type = clamp(0.25 + conv * 0.8 + precip * 0.5, 0.0, 1.0);
-    type = mix(type, 0.05, smoothstep(0.85, 1.0, regional) * (1.0 - precip));
-    // Densité / humidité : assombrit les nuages chargés.
-    float density = clamp(dens * 0.7 + precip * 0.6 + (front - 0.5) * 0.3, 0.0, 1.0);
+    float precip = rain * clamp(0.35 + (frontSpread - 0.45) * 3.0, 0.0, 1.0) * smoothstep(0.4, 0.8, regional);
+    // Type (Nubis : 0 stratus, 0,5 stratocumulus, 1 cumulus) : contraste étalé sur [0, 1].
+    float type = clamp(convSpread * 0.85 + (fp - 0.5) * 0.35 + precip * 0.45, 0.0, 1.0);
+    type = mix(type, 0.12 + 0.25 * fp, smoothstep(0.88, 1.0, regional) * (1.0 - precip));
+    // Densité / humidité : variation organique par cellule et front (évite les bases uniformes).
+    float density = clamp(dens * (0.55 + 0.70 * fp) + precip * 0.55 + (frontSpread - 0.5) * 0.4, 0.05, 1.0);
 
     vec4 macro = SampleMacroBiome(world);
     coverage = clamp(coverage * macro.x, 0.0, 1.0);

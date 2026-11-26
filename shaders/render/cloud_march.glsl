@@ -155,8 +155,8 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
     // Taille de pas adaptative selon la distance (Nubis Evolved 2022) :
     // pas fin de près (netteté des détails), pas croissant au loin (moins de pas vers l'horizon).
     // stepScale adapte automatiquement les constantes pour behindRelief (32 pas) et l'IBL (20 pas).
-    const float kNearStep   = 35.0;     // m : pas fin près de la caméra (~47 m à 1,5 km)
-    const float kFarOffset  = 250.0;    // m : augmentation de pas à kAdjustDist
+    const float kNearStep   = 28.0;     // m : pas fin près de la caméra
+    const float kFarOffset  = 200.0;    // m : augmentation de pas à kAdjustDist
     const float kAdjustDist = 25000.0;  // m : distance de référence
     float stepScale = 64.0 / float(steps);
 
@@ -176,7 +176,7 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
         vec3  pp  = pc + dir * t;
         float alt = length(pp) - Rm;
         float dimProfile = 0.0;
-        float den = CloudDensity(p, alt, detail, dimProfile);
+        float den = CloudDensity(p, alt, detail, stepDt, dimProfile);
         if (den > 0.0) {
             if (zeroCount >= 2) {
                 t = max(tA, t - dt);
@@ -254,7 +254,9 @@ vec4 MarchClouds(vec3 cam, vec3 dir, float tA, float tB, int steps, int lightSte
             T *= Tstep;
             t += dt;
         } else {
-            ++zeroCount;
+            // Ne saute à 2× que hors de l'enveloppe nuageuse : évite de manquer le détail érodé interne.
+            if (dimProfile <= 0.01) ++zeroCount;
+            else                    zeroCount = 0;
             t += (zeroCount >= 2) ? (2.0 * dt) : dt;
         }
     }

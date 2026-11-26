@@ -833,7 +833,7 @@ private:
     glm::vec2           weatherCenterMod_{0.0f};
     glm::vec3           shapeOffset_{0.0f};
     glm::vec3           detailOffset_{0.0f};
-    float               weatherMapExtent_ = 40000.0f;
+    float               weatherMapExtent_ = 64000.0f;
     float               frontScale_       = 15000.0f;
     bool                localVariation_   = true;
     float               maxDistance_      = 60000.0f;
@@ -852,7 +852,7 @@ private:
     int   primarySteps_     = 64;
     int   lightSteps_       = 6;
     bool  temporal_         = true;
-    float shapeScale_       = 9000.0f;
+    float shapeScale_       = 12000.0f;
     float detailScale_      = 900.0f;
     float detailStrength_   = 0.35f;
     float extinction_       = 0.04f;

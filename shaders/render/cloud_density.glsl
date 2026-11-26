@@ -63,16 +63,17 @@ vec4 SampleWeather(vec2 xz) {
 // points interpolés entre stratus (0), stratocumulus (0,5) et cumulus (1). La décroissance progressive
 // vers le haut, combinée à l'érosion par la couverture, arrondit les sommets (dômes, pas d'enclume).
 float DensityHeightGradient(float h, float type) {
-    const vec4 kStratus       = vec4(0.00, 0.08, 0.15, 0.28);
-    const vec4 kStratocumulus = vec4(0.00, 0.12, 0.30, 0.60);
-    const vec4 kCumulus       = vec4(0.00, 0.08, 0.40, 1.00);
+    const vec4 kStratus       = vec4(0.00, 0.14, 0.24, 0.40);
+    const vec4 kStratocumulus = vec4(0.00, 0.18, 0.38, 0.68);
+    const vec4 kCumulus       = vec4(0.00, 0.16, 0.45, 1.00);
     vec4 g = type < 0.5 ? mix(kStratus, kStratocumulus, type * 2.0) : mix(kStratocumulus, kCumulus, type * 2.0 - 1.0);
     return clamp(Remap(h, g.x, g.y, 0.0, 1.0), 0.0, 1.0) * clamp(Remap(h, g.z, g.w, 1.0, 0.0), 0.0, 1.0);
 }
 
 // Densité [0, 1+] avec sortie du profil dimensionnel (Nubis Evolved 2022) ;
-// `detail` = false pour les marches secondaires (lumière), plus économes.
-float CloudDensity(vec3 pRel, float alt, bool detail, out float dimProfile) {
+// `detail` = false pour les marches secondaires (lumière), plus économes ;
+// `stepDt` > 0 adapte le LOD du détail à la taille du pas (supprime le dithering en fort détail).
+float CloudDensity(vec3 pRel, float alt, bool detail, float stepDt, out float dimProfile) {
     dimProfile = 0.0;
     float h = (alt - uCloudBottom) / (uCloudTop - uCloudBottom);
     if (h <= 0.0 || h >= 1.0) return 0.0;
@@ -86,35 +87,56 @@ float CloudDensity(vec3 pRel, float alt, bool detail, out float dimProfile) {
     float anvil = smoothstep(0.5, 1.0, w.g) * smoothstep(0.7, 1.0, w.b);
     coverage = pow(coverage, clamp(Remap(h, 0.7, 0.8, 1.0, mix(1.0, 0.5, anvil)), mix(1.0, 0.5, anvil), 1.0));
 
+    // Modulation macro incommensurable (rotation 37° + échelle 2,37×) : casse toute répétition 3D sous
+    // forte couverture et fait onduler naturellement la hauteur de base de chaque nuage.
+    const mat2 kMacroRot = mat2(0.7986355, -0.6018150, 0.6018150, 0.7986355);
+    vec3  pShape   = p + uShapeOffset;
+    vec2  macroXZ  = kMacroRot * (pShape.xz / (uShapeScale * 2.37));
+    float macroMod = textureLod(uShapeNoise, vec3(macroXZ.x, h * 0.35, macroXZ.y), 1.0).r;
+
+    float baseLift = clamp(0.18 * (1.0 - coverage) + 0.14 * (macroMod - 0.5) + 0.05 * w.b, 0.0, 0.28);
+    float hLocal   = (h - baseLift) / max(1.0 - baseLift, 0.2);
+    if (hLocal <= 0.0 || hLocal >= 1.0) return 0.0;
+
     // Profil dimensionnel (Nubis Evolved 2022) : early-out avant de lire le bruit 3D 128^3.
-    float heightGrad = DensityHeightGradient(h, w.b);
+    float heightGrad = DensityHeightGradient(hLocal, w.b);
     dimProfile = heightGrad * coverage;
     if (dimProfile <= 0.01) return 0.0;
 
-    vec4  shape = textureLod(uShapeNoise, (p + uShapeOffset) / uShapeScale, 0.0);
-    float fbm   = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
-    float base  = Remap(shape.r, fbm - 1.0, 1.0, 0.0, 1.0);
-    base  = smoothstep(0.30, 0.98, base);  // égalisation (répartition mesurée de la texture)
+    vec2  warpXZ = vec2(macroMod - 0.5, w.b - 0.5) * (0.14 * uShapeScale);
+    vec3  sp     = vec3(pShape.x + warpXZ.x, (alt - uCloudBottom) * 1.65 + uShapeOffset.y, pShape.z + warpXZ.y) / uShapeScale;
+    vec4  shape  = textureLod(uShapeNoise, sp, 0.0);
+    float fbm    = shape.g * 0.625 + shape.b * 0.25 + shape.a * 0.125;
+    float base   = Remap(shape.r, fbm - 1.0, 1.0, 0.0, 1.0);
+    base  = smoothstep(0.28, 0.98, base) * mix(0.80, 1.20, macroMod);
     base *= heightGrad;
     base  = clamp(Remap(base, 1.0 - coverage, 1.0, 0.0, 1.0), 0.0, 1.0) * coverage;
     if (base <= 0.0) return 0.0;
 
     if (detail && uDetailStrength > 0.0) {
-        // Curl : torsion des coordonnées du détail, plus forte à la base (volutes, bords effilochés).
-        vec3 pd   = (p + uDetailOffset) / uDetailScale;
-        vec3 curl = textureLod(uDetailNoise, pd * 0.25, 0.0).gba * 2.0 - 1.0;
-        pd += curl * uCurlStrength * (1.0 - h);
-        float dfb   = textureLod(uDetailNoise, pd, 0.0).r;
-        float erode = mix(dfb, 1.0 - dfb, clamp(h * 10.0, 0.0, 1.0));  // volutes en bas, bourgeons en haut
-        base = clamp(Remap(base, erode * uDetailStrength * 0.4, 1.0, 0.0, 1.0), 0.0, 1.0);
+        // Filtrage Nyquist selon le pas de marche : atténue le détail sous-échantillonné au loin (zéro dithering).
+        float detailFade = stepDt > 0.0 ? (1.0 - smoothstep(0.08 * uDetailScale, 0.28 * uDetailScale, stepDt)) : 1.0;
+        if (detailFade > 0.01) {
+            float detailLod = stepDt > 0.0 ? clamp(log2(max(stepDt / max(uDetailScale * 0.055, 1.0), 1.0)), 0.0, 3.0) : 0.0;
+            vec3 pd   = (p + uDetailOffset) / uDetailScale;
+            vec3 curl = textureLod(uDetailNoise, pd * 0.25, min(detailLod, 2.0)).gba * 2.0 - 1.0;
+            pd += curl * uCurlStrength * (1.0 - hLocal) * detailFade;
+            float dfb   = textureLod(uDetailNoise, pd, detailLod).r;
+            float erode = mix(dfb, 1.0 - dfb, clamp(hLocal * 8.0, 0.0, 1.0));  // volutes en bas, bourgeons en haut
+            base = clamp(Remap(base, erode * uDetailStrength * detailFade * 0.35, 1.0, 0.0, 1.0), 0.0, 1.0);
+        }
     }
     return base * mix(0.6, 1.6, w.a);
 }
 
-// Surcharge sans profil dimensionnel (utilisée par cloud_shadow.comp et la marche de lumière).
+// Surcharges sans stepDt / sans profil dimensionnel (cloud_shadow.comp, marche de lumière, IBL).
+float CloudDensity(vec3 pRel, float alt, bool detail, out float dimProfile) {
+    return CloudDensity(pRel, alt, detail, 0.0, dimProfile);
+}
+
 float CloudDensity(vec3 pRel, float alt, bool detail) {
     float unusedProfile;
-    return CloudDensity(pRel, alt, detail, unusedProfile);
+    return CloudDensity(pRel, alt, detail, 0.0, unusedProfile);
 }
 
 #endif  // ENV_CLOUD_DENSITY_GLSL

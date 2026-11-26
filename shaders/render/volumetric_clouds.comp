@@ -42,7 +42,7 @@ void StoreCloud(ivec2 id, vec3 dir, vec4 res) {
             vec4  hist  = textureLod(uCloudHistory, uvp, 0.0);
             float lr    = dot(res.rgb, vec3(0.2126, 0.7152, 0.0722)), lh = dot(hist.rgb, vec3(0.2126, 0.7152, 0.0722));
             float diff  = max(abs(hist.a - res.a), abs(lh - lr) / max(max(lh, lr), 1e-3));
-            float alpha = mix(0.5, 1.0, smoothstep(0.15, 0.6, diff));
+            float alpha = mix(0.25, 0.90, smoothstep(0.20, 0.75, diff));
             res = mix(hist, res, alpha);
         }
     }
