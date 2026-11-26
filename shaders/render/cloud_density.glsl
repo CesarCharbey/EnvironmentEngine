@@ -77,7 +77,7 @@ float CloudDensity(vec3 pRel, float alt, bool detail, out float dimProfile) {
     float h = (alt - uCloudBottom) / (uCloudTop - uCloudBottom);
     if (h <= 0.0 || h >= 1.0) return 0.0;
     vec3 p = vec3(pRel.x, alt, pRel.z);
-    p.xz += h * uSkew;  // le vent incline les nuages avec l'altitude
+    p.xz -= h * uSkew;  // le vent incline le sommet des nuages vers l'aval
 
     vec4 w = SampleWeather(p.xz);
     float coverage = w.r;

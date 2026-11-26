@@ -66,7 +66,8 @@ void main() {
                 vec2  k  = vec2(n - halfN) * (2.0 * PI_OCEAN / L);
                 float kl = length(k);
                 float w  = sqrt(9.81 * kl);
-                float ph = w * uTime;
+                // Signe négatif : e^{i(k·x - ωt)} propage les vagues dans le sens +uWindDir (avec le vent).
+                float ph = -w * uTime;
                 vec2  ep = vec2(cos(ph), sin(ph));
                 vec2  ht = CMul(h0.xy, ep) + CMul(h0.zw, vec2(ep.x, -ep.y));
                 vec2  kn = kl > 1e-6 ? k / kl : vec2(0.0);
