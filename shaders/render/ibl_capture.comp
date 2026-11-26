@@ -34,28 +34,11 @@ uniform vec2 uCloudShadowCenter; // uv de la caméra dans la carte d'ombre
 
 layout(binding = TEX_CloudShadow) uniform sampler2D uCloudShadow;
 
-// Ombre moyenne des nuages sur le sol autour de la caméra (± 3 km) : 16 lectures de clouds.shadowMap.
-float MeanCloudShadow() {
-    if (!uCloudShadowValid) return 1.0;
-    float s = 0.0;
-    for (int i = 0; i < 16; ++i) {
-        vec2 o = (vec2(i & 3, i >> 2) - 1.5) / 1.5 * 0.15;
-        s += textureLod(uCloudShadow, uCloudShadowCenter + o, 0.0).r;
-    }
-    return s / 16.0;
-}
-
 const float kHalfMax = 60000.0;  // borne du RGBA16F
 
-// Éclairement (lux) d'un sol horizontal : soleil + lune (transmittance au niveau du sol) + ciel.
-vec3 GroundIlluminance() {
-    vec3 sunDir  = normalize(envSunDirection());
-    vec3 moonDir = normalize(envMoonDirection());
-    float shadow = MeanCloudShadow();
-    return (SunIlluminanceTOA()  * LightTransmittance(0.0, sunDir,  SunAngularRadius())  * max(sunDir.y, 0.0)
-          + MoonIlluminanceTOA() * LightTransmittance(0.0, moonDir, MoonAngularRadius()) * max(moonDir.y, 0.0)) * shadow
-         + PI * SkyAverage();
-}
+shared float sShadowSamples[16];
+shared vec3  sSkyAvg;
+shared vec3  sGroundE;
 
 // Luminance du sol vu dans la direction dir (dir.y < 0), atténuée par l'air jusqu'au point visé.
 vec3 GroundRadiance(vec3 dir, vec3 groundE) {
@@ -69,24 +52,53 @@ vec3 GroundRadiance(vec3 dir, vec3 groundE) {
 }
 
 void main() {
-    ivec3 id   = ivec3(gl_GlobalInvocationID);
-    int   size = imageSize(uEnvOut).x;
-    if (id.x >= size || id.y >= size) return;
+    ivec3 id     = ivec3(gl_GlobalInvocationID);
+    int   size   = imageSize(uEnvOut).x;
+    bool  inside = id.x < size && id.y < size;
+    uint  lid    = gl_LocalInvocationIndex;
+
+    // Ombre moyenne des nuages, ciel moyen et éclairement du sol : constants sur tout le groupe.
+    if (lid < 16u) {
+        if (uClouds && uCloudShadowValid) {
+            vec2 o = (vec2(lid & 3u, lid >> 2u) - 1.5) / 1.5 * 0.15;
+            sShadowSamples[lid] = textureLod(uCloudShadow, uCloudShadowCenter + o, 0.0).r;
+        } else {
+            sShadowSamples[lid] = 1.0;
+        }
+    }
+    barrier();
+    if (lid == 0u) {
+        sSkyAvg = SkyAverage();
+        float shadow = 0.0;
+        for (int i = 0; i < 16; ++i) shadow += sShadowSamples[i];
+        shadow *= (1.0 / 16.0);
+        if (uIncludeGround && AtmoValid()) {
+            vec3 sunDir  = normalize(envSunDirection());
+            vec3 moonDir = normalize(envMoonDirection());
+            sGroundE = (SunIlluminanceTOA()  * LightTransmittance(0.0, sunDir,  SunAngularRadius())  * max(sunDir.y, 0.0)
+                      + MoonIlluminanceTOA() * LightTransmittance(0.0, moonDir, MoonAngularRadius()) * max(moonDir.y, 0.0)) * shadow
+                     + PI * sSkyAvg;
+        } else {
+            sGroundE = vec3(0.0);
+        }
+    }
+    barrier();
+    if (!inside) return;
 
     vec3 dir = CubeTexelDir(id.z, id.xy, size);
     vec3 L   = SkyLuminance(dir);
     if (uClouds) {
         float overcast = smoothstep(0.4, 0.95, uEnv.weatherExtra.x);
-        L = mix(L, SkyAverage(), overcast);
+        L = mix(L, sSkyAvg, overcast);
     }
-    if (uIncludeGround && dir.y < 0.0 && AtmoValid()) L += GroundRadiance(dir, GroundIlluminance());
+    if (uIncludeGround && dir.y < 0.0 && AtmoValid()) L += GroundRadiance(dir, sGroundE);
     if (uClouds) {
         vec3  cam = envCameraPosition();
         float tA, tB;
         bool  behind;
         if (CloudSegment(cam, dir, 1e30, tA, tB, behind)) {
             float jitter = InterleavedGradientNoise(vec2(id.xy) + 17.0 * float(id.z));
-            vec4  c = MarchClouds(cam, dir, tA, tB, uCloudSteps, uCloudLightSteps, false, jitter, SkyAverage());
+            vec4  c = MarchClouds(cam, dir, tA, tB, uCloudSteps, uCloudLightSteps, false, jitter, sSkyAvg);
             L = L * c.a + c.rgb;
         }
     }

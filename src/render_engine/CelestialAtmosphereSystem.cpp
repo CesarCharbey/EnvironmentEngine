@@ -63,12 +63,6 @@ void DirToAzimuthElevation(const glm::vec3& dir, float& outAzimuthDeg, float& ou
     outAzimuthDeg = az;
 }
 
-void TodoBanner(const char* scope) {
-    ImGui::TextColored(ImVec4(0.35f, 0.80f, 1.0f, 1.0f), "TODO Dev 2");
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", scope);
-}
-
 constexpr std::string_view kProducer = "CelestialAtmosphereSystem";
 
 const char* MoonPhaseName(float phase) {
@@ -211,7 +205,7 @@ public:
         ubo.weatherExtra      = glm::vec4(effectiveCoverage, cloudDensity_, fogDensity_, surfaceWetness_);
     }
 
-    void Render(EngineContext&) override {
+    void Render(EngineContext& ctx) override {
         // Entrées  : paramètres atmosphériques du panneau, directions du soleil et de la lune.
         // Sorties  : LUTs publiées sous atmo.transmittanceLUT, atmo.multiScatteringLUT et atmo.skyViewLUT.
         // Mise à jour de l'UBO atmosphérique (avec turbidité liée à la météo)
@@ -242,14 +236,16 @@ public:
         atmoUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::AtmosphereParams);
 
         // Un rechargement de shader (F5) incrémente Generation() : il faut alors recalculer les LUTs statiques.
-        const std::uint32_t transGen = transmittanceProg_->Generation();
-        const std::uint32_t msGen    = multiScatteringProg_->Generation();
+        const std::uint32_t transGen   = transmittanceProg_->Generation();
+        const std::uint32_t msGen      = multiScatteringProg_->Generation();
+        const std::uint32_t skyViewGen = skyViewProg_->Generation();
         if (transGen != lastTransmittanceGen_ || msGen != lastMultiScatteringGen_) {
             atmoParamsDirty_ = true;
         }
 
         // Passe 1 & 2 : Transmittance (256x64) et Multi-Scattering (32x32)
         // Recalculées si un paramètre d'atmosphère ou la turbidité météo a changé
+        bool skyViewDirty = skyViewDirty_ || skyViewGen != lastSkyViewGen_;
         if (atmoParamsDirty_ || std::abs(weatherTurbidity - lastTurbidity_) > 1e-3f) {
             if (transmittanceProg_->IsValid()) {
                 transmittanceLUT_.BindImage(env::bind::image::AtmoLutOut, GL_WRITE_ONLY);
@@ -268,16 +264,42 @@ public:
             lastTransmittanceGen_   = transGen;
             lastMultiScatteringGen_ = msGen;
             atmoParamsDirty_        = false;
+            skyViewDirty            = true;
         }
 
-        // Passe 3 : Sky-View LUT (192x108), recalculée chaque frame
-        if (skyViewProg_->IsValid()) {
+        // Passe 3 : Sky-View LUT (192x108), recalculée uniquement lorsque le ciel ou l'altitude varie
+        const float     camAlt    = ctx.environment.cameraPosition.y;
+        const glm::vec3 sunDir    = glm::vec3(ctx.environment.sunDirIlluminance);
+        const glm::vec3 sunColLum = glm::vec3(ctx.environment.sunColorAngular) * ctx.environment.sunDirIlluminance.w;
+        const glm::vec3 moonDir   = glm::vec3(ctx.environment.moonDirPhase);
+        const float     moonLux   = ctx.environment.moonParams.x;
+        if (std::abs(camAlt - lastSkyViewCamAlt_) > 0.5f ||
+            glm::dot(sunDir, lastSkyViewSunDir_) < 0.999999f ||
+            glm::length(sunColLum - lastSkyViewSunColLum_) > 1e-3f * std::max(1.0f, glm::length(lastSkyViewSunColLum_)) ||
+            glm::dot(moonDir, lastSkyViewMoonDir_) < 0.999999f ||
+            std::abs(moonLux - lastSkyViewMoonLux_) > 1e-4f ||
+            std::abs(mieAnisotropy_ - lastSkyViewMieG_) > 1e-4f ||
+            std::abs(nightSkyIntensity_ - lastSkyViewNightSky_) > 1e-5f) {
+            skyViewDirty = true;
+        }
+
+        if (skyViewDirty && skyViewProg_->IsValid()) {
             transmittanceLUT_.BindUnit(env::bind::tex::AtmoTransmittance);
             multiScatteringLUT_.BindUnit(env::bind::tex::AtmoMultiScattering);
             skyViewLUT_.BindImage(env::bind::image::AtmoLutOut, GL_WRITE_ONLY);
             // 192 / 8 = 24, 108 / 8 = 13.5 -> 14 groupes en Y
             skyViewProg_->Dispatch(gpu::ShaderProgram::GroupCount(192, 8), gpu::ShaderProgram::GroupCount(108, 8));
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+            skyViewDirty_          = false;
+            lastSkyViewGen_        = skyViewGen;
+            lastSkyViewCamAlt_     = camAlt;
+            lastSkyViewSunDir_     = sunDir;
+            lastSkyViewSunColLum_  = sunColLum;
+            lastSkyViewMoonDir_    = moonDir;
+            lastSkyViewMoonLux_    = moonLux;
+            lastSkyViewMieG_       = mieAnisotropy_;
+            lastSkyViewNightSky_   = nightSkyIntensity_;
         }
     }
 
@@ -294,8 +316,6 @@ public:
     }
 
     void OnGui(EngineContext&) override {
-        TodoBanner("modele astronomique, phases lunaires, meteo, LUTs d'atmosphere");
-
         ImGui::SeparatorText("Temps");
         ImGui::Checkbox("Modele astronomique", &useAstronomicalModel_);
         ImGui::SliderFloat("Heure", &timeOfDayHours_, 0.0f, 24.0f, "%.2f h");
@@ -373,6 +393,15 @@ private:
     float               lastTurbidity_          = -1.0f;
     std::uint32_t       lastTransmittanceGen_   = 0;
     std::uint32_t       lastMultiScatteringGen_ = 0;
+    bool                skyViewDirty_           = true;
+    std::uint32_t       lastSkyViewGen_         = 0;
+    float               lastSkyViewCamAlt_      = -1e9f;
+    glm::vec3           lastSkyViewSunDir_{0.0f};
+    glm::vec3           lastSkyViewSunColLum_{-1.0f};
+    glm::vec3           lastSkyViewMoonDir_{0.0f};
+    float               lastSkyViewMoonLux_     = -1.0f;
+    float               lastSkyViewMieG_        = -1.0f;
+    float               lastSkyViewNightSky_    = -1.0f;
 
     // Variables liées aux sliders d'OnGui (aucune logique branchée).
     bool  useAstronomicalModel_  = false;

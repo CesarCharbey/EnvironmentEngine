@@ -34,12 +34,18 @@ vec3 SkyLuminanceAbove(vec3 dir) {
 
 // Ciel moyen (cd/m²) : zénith + 4 directions à 15° d'élévation (cos 0.966, sin 0.259).
 vec3 SkyAverage() {
-    vec3 ring = vec3(0.0);
-    for (int i = 0; i < 4; ++i) {
-        float az = (float(i) + 0.5) * 0.5 * PI;
-        ring += SkyLuminance(vec3(0.966 * sin(az), 0.259, -0.966 * cos(az)));
-    }
-    return 0.5 * SkyLuminance(vec3(0.0, 1.0, 0.0)) + 0.125 * ring;
+    if (!AtmoValid()) return vec3(0.0);
+    float Rb = uAtmo.uRadiiAndScaleHeights.x;
+    float beta, zenithHorizonAngle;
+    SkyViewHorizon(AtmoViewRadiusKm(), Rb, beta, zenithHorizonAngle);
+    float vZenith = 0.5 / SKYVIEW_LUT_RES.y;
+    float c       = 1.30879504 / zenithHorizonAngle;  // acos(0.259)
+    float vRing   = UnitToSubUV(0.5 * (1.0 - sqrt(max(0.0, 1.0 - c))), SKYVIEW_LUT_RES.y);
+    vec3  ring    = textureLod(uSkyViewLUT, vec2(0.125, vRing), 0.0).rgb
+                  + textureLod(uSkyViewLUT, vec2(0.375, vRing), 0.0).rgb
+                  + textureLod(uSkyViewLUT, vec2(0.625, vRing), 0.0).rgb
+                  + textureLod(uSkyViewLUT, vec2(0.875, vRing), 0.0).rgb;
+    return 0.5 * textureLod(uSkyViewLUT, vec2(0.0, vZenith), 0.0).rgb + 0.125 * ring;
 }
 
 // Transmittance atmosphère × ombre de la planète, d'un point d'altitude altM (m) vers un astre de
