@@ -45,12 +45,13 @@ layout(std430, binding = SSBO_Dev2Scratch) buffer FoliageAccumBuffer {
     uint foliageAccum[];
 };
 
-uniform int   uPass;              // 0 = terrain, 1 = végétation (accumulation), 2 = végétation (résolution)
+uniform int   uPass;              // 0 = terrain, 1 = végétation (accum), 2 = végétation (résol), 3 = dispatch indirect
 uniform vec3  uChunkOffset;       // coin du chunk relatif à l'origine de rendu (m)
 uniform uint  uInstanceCapacity;  // taille du SSBO d'instances du chunk
 uniform uint  uCommandCount;      // nombre de commandes indirectes (archétypes)
 uniform float uFoliageDensity;    // multiplicateur d'opacité de la végétation
 uniform ivec2 uFoliageYRange;     // tranche Y (voxels) traitée par les passes 1 ET 2 pour ce chunk
+uniform uint  uDispatchBase;      // passe 3 : offset uint dans SSBO_Dev2Scratch (stride 4 uints = 16 o)
 
 const float kMaxRadiance = 60000.0;  // borne du RGBA16F
 
@@ -172,14 +173,18 @@ void AccumulateTau(uint index, uint field, float tau) {
     }
 }
 
-void AccumulateFoliageInstance(uint index) {
-    if (index >= uInstanceCapacity) return;
-    bool valid = false;
-    for (uint c = 0u; c < uCommandCount; ++c) {
+void AccumulateFoliageInstance(uint id) {
+    uint rem   = id;
+    uint index = 0xFFFFFFFFu;
+    for (uint c = 1u; c < uCommandCount; ++c) {
         DrawElementsIndirectCommand cmd = commands[c];
-        if (index >= cmd.baseInstance && index < cmd.baseInstance + cmd.instanceCount) { valid = true; break; }
+        if (rem < cmd.instanceCount) {
+            index = cmd.baseInstance + rem;
+            break;
+        }
+        rem -= cmd.instanceCount;
     }
-    if (!valid) return;
+    if (index == 0xFFFFFFFFu || index >= uInstanceCapacity) return;
 
     FoliageInstance inst = instances[index];
     int archetype = int(inst.params.y + 0.5);
@@ -247,9 +252,19 @@ void ResolveFoliageVoxel(uint id) {
     imageStore(uGridOut, v, vec4(cur.rgb + radiance * o * (1.0 - cur.a), cur.a + o * (1.0 - cur.a)));
 }
 
+void BuildFoliageDispatch(uint id) {
+    if (id != 0u) return;
+    uint total = 0u;
+    for (uint c = 1u; c < uCommandCount; ++c) total += commands[c].instanceCount;
+    foliageAccum[uDispatchBase + 0u] = (total + 63u) / 64u;
+    foliageAccum[uDispatchBase + 1u] = 1u;
+    foliageAccum[uDispatchBase + 2u] = 1u;
+}
+
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if      (uPass == 0) InjectTerrainColumn(id);
     else if (uPass == 1) AccumulateFoliageInstance(id);
-    else                 ResolveFoliageVoxel(id);
+    else if (uPass == 2) ResolveFoliageVoxel(id);
+    else                 BuildFoliageDispatch(id);
 }

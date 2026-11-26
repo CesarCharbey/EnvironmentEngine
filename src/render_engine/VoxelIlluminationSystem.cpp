@@ -59,6 +59,8 @@ static_assert(static_cast<float>(kVoxelsPerChunk) * kVoxelSize == kChunkSizeMete
               "La taille de voxel doit diviser exactement la taille d'un chunk");
 /// LOD max exploité par le cone tracing : au LOD 6, l'axe Y (64 voxels) est réduit à 1.
 constexpr float kMaxConeLod = 5.0f;
+/// Capacité maximale de commandes de dispatch indirect pour la végétation par frame.
+constexpr std::size_t kMaxFoliageDispatchCmds = 256;
 /// Marges verticales (m) : sous le point le plus bas, au-dessus du plus haut (arbres).
 constexpr float kMarginBelow = 2.0f * kVoxelSize;
 constexpr float kMarginAbove = 8.0f * kVoxelSize;
@@ -101,6 +103,8 @@ public:
         foliageAccum_.Create(static_cast<GLsizeiptr>(kDimX) * kDimY * kDimZ * sizeof(std::uint32_t),
                              GL_DYNAMIC_STORAGE_BIT, nullptr, "voxel.foliageAccum");
         foliageAccum_.ClearZero();
+        dispatchCmds_.Create(static_cast<GLsizeiptr>(kMaxFoliageDispatchCmds) * 16,
+                             GL_DYNAMIC_STORAGE_BIT, nullptr, "voxel.foliageDispatchCmds");
     }
 
     void Update(EngineContext& ctx) override {
@@ -214,9 +218,26 @@ public:
             }
         }
         if (!foliageItems_.empty()) {
+            const std::size_t dispatchCount = std::min(foliageItems_.size(), kMaxFoliageDispatchCmds);
+
+            // Passe 3 : prépare les commandes de dispatch indirect (hors herbe) pour chaque chunk.
+            dispatchCmds_.BindBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::Dev2Scratch);
+            p.Set("uPass", 3);
+            for (std::size_t i = 0; i < dispatchCount; ++i) {
+                const FoliageItem& f = foliageItems_[i];
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::FoliageIndirectCmds,
+                                 f.res->foliageIndirectCmdBuffer);
+                p.Set("uCommandCount", f.res->foliageCommandCount);
+                p.Set("uDispatchBase", static_cast<std::uint32_t>(i * 4u));
+                p.Dispatch(1, 1, 1);
+            }
+            glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
+
+            // Passe 1 : accumulation atomique des instances non-herbe uniquement.
             foliageAccum_.BindBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::Dev2Scratch);
             p.Set("uPass", 1);
-            for (const FoliageItem& f : foliageItems_) {
+            for (std::size_t i = 0; i < dispatchCount; ++i) {
+                const FoliageItem& f = foliageItems_[i];
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::FoliageInstances, f.res->foliageInstanceSSBO);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::FoliageIndirectCmds,
                                  f.res->foliageIndirectCmdBuffer);
@@ -224,13 +245,15 @@ public:
                 p.Set("uFoliageYRange", f.yRange);
                 p.Set("uInstanceCapacity", f.res->foliageInstanceCapacity);
                 p.Set("uCommandCount", f.res->foliageCommandCount);
-                p.Dispatch(gpu::ShaderProgram::GroupCount(f.res->foliageInstanceCapacity, 64));
+                p.DispatchIndirect(dispatchCmds_.Id(), static_cast<GLintptr>(i) * 16);
                 instancesDispatched_ += f.res->foliageInstanceCapacity;
             }
+            glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);  // sommes atomiques visibles pour la résolution
 
             p.Set("uPass", 2);
-            for (const FoliageItem& f : foliageItems_) {
+            for (std::size_t i = 0; i < dispatchCount; ++i) {
+                const FoliageItem& f = foliageItems_[i];
                 p.Set("uChunkOffset", f.offset);
                 p.Set("uFoliageYRange", f.yRange);
                 const auto layers = static_cast<std::uint32_t>(f.yRange.y - f.yRange.x + 1);
@@ -256,6 +279,7 @@ public:
         grids_[1].Destroy();
         ubo_.Destroy();
         foliageAccum_.Destroy();
+        dispatchCmds_.Destroy();
         program_ = nullptr;
     }
 
@@ -295,13 +319,16 @@ private:
         return {std::clamp(lo, 0, kDimY - 1), std::clamp(hi, 0, kDimY - 1)};
     }
 
-    /// Mips par compute (voxel_mip.comp) : glGenerateTextureMipmap sur une texture 3D RGBA16F coûte
-    /// ~30 ms sur NVIDIA (chemin lent du pilote, mesuré), contre quelques µs ici.
+    /// Mips par compute (voxel_mip.comp, 2 niveaux par dispatch via mémoire partagée).
     void GenerateMips(gpu::Texture3D& grid) {
         grid.BindUnit(env::bind::tex::VoxelGrid);  // lecture du niveau N-1 (texelFetch)
-        for (GLint level = 1; level < grid.Levels(); ++level) {
+        for (GLint level = 1; level < grid.Levels(); level += 2) {
+            const bool writeSecond = (level + 1) < grid.Levels();
             grid.BindImage(env::bind::image::AtmoLutOut, GL_WRITE_ONLY, level, GL_TRUE, 0, GL_RGBA16F);
+            grid.BindImage(env::bind::image::IblOut, GL_WRITE_ONLY, writeSecond ? level + 1 : level, GL_TRUE, 0,
+                           GL_RGBA16F);
             mipProgram_->Set("uSrcLevel", static_cast<int>(level - 1));
+            mipProgram_->Set("uWriteSecond", writeSecond);
             mipProgram_->Dispatch(gpu::ShaderProgram::GroupCount(static_cast<GLuint>(grid.LevelWidth(level)), 4),
                                   gpu::ShaderProgram::GroupCount(static_cast<GLuint>(grid.LevelHeight(level)), 4),
                                   gpu::ShaderProgram::GroupCount(static_cast<GLuint>(grid.LevelDepth(level)), 4));
@@ -320,6 +347,7 @@ private:
     std::array<gpu::Texture3D, 2> grids_;
     gpu::GpuBuffer                ubo_;
     gpu::GpuBuffer                foliageAccum_;  // épaisseur optique de la végétation (SSBO_Dev2Scratch)
+    gpu::GpuBuffer                dispatchCmds_;  // commandes de dispatch indirect (hors herbe)
     int                           current_ = 0;
 
     std::vector<ChunkItem>   chunks_;
