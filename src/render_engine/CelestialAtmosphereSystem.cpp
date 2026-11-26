@@ -274,9 +274,9 @@ public:
         const glm::vec3 moonDir   = glm::vec3(ctx.environment.moonDirPhase);
         const float     moonLux   = ctx.environment.moonParams.x;
         if (std::abs(camAlt - lastSkyViewCamAlt_) > 0.5f ||
-            glm::dot(sunDir, lastSkyViewSunDir_) < 0.999999f ||
+            glm::length(sunDir - lastSkyViewSunDir_) > 1e-5f ||
             glm::length(sunColLum - lastSkyViewSunColLum_) > 1e-3f * std::max(1.0f, glm::length(lastSkyViewSunColLum_)) ||
-            glm::dot(moonDir, lastSkyViewMoonDir_) < 0.999999f ||
+            glm::length(moonDir - lastSkyViewMoonDir_) > 1e-5f ||
             std::abs(moonLux - lastSkyViewMoonLux_) > 1e-4f ||
             std::abs(mieAnisotropy_ - lastSkyViewMieG_) > 1e-4f ||
             std::abs(nightSkyIntensity_ - lastSkyViewNightSky_) > 1e-5f) {

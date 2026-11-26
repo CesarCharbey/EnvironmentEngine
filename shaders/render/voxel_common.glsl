@@ -31,7 +31,7 @@ bool VoxelUvwInside(vec3 uvw) {
 // d'où une pénombre qui s'élargit naturellement avec la distance à l'occultant.
 // La marche s'arrête à la sortie de la grille (au-delà, on ne sait pas : visible).
 float VoxelConeVisibility(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, float startDist, float maxDist,
-                          int maxSteps) {
+                          int maxSteps, float minLod) {
     float voxel  = VoxelSize();
     float maxLod = uVoxel.uGridInvExtent.w;
     float occ    = 0.0;
@@ -41,7 +41,7 @@ float VoxelConeVisibility(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, fl
         float diam = max(voxel, 2.0 * tanHalf * t);
         vec3  uvw  = VoxelUvw(origin + dir * t, gridMin);
         if (!VoxelUvwInside(uvw)) break;
-        float lod     = min(log2(diam / voxel), maxLod);
+        float lod     = clamp(log2(diam / voxel), minLod, maxLod);
         float a       = clamp(textureLod(uVoxelGrid, uvw, lod).a, 0.0, 0.999);
         float stepLen = max(diam * 0.6, voxel * 0.75);
         // Correction d'opacité : a vaut pour une traversée de longueur diam, le pas est plus court.
@@ -50,6 +50,11 @@ float VoxelConeVisibility(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, fl
         t   += stepLen;
     }
     return 1.0 - occ;
+}
+
+float VoxelConeVisibility(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, float startDist, float maxDist,
+                          int maxSteps) {
+    return VoxelConeVisibility(gridMin, origin, dir, tanHalf, startDist, maxDist, maxSteps, 0.0);
 }
 
 // Radiance accumulée le long d'un cône (composition avant -> arrière, radiance pré-multipliée) :

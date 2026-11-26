@@ -59,7 +59,7 @@ constexpr std::string_view kProducer      = "VolumetricGodRaysSystem";
 constexpr GLsizei          kShapeSize      = 128;
 constexpr GLsizei          kDetailSize     = 32;
 constexpr GLsizei          kWeatherSize    = 512;
-constexpr GLsizei          kShadowSize     = 512;
+constexpr GLsizei          kShadowSize     = 1024;
 constexpr int              kFrontPeriodCells = 128;  ///< période des fronts = 128 cellules de base
 
 /// x mod period dans [0, period), en double (positions absolues d'un monde infini).
@@ -217,17 +217,20 @@ public:
             historyValid_    = false;  // redimensionnement / changement d'échelle
         }
 
-        // --- God rays : cible en demi-résolution (republiée après réallocation) ---
+        // --- God rays : cibles ping-pong en demi-résolution (republiées après réallocation) ---
         const glm::ivec2 gs((w + 1) / 2, (h + 1) / 2);
         if (gs != godRaysSize_) {
             gpu::Texture2D::Desc d;
             d.width          = gs.x;
             d.height         = gs.y;
             d.internalFormat = GL_RGBA16F;  // rgb luminance diffusée, a transmittance (ciel)
-            d.debugName      = "volumetrics.godRays";
-            godRays_.Create(d);
-            godRaysSize_ = gs;
-            ctx.blackboard.PublishTexture(env::bb::VolumetricGodRays, godRays_, kProducer);
+            d.debugName      = "volumetrics.godRaysA";
+            godRaysTargets_[0].Create(d);
+            d.debugName      = "volumetrics.godRaysB";
+            godRaysTargets_[1].Create(d);
+            godRaysSize_         = gs;
+            godRaysHistoryValid_ = false;
+            ctx.blackboard.PublishTexture(env::bb::VolumetricGodRays, godRaysTargets_[godRaysCurrent_], kProducer);
         }
         // Distance prise en charge par les god rays : l'éclairage n'y diffuse plus l'astre dominant dans son
         // brouillard (pas de double compte). 0 sans tonemap (repli LDR de l'éclairage) ou god rays coupés.
@@ -239,19 +242,24 @@ public:
         }
 
         // --- Reprojection temporelle : matrices et origine de la frame précédente, invalidations ---
-        const glm::vec3 sunNow = glm::normalize(glm::vec3(ctx.environment.sunDirIlluminance));
+        const glm::vec3 sunNow   = glm::normalize(glm::vec3(ctx.environment.sunDirIlluminance));
+        const glm::vec3 moonNow  = glm::normalize(glm::vec3(ctx.environment.moonDirPhase));
+        const glm::vec3 lightNow = sunNow.y > -0.02f ? sunNow : moonNow;
         const glm::vec4 wxNow(ctx.environment.weatherExtra.x, ctx.environment.weatherExtra.y, ctx.environment.weather.x,
                               ctx.environment.weather.y);
         const int  block    = temporal_ ? (temporalPattern_ == 0 ? 2 : 4) : 1;
-        const bool jump     = !hasPrevFrame_ || glm::dot(sunNow, prevSun_) < std::cos(glm::radians(1.0f)) ||
+        const bool jump     = !hasPrevFrame_ || glm::dot(lightNow, prevLight_) < std::cos(glm::radians(1.0f)) ||
                               glm::any(glm::greaterThan(glm::abs(wxNow - prevWeather_), glm::vec4(0.08f))) ||
                               block != prevBlock_;
-        if (jump) historyValid_ = false;  // saut d'heure / de météo, motif changé : historique écarté 1 frame
+        if (jump) {
+            historyValid_        = false;
+            godRaysHistoryValid_ = false;
+        }
         prevViewProj_     = hasPrevFrame_ ? lastViewProj_ : ctx.environment.viewProj;
         prevOriginChunk_  = hasPrevFrame_ ? lastOriginChunk_ : ctx.renderOriginChunk;
         lastViewProj_     = ctx.environment.viewProj;
         lastOriginChunk_  = ctx.renderOriginChunk;
-        prevSun_          = sunNow;
+        prevLight_        = lightNow;
         prevWeather_      = wxNow;
         prevBlock_        = block;
         hasPrevFrame_     = true;
@@ -307,7 +315,7 @@ public:
         p.Set("uGodRaysAvailable", godRays);
         ctx.blackboard.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
         // Le slot TEX_GodRays porte l'historique des nuages pendant leurs passes ; ici, les god rays.
-        if (godRays) godRays_.BindUnit(env::bind::tex::GodRays);
+        if (godRays) godRaysTargets_[godRaysCurrent_].BindUnit(env::bind::tex::GodRays);
         if (clouds)  cloudTargets_[current_].BindUnit(env::bind::tex::CloudWeatherMap);
         p.Use();
         emptyVao_.Bind();
@@ -348,7 +356,8 @@ public:
         weatherMap_.Destroy();
         cloudTargets_[0].Destroy();
         cloudTargets_[1].Destroy();
-        godRays_.Destroy();
+        godRaysTargets_[0].Destroy();
+        godRaysTargets_[1].Destroy();
         SharedLighting().godRayDistance = 0.0f;
         shadowMap_.Destroy();
         cloudUbo_.Destroy();
@@ -411,7 +420,7 @@ public:
         ImGui::SetItemTooltip("1 = un nuage epais coupe entierement le soleil direct (physique).");
         ImGui::SliderFloat("Epaisseur optique", &cloudShadowStrength_, 0.05f, 4.0f, "x%.2f", ImGuiSliderFlags_Logarithmic);
         ImGui::SliderFloat("Emprise de l'ombre", &cloudShadowExtent_, 4000.0f, 80000.0f, "%.0f m", ImGuiSliderFlags_Logarithmic);
-        ImGui::SetItemTooltip("Cote de la carte (512 texels) centree sur la camera ; au-dela, pas d'ombre.");
+        ImGui::SetItemTooltip("Cote de la carte (1024 texels) centree sur la camera ; au-dela, pas d'ombre.");
         if (shadowMap_.IsValid()) {
             ImGui::Image(static_cast<ImTextureID>(static_cast<std::uintptr_t>(shadowMap_.Id())), ImVec2(160, 160));
             ImGui::SetItemTooltip("Transmittance vers l'astre dominant (blanc = plein soleil), camera au centre.");
@@ -502,7 +511,7 @@ private:
         {
             const std::uint32_t wGen = weatherProg_->Generation();
             const glm::vec3 wEnv(ctx.environment.weatherExtra.x, ctx.environment.weatherExtra.y, ctx.environment.weather.x);
-            const float     wTol = 0.125f * (weatherMapExtent_ / static_cast<float>(kWeatherSize));
+            const float     wTol = 0.02f * (weatherMapExtent_ / static_cast<float>(kWeatherSize));
             const bool dirty = weatherMapDirty_ || wGen != lastWeatherGen_ ||
                                std::abs(weatherMapExtent_ - lastWeatherExtent_) > 1e-2f ||
                                std::abs(frontScale_ - lastFrontScale_) > 1e-2f ||
@@ -596,10 +605,12 @@ private:
 
     /// God rays : marche dans le brouillard ombré par les nuages (clouds.shadowMap) et le relief (VXGI).
     bool RenderGodRays(EngineContext& ctx) {
-        if (!godRays_.IsValid()) return false;
+        if (!godRaysTargets_[0].IsValid()) return false;
         const core::RenderBlackboard& bb = ctx.blackboard;
         BindSurfaceLightingResources(bb);  // ombre des nuages, grille VXGI, transmittance, ciel
         bb.BindTexture(env::bb::SceneDepth, env::bind::tex::SceneDepth);
+        godRaysCurrent_ ^= 1;
+        godRaysTargets_[godRaysCurrent_ ^ 1].BindUnit(env::bind::tex::GodRays);
         const gpu::ShaderProgram& p = *godRaysProg_;
         surfaceLightingUbo_.UploadObject(BuildSurfaceLightingUbo(ctx.renderOriginChunk));
         surfaceLightingUbo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::PostParams);
@@ -609,10 +620,15 @@ private:
         p.Set("uIntensity", godRayIntensity_);
         p.Set("uAnisotropy", godRayAnisotropy_);
         p.Set("uSkyShafts", godRaySkyShafts_);
-        godRays_.BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
+        p.Set("uPrevViewProj", prevViewProj_);
+        p.Set("uOriginShift", glm::vec2(ctx.renderOriginChunk - prevOriginChunk_) * kChunkSizeMeters);
+        p.Set("uHistoryValid", godRaysHistoryValid_);
+        godRaysTargets_[godRaysCurrent_].BindImage(env::bind::image::VolumetricOut, GL_WRITE_ONLY);
         p.Use();
         glDispatchCompute(static_cast<GLuint>((godRaysSize_.x + 7) / 8), static_cast<GLuint>((godRaysSize_.y + 7) / 8), 1);
         glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);  // lue par texelFetch dans le tonemap
+        godRaysHistoryValid_ = true;
+        ctx.blackboard.PublishTexture(env::bb::VolumetricGodRays, godRaysTargets_[godRaysCurrent_], kProducer);
         return true;
     }
 
@@ -684,12 +700,12 @@ private:
             return;
         }
         const std::uint32_t sGen = shadowProg_->Generation();
-        const float         sTol = 0.125f * (cloudShadowExtent_ / static_cast<float>(kShadowSize));
+        const float         sTol = 0.02f * (cloudShadowExtent_ / static_cast<float>(kShadowSize));
         const glm::vec2     skew = windDirXZ_ * skew_;
         const bool dirty = shadowMapDirty_ || weatherUpdated || !sh.cloudShadowValid || ctx.renderOriginShifted ||
                            sGen != lastShadowGen_ ||
                            glm::length(shadowOriginRel_ - lastShadowOriginRel_) > 1e-2f ||
-                           glm::dot(shadowLight_, lastShadowLight_) < 0.999999f ||
+                           glm::length(shadowLight_ - lastShadowLight_) > 1e-5f ||
                            WrappedDelta2D(glm::vec2(shapeOffset_.x, shapeOffset_.z),
                                           glm::vec2(lastShapeOffset_.x, lastShapeOffset_.z), shapeScale_) > sTol ||
                            std::abs(cloudBottom_ - lastShadowBottom_) > 1e-2f ||
@@ -779,7 +795,7 @@ private:
     glm::vec3           shadowLight_{0.0f, 1.0f, 0.0f};
     bool                shadowLightUp_       = false;
     bool                cloudShadowsEnabled_ = true;
-    float               cloudShadowExtent_   = 20000.0f;
+    float               cloudShadowExtent_   = 14000.0f;
     float               cloudShadowStrength_ = 1.0f;
     float               cloudShadowOpacity_  = 1.0f;
     bool                weatherMapDirty_     = true;
@@ -812,9 +828,11 @@ private:
     glm::ivec2          cloudTargetSize_{0};
     gpu::ShaderProgram* reprojectProg_ = nullptr;
     gpu::ShaderProgram* godRaysProg_   = nullptr;
-    gpu::Texture2D      godRays_;
+    gpu::Texture2D      godRaysTargets_[2];
+    int                 godRaysCurrent_      = 0;
     glm::ivec2          godRaysSize_{0};
-    bool                godRaysActive_ = false;
+    bool                godRaysActive_       = false;
+    bool                godRaysHistoryValid_ = false;
     bool                historyValid_  = false;
     bool                hasPrevFrame_  = false;
     int                 temporalPattern_ = 0;   ///< 0 = 2×2, 1 = 4×4
@@ -823,7 +841,7 @@ private:
     glm::mat4           lastViewProj_{1.0f};
     glm::ivec2          prevOriginChunk_{0};
     glm::ivec2          lastOriginChunk_{0};
-    glm::vec3           prevSun_{0.0f, 1.0f, 0.0f};
+    glm::vec3           prevLight_{0.0f, 1.0f, 0.0f};
     glm::vec4           prevWeather_{0.0f};
     CloudParams         cloudParams_;
     bool                noiseReady_ = false;

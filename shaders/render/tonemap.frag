@@ -89,8 +89,8 @@ float LinearSceneDepth(vec2 uv) {
     return envIsSky(d) ? 1.0e7 : envLinearDepth(d);
 }
 
-// Suréchantillonnage bilatéral en croix (5 taps) des god rays : poids spatial × ressemblance de profondeur
-// (pas de halo autour des montagnes), et lissage du jitter IGN de la marche.
+// Suréchantillonnage bilatéral 3 × 3 des god rays : poids spatial × ressemblance de profondeur relative
+// (évite les blocs 2 × 2 sur les angles rasants tout en préservant les silhouettes de montagnes).
 vec4 GodRaysAt(vec2 uv, float centerDepth) {
     ivec2 size = textureSize(uGodRays, 0);
     vec2  st   = uv * vec2(size) - 0.5;
@@ -98,16 +98,16 @@ vec4 GodRaysAt(vec2 uv, float centerDepth) {
     float z0   = envIsSky(centerDepth) ? 1.0e7 : envLinearDepth(centerDepth);
     vec4  acc  = vec4(0.0);
     float wsum = 0.0;
-    const ivec2 kOffsets[5] = ivec2[5](ivec2(0, 0), ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
-    for (int i = 0; i < 5; ++i) {
-        ivec2 q  = clamp(c + kOffsets[i], ivec2(0), size - 1);
-        vec2  dq = vec2(q) - st;
-        float zq = LinearSceneDepth((vec2(q) + 0.5) / vec2(size));
-        float dz = abs(zq - z0) / max(min(z0, zq), 1e-3);
-        float w  = exp(-dot(dq, dq) * 0.9 - min(dz, 4.0) * 6.0) + 1e-5;
-        acc  += texelFetch(uGodRays, q, 0) * w;
-        wsum += w;
-    }
+    for (int y = -1; y <= 1; ++y)
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q  = clamp(c + ivec2(x, y), ivec2(0), size - 1);
+            vec2  dq = vec2(q) - st;
+            float zq = LinearSceneDepth((vec2(q) + 0.5) / vec2(size));
+            float dz = abs(zq - z0) / max(z0, 1.0);
+            float w  = exp(-dot(dq, dq) * 0.65 - min(dz, 2.0) * 6.0) + 1e-4;
+            acc  += texelFetch(uGodRays, q, 0) * w;
+            wsum += w;
+        }
     return acc / wsum;
 }
 

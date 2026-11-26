@@ -130,13 +130,13 @@ vec4 TraceScreenReflection(vec3 P, vec3 R, float distToCam) {
     return vec4(0.0);
 }
 
-// Ombre lointaine (cône VXGI) allégée pour l'eau : 16 pas au lieu de 40, cône un peu plus large. Sur
-// l'eau, l'ombre ne module que le reflet du soleil et la diffusion : pénombre plus douce invisible.
-float WaterVoxelShadow(vec3 P, vec3 L) {
+// Ombre lointaine (cône VXGI) pour l'eau : pas jitteré + minLod > 0 pour éviter les angles carrés de 8 m
+// (très visibles la nuit sur la mer).
+float WaterVoxelShadow(vec3 P, vec3 L, float noise) {
     if (!uVoxelShadows || !VoxelGridUsable(P)) return 1.0;
     float voxel = VoxelSize();
     return VoxelConeVisibility(uVoxel.uGridMin.xyz, P + vec3(0.0, 0.5 * voxel, 0.0), L,
-                               max(uVoxelShadowSoftness, 0.06), 1.5 * voxel, 2000.0, 16);
+                               max(uVoxelShadowSoftness, 0.07), (1.35 + 0.5 * noise) * voxel, 2000.0, 32, 0.75);
 }
 
 // Coefficients du milieu (1/m) : eau claire + turbidité (marais), sédiments en rivière.
@@ -225,11 +225,11 @@ void main() {
     // Cône lointain seulement si le relief proche n'occulte pas déjà l'astre.
     if (sunDir.y > -0.01) {
         sunShadow = HeightfieldShadow(P + up * 0.15, sunDir, noise);
-        if (sunShadow > 0.0) sunShadow = min(sunShadow, WaterVoxelShadow(P, sunDir));
+        if (sunShadow > 0.0) sunShadow = min(sunShadow, WaterVoxelShadow(P, sunDir, noise));
     }
     if (moonDir.y > -0.01 && sunDir.y < 0.05) {
         moonShadow = HeightfieldShadow(P + up * 0.15, moonDir, noise);
-        if (moonShadow > 0.0) moonShadow = min(moonShadow, WaterVoxelShadow(P, moonDir));
+        if (moonShadow > 0.0) moonShadow = min(moonShadow, WaterVoxelShadow(P, moonDir, noise));
     }
     vec3 sunE  = SunIlluminanceTOA()  * LightTransmittance(P.y, sunDir, SunAngularRadius())
                * CloudShadow(P, sunDir) * uSunScale;

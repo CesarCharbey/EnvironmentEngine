@@ -128,7 +128,7 @@ vec3 DirectLight(Surface s, vec3 V, vec3 L, vec3 E) {
 // le plan de la base des nuages, origine de la carte calée sur un texel et stockée avec elle (recalée
 // ici sur l'origine de rendu courante). L'autre astre (la lune le jour, le soleil la nuit, négligeables
 // alors) n'est pas ombré. Hors de la carte : 1 (la carte s'y fond déjà vers 1).
-float CloudShadow(vec3 P, vec3 L) {
+float CloudShadowSample(vec3 P, vec3 L, bool pcf) {
     if (!uCloudShadowAvailable) return 1.0;
     // Transmittance de repli hors carte : 1.0 par temps clair, 0.0 (ombre totale) à couverture 1.0.
     float fallback = 1.0 - smoothstep(0.35, 0.98, uEnv.weatherExtra.x);
@@ -138,8 +138,20 @@ float CloudShadow(vec3 P, vec3 L) {
     vec2  uv = (xz - uCloudShadowOrigin) / uCloudShadowExtent + 0.5;
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return fallback;
     float edge = smoothstep(0.35, 0.5, max(abs(uv.x - 0.5), abs(uv.y - 0.5)));
-    return min(textureLod(uCloudShadow, uv, 0.0).r, mix(1.0, fallback, edge));
+    float s;
+    if (pcf) {
+        vec2 tex = 1.25 / vec2(textureSize(uCloudShadow, 0));
+        s = 0.25 * (textureLod(uCloudShadow, uv + vec2( 0.9,  0.4) * tex, 0.0).r
+                  + textureLod(uCloudShadow, uv + vec2(-0.9, -0.4) * tex, 0.0).r
+                  + textureLod(uCloudShadow, uv + vec2(-0.4,  0.9) * tex, 0.0).r
+                  + textureLod(uCloudShadow, uv + vec2( 0.4, -0.9) * tex, 0.0).r);
+    } else {
+        s = textureLod(uCloudShadow, uv, 0.0).r;
+    }
+    return min(s, mix(1.0, fallback, edge));
 }
+
+float CloudShadow(vec3 P, vec3 L) { return CloudShadowSample(P, L, true); }
 
 // =============================================================================
 // Ombres portées : relief (heightfield du chunk focus) + contact (espace écran)
@@ -226,12 +238,15 @@ bool VoxelGridUsable(vec3 P) {
 
 // Ombre LOINTAINE : cône fin vers l'astre, à partir d'un voxel et demi (en deçà, la grille de 8 m
 // s'auto-occulterait ; l'ombre proche est assurée par le heightfield + le contact écran).
-float VoxelShadow(vec3 P, vec3 N, vec3 L) {
+// minLod > 0 + jitter du départ suppriment les angles carrés des voxels de 8 m (surtout visibles la nuit).
+float VoxelShadow(vec3 P, vec3 N, vec3 L, float noise) {
     if (!uVoxelShadows || !VoxelGridUsable(P)) return 1.0;
     float voxel = VoxelSize();
     return VoxelConeVisibility(uVoxel.uGridMin.xyz, P + N * (0.5 * voxel), L, uVoxelShadowSoftness,
-                               1.5 * voxel, 2000.0, 40);
+                               (1.35 + 0.5 * noise) * voxel, 2000.0, 40, 0.55);
 }
+
+float VoxelShadow(vec3 P, vec3 N, vec3 L) { return VoxelShadow(P, N, L, 0.5); }
 
 // VXAO + rebond diffus : 5 cônes (normale + 4 inclinés de 60°, ouverture 60° -> tan 30° = 0.577),
 // pondérés par le cosinus. Chaque cône ramène la lumière des voxels rencontrés ; la part non occultée

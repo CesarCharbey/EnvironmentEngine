@@ -26,7 +26,7 @@ uniform vec3  uLightDir;        // direction VERS l'astre dominant (unitaire)
 uniform float uShadowStrength;  // multiplicateur de l'épaisseur optique
 uniform float uShadowOpacity;   // opacité maximale de l'ombre [0, 1]
 
-const int kSteps = 8;
+const int kSteps = 16;
 
 void main() {
     ivec2 id   = ivec2(gl_GlobalInvocationID.xy);

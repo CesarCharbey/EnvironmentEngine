@@ -28,16 +28,20 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(rgba16f, binding = IMG_VolumetricOut) writeonly uniform image2D uGodRaysOut;
 layout(binding = TEX_SceneDepth) uniform sampler2D uSceneDepth;  // opaque + eau
+layout(binding = TEX_GodRays)    uniform sampler2D uGodRaysHistory;
 
 uniform int   uSteps;
 uniform float uMaxDistance;   // m
 uniform float uIntensity;     // multiplicateur de la diffusion (1 = même milieu que le brouillard)
 uniform float uAnisotropy;    // g de Henyey-Greenstein (fort lobe avant)
 uniform float uSkyShafts;     // force des rayons crépusculaires dans le ciel [0, 1]
+uniform mat4  uPrevViewProj;
+uniform vec2  uOriginShift;
+uniform bool  uHistoryValid;
 
 const float kHazeScaleHeight = 1200.0;  // m : brume de la couche limite
 const float kHazeTop         = 3000.0;  // m : au-delà, plus de brume utile
-const int   kHazeSteps       = 16;
+const int   kHazeSteps       = 24;
 
 // Visibilité moyenne de l'astre dans la brume le long d'un rayon de ciel (1 = aucun nuage ne l'ombre).
 float HazeVisibility(vec3 cam, vec3 dir, vec3 L, float jitter) {
@@ -48,13 +52,38 @@ float HazeVisibility(vec3 cam, vec3 dir, vec3 L, float jitter) {
     for (int i = 0; i < kHazeSteps; ++i) {
         vec3  p = cam + dir * ((float(i) + jitter) * dt);
         float w = exp(-max(p.y, 0.0) / kHazeScaleHeight);
-        acc  += w * CloudShadow(p, L);
+        acc  += w * CloudShadowSample(p, L, false);
         wsum += w;
     }
     return wsum > 0.0 ? acc / wsum : 1.0;
 }
 
-const int kShadowPoints = 8;
+const int kShadowPoints = 12;
+
+void StoreGodRays(ivec2 id, vec2 uv, vec3 dir, float depth, bool sky, vec4 cur) {
+    if (uHistoryValid) {
+        vec4 clip;
+        if (sky) {
+            clip = uPrevViewProj * vec4(dir, 0.0);
+        } else {
+            vec3 X = envWorldPosFromDepth(uv, depth);
+            X.xz += uOriginShift;
+            clip = uPrevViewProj * vec4(X, 1.0);
+        }
+        if (clip.w > 1e-6) {
+            vec2 uvp = clip.xy / clip.w * 0.5 + 0.5;
+            if (all(greaterThanEqual(uvp, vec2(0.0))) && all(lessThanEqual(uvp, vec2(1.0)))) {
+                vec4  hist  = textureLod(uGodRaysHistory, uvp, 0.0);
+                float lc    = Luminance(cur.rgb);
+                float lh    = Luminance(hist.rgb);
+                float diff  = max(abs(hist.a - cur.a), abs(lh - lc) / max(max(lh, lc), 1e-4));
+                float alpha = mix(0.20, 0.90, smoothstep(0.18, 0.75, diff));
+                cur = mix(hist, cur, alpha);
+            }
+        }
+    }
+    imageStore(uGodRaysOut, id, cur);
+}
 
 void main() {
     ivec2 id   = ivec2(gl_GlobalInvocationID.xy);
@@ -73,7 +102,7 @@ void main() {
     bool  sunUp   = sunDir.y > -0.02;  // même astre dominant que le brouillard et l'ombre des nuages
     vec3  L       = sunUp ? sunDir : moonDir;
     if (dist <= 1.0 || (!sunUp && moonDir.y <= -0.02)) {
-        imageStore(uGodRaysOut, id, vec4(0.0, 0.0, 0.0, 1.0));
+        StoreGodRays(id, uv, dir, depth, sky, vec4(0.0, 0.0, 0.0, 1.0));
         return;
     }
     vec3  E0    = sunUp ? SunIlluminanceTOA() * uSunScale : MoonIlluminanceTOA() * uMoonScale;
@@ -93,16 +122,16 @@ void main() {
         skyFactor  = mix(1.0, f, uSkyShafts * mieW);
     }
     if (sky || uEnv.weatherExtra.z <= 0.0) {
-        imageStore(uGodRaysOut, id, vec4(0.0, 0.0, 0.0, skyFactor));
+        StoreGodRays(id, uv, dir, depth, sky, vec4(0.0, 0.0, 0.0, skyFactor));
         return;
     }
-    // Ombre du relief (cône VXGI) sur kShadowPoints points régulièrement espacés, interpolée entre eux.
+    // Ombre du relief (cône VXGI adouci et jitteré) sur kShadowPoints points, interpolée entre eux.
     float terrainVis[kShadowPoints];
     bool  voxel = uVoxelShadows && uVoxelAvailable && uVoxel.uGridExtent.w > 0.5;
     for (int k = 0; k < kShadowPoints; ++k) {
-        vec3 p = cam + dir * (dist * (float(k) + 0.5) / float(kShadowPoints));
+        vec3 p = cam + dir * (dist * (float(k) + jitter) / float(kShadowPoints));
         terrainVis[k] = voxel && VoxelUvwInside(VoxelUvw(p, uVoxel.uGridMin.xyz))
-                      ? VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.06, 0.5 * VoxelSize(), 1500.0, 12) : 1.0;
+                      ? VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.08, 0.5 * VoxelSize(), 1500.0, 16, 0.85) : 1.0;
     }
 
     float dt      = dist / float(uSteps);
@@ -123,9 +152,9 @@ void main() {
         float kf  = clamp(t / dist * float(kShadowPoints) - 0.5, 0.0, float(kShadowPoints - 1));
         int   k0  = int(kf);
         float vis = mix(terrainVis[k0], terrainVis[min(k0 + 1, kShadowPoints - 1)], kf - float(k0));
-        vis *= CloudShadow(p, L);
+        vis *= CloudShadowSample(p, L, false);
         acc += w * vis * LightTransmittance(p.y, L, angR);
     }
     vec3 rgb = acc * E0 * phase * boost;
-    imageStore(uGodRaysOut, id, vec4(min(rgb, vec3(65000.0)), skyFactor));
+    StoreGodRays(id, uv, dir, depth, sky, vec4(min(rgb, vec3(65000.0)), skyFactor));
 }

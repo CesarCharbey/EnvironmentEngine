@@ -213,16 +213,17 @@ void main() {
         bool  moonLit    = moonDir.y > -0.01 && dot(s.N, moonDir) > 0.0;
         float sunCloud   = sunLit  ? CloudShadow(P, sunDir)  : 0.0;
         float moonCloud  = moonLit ? CloudShadow(P, moonDir) : 0.0;
+        float shadowNoise = (sunLit || moonLit) ? InterleavedGradientNoise(vUv * uEnv.viewportSize.xy) : 0.5;
         float sunShadow  = 0.0;
         if (sunLit && (sunCloud > 0.001 || uDebugView == 9)) {
             sunShadow = ComputeTerrainAndContactShadow(P, s.N, sunDir, vUv);
-            if (sunShadow > 0.001) sunShadow = min(sunShadow, VoxelShadow(P, s.N, sunDir));
+            if (sunShadow > 0.001) sunShadow = min(sunShadow, VoxelShadow(P, s.N, sunDir, shadowNoise));
         }
         float moonShadow = 0.0;
         bool  moonRelevant = moonLit && (sunDir.y < 0.05 || uDebugView == 9) && (moonCloud > 0.001 || uDebugView == 9);
         if (moonRelevant) {
             moonShadow = ComputeTerrainAndContactShadow(P, s.N, moonDir, vUv);
-            if (moonShadow > 0.001) moonShadow = min(moonShadow, VoxelShadow(P, s.N, moonDir));
+            if (moonShadow > 0.001) moonShadow = min(moonShadow, VoxelShadow(P, s.N, moonDir, shadowNoise));
         }
         vec3 sunE  = SunIlluminanceTOA()  * LightTransmittance(P.y, sunDir, SunAngularRadius())
                    * sunCloud * sunShadow * uSunScale;
