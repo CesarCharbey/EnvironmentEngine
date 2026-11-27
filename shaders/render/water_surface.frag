@@ -193,8 +193,8 @@ void main() {
     vec3  dndx    = dFdx(N), dndy = dFdy(N);
     float kernel2 = min(2.0 * kSpecAaSigma2 * (dot(dndx, dndx) + dot(dndy, dndy)), kSpecAaKappa);
 
-    // --- Rejet hors de l'eau (rivières / marais) ---
-    if (uKind == 1 && (fsIn.valid < 0.5 || fsIn.waterSdf > uWater.riverParams.z)) discard;
+    // --- Rejet hors de l'eau (rivières / marais) ou sous le niveau de l'océan ---
+    if (uKind == 1 && (fsIn.valid < 0.5 || fsIn.waterSdf > uWater.riverParams.z || P.y <= envOceanLevel())) discard;
 
     vec3  cam    = envCameraPosition();
     vec3  toCam  = cam - P;

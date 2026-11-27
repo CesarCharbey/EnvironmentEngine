@@ -37,9 +37,14 @@ void main() {
     vec2  sdfs = unpackHalf2x16(floatBitsToUint(d.z));  // (rivière, marais)
     vec2  flow = unpackHalf2x16(floatBitsToUint(d.w));
 
-    float riverLevel = uRivers && d.x > kNoRiver * 0.5 ? d.x : kNoRiver;
+    float oceanLevel = envOceanLevel();
+    // Garde-fou : ne pas dessiner de rivière ni de marais au niveau ou sous l'océan (évite
+    // le double overdraw avec la passe océan et les nappes flottantes sur les fonds marins).
+    float riverLevel = (uRivers && d.x > kNoRiver * 0.5 && d.x > oceanLevel + 0.05) ? d.x : kNoRiver;
     // +2 cm : le marais du mock est aplani exactement au niveau d'eau par défaut (pas de z-fighting).
-    float marshLevel = uSwamps && sdfs.y < kMarshReach ? envSwampLevel() + 0.02 : kNoRiver;
+    float marshY     = envSwampLevel() + 0.02;
+    float marshLevel = (uSwamps && sdfs.y < kMarshReach && marshY > oceanLevel + 0.05 && d.y > oceanLevel)
+                     ? marshY : kNoRiver;
     float level      = max(riverLevel, marshLevel);
     bool  hasWater   = level > kNoRiver * 0.5;
     float marsh      = marshLevel >= riverLevel && hasWater ? 1.0 : 0.0;
