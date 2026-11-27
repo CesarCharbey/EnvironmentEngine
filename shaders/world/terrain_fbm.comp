@@ -130,23 +130,23 @@ float getSignedRiverSDF(vec2 worldPos) {
     return clamp(rawDist - uRiverHalfWidth, -RIVER_SDF_FAR, RIVER_SDF_FAR);
 }
 
-// Hauteur finale (terrain + creusement rivière) en une seule évaluation
+// Hauteur finale (terrain + creusement rivière) avec SDF continue
 float evalFinalHeight(vec2 worldPos, out float outRiverSDF) {
     float h = getBaseTerrainHeight(worldPos);
     float sdf = getSignedRiverSDF(worldPos);
 
-    // Masque : la rivière naît sous la haute montagne et s'aplatit en rejoignant l'océan
     float birthMask = 1.0 - smoothstep(uHighMountainHeight * 0.6, uHighMountainHeight, h);
     float oceanFade = smoothstep(uOceanLevel - 2.0, uOceanLevel + 5.0, h);
     float intensity = birthMask * oceanFade;
 
     if (sdf < uBankWidth && intensity > 0.0) {
-        // 1.0 au fond du lit (sdf <= 0), transition douce sur [0, uBankWidth]
         float carve = 1.0 - smoothstep(0.0, max(uBankWidth, 0.1), sdf);
         h -= uRiverDepth * carve * intensity;
     }
 
-    outRiverSDF = (intensity < 0.05) ? RIVER_SDF_FAR : sdf;
+    // Transition continue vers RIVER_SDF_FAR quand intensity -> 0 (plus de saut brutal)
+    float fade = smoothstep(0.0, 0.2, intensity);
+    outRiverSDF = clamp(mix(RIVER_SDF_FAR, sdf, fade), -RIVER_SDF_FAR, RIVER_SDF_FAR);
     return h;
 }
 
@@ -194,26 +194,32 @@ void main() {
 
     imageStore(uHeightNormalOut, texelCoord, vec4(h, normal));
 
-    // 4. Biomes complets + Marais
+    // 4. Biomes complets + SDF Marais continue
     float moisture = getMoisture(worldPos);
     if (riverSDF < uBankWidth * 2.0) {
         moisture += 0.35 * (1.0 - clamp(riverSDF / (uBankWidth * 2.0), 0.0, 1.0));
     }
     moisture = clamp(moisture, 0.0, 1.0);
 
-    float slope = 1.0 - normal.y; // 0 = plat, 1 = vertical
-    float marshSDF = RIVER_SDF_FAR;
-    int biome = B_PLAINS;
+    float slope = 1.0 - normal.y;
 
+    // SDF Marais continue : < 0 dans le marais, > 0 dès qu'on monte, qu'on est en pente ou au sec
+    float marshHeightDist = (h - uSwampLevel) * 4.0;
+    float slopePenalty    = max(0.0, slope - uMarshSlopeThreshold) * 200.0;
+    float moistPenalty    = max(0.0, 0.5 - moisture) * 100.0;
+    float oceanPenalty    = max(0.0, uOceanLevel - h) * 8.0; // pas de marais sous l'océan
+    float marshSDF        = clamp(marshHeightDist + slopePenalty + moistPenalty + oceanPenalty,
+                                  -RIVER_SDF_FAR, RIVER_SDF_FAR);
+
+    int biome = B_PLAINS;
     if (h < uOceanLevel) {
         biome = B_OCEAN;
     } else if (h < uOceanLevel + uBeachMaxHeight) {
         biome = B_BEACH;
     } else if (h > uHighMountainHeight) {
         biome = B_HIGHMOUNTAIN;
-    } else if (h < uSwampLevel && slope < uMarshSlopeThreshold && moisture > 0.5) {
+    } else if (marshSDF < 0.0) {
         biome = B_SWAMP;
-        marshSDF = (h - uSwampLevel); // < 0 dans le marais
     } else {
         if (moisture > 0.75)      biome = B_JUNGLE;
         else if (moisture > 0.55) biome = B_FOREST;

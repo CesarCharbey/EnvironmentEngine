@@ -108,7 +108,8 @@ public:
             if (requests >= maxRequestsPerFrame_) break;
 
             if (pool_.empty()) {
-                pool_.push_back(AllocateSlot());
+                pendingSlotsNeeded_ = std::max(pendingSlotsNeeded_, maxRequestsPerFrame_ - requests);
+                break;
             }
 
             entt::entity entity = ctx.registry.create();
@@ -137,7 +138,12 @@ public:
         UpdateFocus(ctx);
     }
 
-    void Render(EngineContext&) override {}
+    void Render(EngineContext&) override {
+        while (pendingSlotsNeeded_ > 0) {
+            pool_.push_back(AllocateSlot());
+            pendingSlotsNeeded_--;
+        }
+    }
 
     void Shutdown(EngineContext& ctx) override {
         ctx.blackboard.UnpublishIfProducer(bb::WorldFocusHeightNormal, "Dev 1");
@@ -197,10 +203,13 @@ private:
 
         auto it = chunkMap_.find(centerChunk);
         if (it != chunkMap_.end()) {
-            auto resIt = activeResources_.find(it->second);
-            if (resIt != activeResources_.end()) {
-                ctx.blackboard.PublishTexture(bb::WorldFocusHeightNormal, resIt->second.heightNormalTex, "Dev 1");
-                ctx.blackboard.PublishTexture(bb::WorldFocusBiomeHydro,   resIt->second.biomeHydroTex,   "Dev 1");
+            const auto& state = ctx.registry.get<ChunkStateComponent>(it->second);
+            if ((state.readyMask & ChunkReady::HeightNormal) != 0 && state.state != ChunkState::Evicting) {
+                auto resIt = activeResources_.find(it->second);
+                if (resIt != activeResources_.end()) {
+                    ctx.blackboard.PublishTexture(bb::WorldFocusHeightNormal, resIt->second.heightNormalTex, "Dev 1");
+                    ctx.blackboard.PublishTexture(bb::WorldFocusBiomeHydro,   resIt->second.biomeHydroTex,   "Dev 1");
+                }
             }
         }
     }
@@ -210,6 +219,7 @@ private:
     int  maxRequestsPerFrame_  = 4;
     int  maxEvictionsPerFrame_ = 8;
     bool freezeStreaming_      = false;
+    int pendingSlotsNeeded_ = 0;
 
     std::vector<PooledChunk> pool_;
     std::unordered_map<entt::entity, PooledChunk> activeResources_;
