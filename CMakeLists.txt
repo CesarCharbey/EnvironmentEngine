@@ -5,7 +5,7 @@
 #
 #  Toutes les dependances sont telechargees par FetchContent (URL + SHA256 :
 #  builds reproductibles, aucune dependance systeme a installer a la main).
-#  Prerequis : CMake >= 3.25, compilateur C++20, Python 3 (generateur glad,
+#  Prerequis : CMake >= 3.22, compilateur C++20, Python 3 (generateur glad,
 #  bibliotheque standard uniquement), GPU OpenGL 4.6.
 #
 #  ADR-002 "Zero-Conflict" : il n'y a AUCUNE liste de sources dans ce fichier.
@@ -13,7 +13,7 @@
 #  et s'auto-enregistre via REGISTER_SYSTEM. Ce fichier ne doit pas changer quand
 #  un developpeur ajoute un systeme.
 # =============================================================================
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.22)
 
 project(EnvEngine VERSION 0.1.0 LANGUAGES C CXX)
 
@@ -64,9 +64,7 @@ endif()
 
 FetchContent_Declare(glfw
     URL      https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip
-    URL_HASH SHA256=b5ec004b2712fd08e8861dc271428f048775200a2df719ccf575143ba749a3e9
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SYSTEM)
+    URL_HASH SHA256=b5ec004b2712fd08e8861dc271428f048775200a2df719ccf575143ba749a3e9)
 
 # -----------------------------------------------------------------------------
 # glad 0.1.36 - loader OpenGL 4.6 Core (genere a la configuration, spec embarquee)
@@ -82,9 +80,7 @@ set(PYTHON_EXECUTABLE ${Python3_EXECUTABLE})
 
 FetchContent_Declare(glad
     URL      https://github.com/Dav1dde/glad/archive/refs/tags/v0.1.36.tar.gz
-    URL_HASH SHA256=8470ed1b0e9fbe88e10c34770505c8a1dc8ccb78cadcf673331aaf5224f963d2
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SYSTEM)
+    URL_HASH SHA256=8470ed1b0e9fbe88e10c34770505c8a1dc8ccb78cadcf673331aaf5224f963d2)
 
 # -----------------------------------------------------------------------------
 # glm 1.0.1 - mathematiques (header-only)
@@ -95,26 +91,21 @@ set(GLM_BUILD_LIBRARY OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(glm
     URL      https://github.com/g-truc/glm/archive/refs/tags/1.0.1.tar.gz
-    URL_HASH SHA256=9f3174561fd26904b23f0db5e560971cbf9b3cbda0b280f04d5c379d03bf234c
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SYSTEM)
+    URL_HASH SHA256=9f3174561fd26904b23f0db5e560971cbf9b3cbda0b280f04d5c379d03bf234c)
 
 # -----------------------------------------------------------------------------
 # EnTT 3.15.0 - ECS (header-only)
 # -----------------------------------------------------------------------------
 FetchContent_Declare(EnTT
     URL      https://github.com/skypjack/entt/archive/refs/tags/v3.15.0.tar.gz
-    URL_HASH SHA256=01466fcbf77618a79b62891510c0bbf25ac2804af5751c84982b413852234d66
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SYSTEM)
+    URL_HASH SHA256=01466fcbf77618a79b62891510c0bbf25ac2804af5751c84982b413852234d66)
 
 # -----------------------------------------------------------------------------
 # Dear ImGui 1.91.9b (branche docking) - pas de CMakeLists amont : cible locale
 # -----------------------------------------------------------------------------
 FetchContent_Declare(imgui
     URL      https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b-docking.tar.gz
-    URL_HASH SHA256=466fdef9b18de15f0bb6e288e3d00ffa3d82200ec458ce5e4f724a161d9528a5
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    URL_HASH SHA256=466fdef9b18de15f0bb6e288e3d00ffa3d82200ec458ce5e4f724a161d9528a5)
 
 # -----------------------------------------------------------------------------
 # JoltPhysics 5.6.0 - physique (ADR-006)
@@ -141,9 +132,7 @@ set(JPH_USE_CPU_COMPUTE     OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(JoltPhysics
     URL      https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.6.0.tar.gz
     URL_HASH SHA256=6e069ee0172478cc78182047aac87e5310ba14a67a53348ae14cc37801fd3f8e
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SOURCE_SUBDIR Build
-    SYSTEM)
+    SOURCE_SUBDIR Build)
 
 # Les CMakeLists amont (glad, glm) declarent des versions minimales anciennes :
 # on masque leurs avertissements de deprecation, sans toucher a nos propres cibles.
