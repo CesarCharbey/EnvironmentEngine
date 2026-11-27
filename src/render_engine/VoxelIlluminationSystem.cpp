@@ -137,16 +137,15 @@ public:
             chunks_.push_back({e, offset, res.heightRange});
         }
 
-        // --- Y : emprise de 512 m calée sur le relief (et non sur y = 0) ---
-        // Relief plus haut que la grille : on garde la tranche autour de la caméra.
-        const float height = kDimY * kVoxelSize;
-        float bottom;
+        // --- Y : emprise de 512 m calée sur le relief émergé (indépendante de cam.y) ---
+        // Les fonds sous-marins n'ont pas besoin de VXGI : on borne le bas au niveau de l'océan pour
+        // couvrir tout le relief émergé (~[ocean - 32 m, ocean + 480 m]) sans que la grille ne décolle
+        // du sol quand la caméra vole en altitude.
+        const float oceanY = ctx.environment.waterTime.x;
+        float       bottom = oceanY - kMarginBelow;
         if (hMin <= hMax) {
-            bottom = hMin - kMarginBelow;
-            if (hMax + kMarginAbove > bottom + height)
-                bottom = std::clamp(cam.y - 0.5f * height, hMin - kMarginBelow, hMax + kMarginAbove - height);
-        } else {
-            bottom = cam.y - 0.5f * height;
+            const float relMin = (hMax > oceanY) ? std::max(hMin, oceanY - kMarginBelow) : hMin;
+            bottom             = relMin - kMarginBelow;
         }
         const int relY = FloorToVoxel(bottom);
 

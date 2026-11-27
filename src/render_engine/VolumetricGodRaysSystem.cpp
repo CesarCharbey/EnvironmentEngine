@@ -86,14 +86,6 @@ public:
         surfaceLightingUbo_.Create(sizeof(SurfaceLightingUbo), GL_DYNAMIC_STORAGE_BIT, nullptr,
                                    "godrays.surfaceLightingUbo");
         // Les textures sont allouées au premier Render() (Init n'émet aucune commande GPU).
-        // [DEV 2 WORKSPACE] — Spécification fonctionnelle
-        // Entrées  : shaders à créer dans shaders/render/ ; slots du contrat UBO_VolumetricParams,
-        //            UBO_PostParams, IMG_VolumetricOut, SSBO_ExposureHistogram.
-        // Sorties  : bruits 3D de forme (RGBA8 128^3) et de détail (RGBA8 32^3) publiés sous
-        //            clouds.shapeNoise et clouds.detailNoise ; carte météo publiée sous clouds.weatherMap ;
-        //            cible des nuages et son historique temporel ; carte d'ombre R16F ; cible des god rays en
-        //            demi-résolution ; cible d'affichage tonemappée ; programmes associés.
-        // Objectif : préparer les ressources volumétriques et de post-traitement.
     }
 
     void Update(EngineContext& ctx) override {
@@ -862,7 +854,7 @@ private:
     glm::vec2           windDirXZ_{1.0f, 0.0f};
     glm::vec2           windDeltaXZ_{0.0f};
 
-    // Variables liées aux sliders d'OnGui (god rays : aucune logique branchée).
+    // Paramètres (OnGui)
     bool  cloudsEnabled_    = true;
     float cloudBottom_      = 1500.0f;
     float cloudTop_         = 4500.0f;

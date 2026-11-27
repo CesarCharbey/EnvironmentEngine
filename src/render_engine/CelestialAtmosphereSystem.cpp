@@ -75,10 +75,6 @@ const char* MoonPhaseName(float phase) {
 class CelestialAtmosphereSystem final : public ISystemModule {
 public:
     void Init(EngineContext& ctx) override {
-        // Entrées  : shaders compute à créer dans shaders/render/ ; slots du contrat UBO_AtmosphereParams,
-        //            IMG_AtmoLutOut.
-        // Sorties  : LUT de transmittance (RGBA16F 256 x 64), LUT de multi-diffusion (RGBA16F 32 x 32),
-        //            LUT sky-view (RGBA16F 192 x 108), programmes compute, UBO de paramètres atmosphériques.
         // Chargement des 3 Compute Shaders (Hillaire 2020)
         transmittanceProg_   = &ctx.shaders.LoadCompute("atmo.transmittance",   "render/atmo_transmittance.comp");
         multiScatteringProg_ = &ctx.shaders.LoadCompute("atmo.multiscattering", "render/atmo_multiscattering.comp");
