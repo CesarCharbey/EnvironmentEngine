@@ -58,7 +58,7 @@ namespace {
 constexpr int           kCascades     = 3;
 constexpr int           kRiverVerts   = 129;  ///< sommets par côté de la grille d'un chunk (2 m)
 constexpr int           kRiverSlots   = 81;   ///< chunks porteurs d'eau simultanés (9 × 9)
-constexpr int           kRiverCmdVec4s = kRiverSlots * 2;  ///< en-tête de commandes indirectes (32 o / slot)
+constexpr int           kRiverCmdVec4s = kRiverSlots * 4;  ///< 2 commandes indirectes / slot (LOD0 + LOD1, 64 o / slot)
 constexpr GLsizeiptr    kRiverSlotBytes = static_cast<GLsizeiptr>(kRiverVerts) * kRiverVerts * 16;
 constexpr int           kRiverJobsPerFrame = 2;
 constexpr float         kPi = 3.14159265358979f;
@@ -122,7 +122,7 @@ public:
         glTextureParameteri(id_, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTextureParameteri(id_, GL_TEXTURE_WRAP_S, GL_REPEAT);
         glTextureParameteri(id_, GL_TEXTURE_WRAP_T, GL_REPEAT);
-        glTextureParameterf(id_, GL_TEXTURE_MAX_ANISOTROPY, 8.0f);
+        glTextureParameterf(id_, GL_TEXTURE_MAX_ANISOTROPY, 4.0f);
         glObjectLabel(GL_TEXTURE, id_, -1, name);
         const float zero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         glClearTexImage(id_, 0, GL_RGBA, GL_FLOAT, zero);
@@ -216,6 +216,7 @@ public:
         BuildGrid(oceanGrid_, kOceanGridX, kOceanGridY,
                   glm::vec2(1.0f / kOceanGridX, 1.0f / kOceanGridY), "water.oceanGrid");
         BuildGrid(riverGrid_, kRiverVerts - 1, kRiverVerts - 1, glm::vec2(1.0f), "water.riverGrid");
+        BuildGrid(riverGridFar_, (kRiverVerts - 1) / 2, (kRiverVerts - 1) / 2, glm::vec2(2.0f), "water.riverGridFar");
         riverPool_.Create(static_cast<GLsizeiptr>(kRiverCmdVec4s) * 16 + kRiverSlotBytes * (kRiverSlots + 1),
                           GL_DYNAMIC_STORAGE_BIT, nullptr, "water.riverPool");
         freeSlots_.clear();
@@ -354,14 +355,20 @@ public:
             // (hors de l'eau). Rivières et marais sont peu profonds : scene.depth garde leur fond.
             glDepthMask(GL_FALSE);
             p.Use();
-            riverGrid_.vao.Bind();
+            int boundLod = -1;
             for (const RiverDraw& d : riverDraws_) {
                 const auto it = riverChunks_.find(d.entity);
                 if (it == riverChunks_.end() || !it->second.baked) continue;
+                const int lod = d.dist >= 350.0f ? 1 : 0;
+                if (lod != boundLod) {
+                    (lod == 0 ? riverGrid_ : riverGridFar_).vao.Bind();
+                    boundLod = lod;
+                }
                 p.Set("uSlotBase", static_cast<std::uint32_t>(kRiverCmdVec4s + it->second.slot * kRiverVerts * kRiverVerts));
                 p.Set("uChunkOffset", d.offset);
-                glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT,
-                                       reinterpret_cast<const void*>(static_cast<std::uintptr_t>(it->second.slot * 32)));
+                glDrawElementsIndirect(
+                    GL_TRIANGLES, GL_UNSIGNED_INT,
+                    reinterpret_cast<const void*>(static_cast<std::uintptr_t>(it->second.slot * 64 + lod * 32)));
             }
             glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
             glDepthMask(GL_TRUE);
@@ -378,8 +385,9 @@ public:
         surfaceLightingUbo_.Destroy();
         sceneCopy_.Destroy();
         emptyVao_.Destroy();
-        oceanGrid_ = Grid{};
-        riverGrid_ = Grid{};
+        oceanGrid_    = Grid{};
+        riverGrid_    = Grid{};
+        riverGridFar_ = Grid{};
         riverChunks_.clear();
         spectrumProg_ = fftProg_ = mipProg_ = riverBakeProg_ = depthProg_ = oceanProg_ = riverProg_ = nullptr;
     }
@@ -440,6 +448,7 @@ private:
     struct RiverDraw {
         entt::entity entity = entt::null;
         glm::vec3    offset{0.0f};
+        float        dist   = 0.0f;
     };
 
     static constexpr int kFftSizes[3] = {128, 256, 512};
@@ -603,7 +612,7 @@ private:
             const glm::vec3 mn = c.offset + glm::vec3(0.0f, std::min(hMin, ctx.environment.waterTime.y), 0.0f);
             const glm::vec3 mx = c.offset + glm::vec3(kChunkSizeMeters, std::max(hMax, ctx.environment.waterTime.y + 1.0f),
                                                       kChunkSizeMeters);
-            if (AabbInFrustum(planes, mn, mx)) riverDraws_.push_back({c.e, c.offset});
+            if (AabbInFrustum(planes, mn, mx)) riverDraws_.push_back({c.e, c.offset, c.dist});
         }
     }
 
@@ -618,10 +627,13 @@ private:
             auto it = riverChunks_.find(e);
             if (it == riverChunks_.end() || !ctx.registry.valid(e)) continue;
             RiverChunk& rc = it->second;
-            // Commande indirecte : instanceCount = 0 tant que le compute shader n'a pas détecté d'eau.
-            const DrawElementsIndirectCommand cmd{
+            // Commandes indirectes (LOD0 128² + LOD1 64²) : instanceCount = 0 tant que le compute shader n'a pas détecté d'eau.
+            const DrawElementsIndirectCommand cmdNear{
                 static_cast<std::uint32_t>(riverGrid_.indexCount), 0u, 0u, 0u, 0u};
-            riverPool_.Upload(&cmd, sizeof(cmd), static_cast<GLintptr>(rc.slot) * 32);
+            const DrawElementsIndirectCommand cmdFar{
+                static_cast<std::uint32_t>(riverGridFar_.indexCount), 0u, 0u, 0u, 0u};
+            riverPool_.Upload(&cmdNear, sizeof(cmdNear), static_cast<GLintptr>(rc.slot) * 64);
+            riverPool_.Upload(&cmdFar, sizeof(cmdFar), static_cast<GLintptr>(rc.slot) * 64 + 32);
             // Lecture seule des textures du chunk (slots Dev 1 existants).
             glBindTextureUnit(env::bind::tex::HeightNormal, rc.heightTex);
             glBindTextureUnit(env::bind::tex::BiomeHydro, rc.biomeTex);
@@ -632,7 +644,7 @@ private:
             p.Set("uPass", 1);
             p.Set("uSrcBase", tmpBase);
             p.Set("uDstBase", static_cast<std::uint32_t>(kRiverCmdVec4s + rc.slot * kRiverVerts * kRiverVerts));
-            p.Set("uCmdVec4Idx", static_cast<std::uint32_t>(rc.slot * 2));
+            p.Set("uCmdVec4Idx", static_cast<std::uint32_t>(rc.slot * 4));
             glDispatchCompute(groups, groups, 1);
             glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
             rc.baked = true;
@@ -660,6 +672,7 @@ private:
     gpu::VertexArray emptyVao_;
     Grid             oceanGrid_;
     Grid             riverGrid_;
+    Grid             riverGridFar_;
 
     // État
     int       allocatedN_        = 0;

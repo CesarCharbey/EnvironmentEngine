@@ -32,18 +32,25 @@ bool VoxelUvwInside(vec3 uvw) {
 // La marche s'arrête à la sortie de la grille (au-delà, on ne sait pas : visible).
 float VoxelConeVisibility(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, float startDist, float maxDist,
                           int maxSteps, float minLod) {
-    float voxel  = VoxelSize();
-    float maxLod = uVoxel.uGridInvExtent.w;
-    float occ    = 0.0;
-    float t      = startDist;
+    float voxel   = VoxelSize();
+    float maxLod  = uVoxel.uGridInvExtent.w;
+    float minDiam = voxel * exp2(minLod);
+    float occ     = 0.0;
+    float t       = startDist;
     for (int i = 0; i < maxSteps; ++i) {
-        if (t > maxDist || occ > 0.97) break;
-        float diam = max(voxel, 2.0 * tanHalf * t);
-        vec3  uvw  = VoxelUvw(origin + dir * t, gridMin);
+        if (t > maxDist || occ > 0.96) break;
+        vec3 uvw = VoxelUvw(origin + dir * t, gridMin);
         if (!VoxelUvwInside(uvw)) break;
-        float lod     = clamp(log2(diam / voxel), minLod, maxLod);
-        float a       = clamp(textureLod(uVoxelGrid, uvw, lod).a, 0.0, 0.999);
-        float stepLen = max(diam * 0.6, voxel * 0.75);
+        // Diamètre effectif aligné sur minLod (à minLod >= 1, évite le LOD 0 de 32 Mo -> cache L2).
+        float diam = max(max(minDiam, 2.0 * tanHalf * t), minDiam + 0.10 * t);
+        float lod  = clamp(log2(diam / voxel), minLod, maxLod);
+        float a    = clamp(textureLod(uVoxelGrid, uvw, lod).a, 0.0, 0.999);
+        if (a <= 1e-4) {
+            // Air vide : aucun pow() et pas égal au diamètre échantillonné (cohérent avec le mip).
+            t += diam;
+            continue;
+        }
+        float stepLen = max(diam * 0.7, voxel * 0.75);
         // Correction d'opacité : a vaut pour une traversée de longueur diam, le pas est plus court.
         a    = 1.0 - pow(1.0 - a, stepLen / diam);
         occ += (1.0 - occ) * a;
@@ -60,27 +67,35 @@ float VoxelConeVisibility(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, fl
 // Radiance accumulée le long d'un cône (composition avant -> arrière, radiance pré-multipliée) :
 // rgb = radiance reçue des voxels (cd/m²), a = occlusion totale. Le reste (1 - a) voit le ciel.
 vec4 VoxelConeRadiance(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, float startDist, float maxDist,
-                       int maxSteps) {
-    float voxel  = VoxelSize();
-    float maxLod = uVoxel.uGridInvExtent.w;
-    vec4  acc    = vec4(0.0);
-    float t      = startDist;
+                       int maxSteps, float minLod) {
+    float voxel   = VoxelSize();
+    float maxLod  = uVoxel.uGridInvExtent.w;
+    float minDiam = voxel * exp2(minLod);
+    vec4  acc     = vec4(0.0);
+    float t       = startDist;
     for (int i = 0; i < maxSteps; ++i) {
         if (t > maxDist || acc.a > 0.97) break;
-        float diam = max(voxel, 2.0 * tanHalf * t);
+        float diam = max(minDiam, 2.0 * tanHalf * t);
         vec3  uvw  = VoxelUvw(origin + dir * t, gridMin);
         if (!VoxelUvwInside(uvw)) break;
-        float lod     = min(log2(diam / voxel), maxLod);
+        float lod     = clamp(log2(diam / voxel), minLod, maxLod);
         vec4  s       = textureLod(uVoxelGrid, uvw, lod);
         float a       = clamp(s.a, 0.0, 0.999);
-        float stepLen = max(diam * 0.8, voxel);
-        float aStep   = 1.0 - pow(1.0 - a, stepLen / diam);
-        vec3  rgb     = s.rgb * (aStep / max(a, 1e-4));  // radiance pré-multipliée par l'opacité corrigée
-        acc.rgb += (1.0 - acc.a) * rgb;
-        acc.a   += (1.0 - acc.a) * aStep;
-        t       += stepLen;
+        float stepLen = max(diam * 0.8, minDiam);
+        if (a > 1e-4) {
+            float aStep = 1.0 - pow(1.0 - a, stepLen / diam);
+            vec3  rgb   = s.rgb * (aStep / a);  // radiance pré-multipliée par l'opacité corrigée
+            acc.rgb += (1.0 - acc.a) * rgb;
+            acc.a   += (1.0 - acc.a) * aStep;
+        }
+        t += stepLen;
     }
     return acc;
+}
+
+vec4 VoxelConeRadiance(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, float startDist, float maxDist,
+                       int maxSteps) {
+    return VoxelConeRadiance(gridMin, origin, dir, tanHalf, startDist, maxDist, maxSteps, 0.0);
 }
 
 #endif  // ENV_VOXEL_COMMON_GLSL

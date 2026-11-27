@@ -118,8 +118,16 @@ public:
         const float minX = static_cast<float>(relX) * kVoxelSize, maxX = minX + kDimX * kVoxelSize;
         const float minZ = static_cast<float>(relZ) * kVoxelSize, maxZ = minZ + kDimZ * kVoxelSize;
 
-        // --- Chunks qui recouvrent la grille + plage de hauteurs connue ---
+        // --- Chunks qui recouvrent la grille + plage de hauteurs connue + empreinte de cache ---
         chunks_.clear();
+        std::uint64_t chunksHash = 0;
+        auto mix64 = [](std::uint64_t x) {
+            x ^= x >> 30;
+            x *= 0xbf58476d1ce4e5b9ULL;
+            x ^= x >> 27;
+            x *= 0x94d049bb133111ebULL;
+            return x ^ (x >> 31);
+        };
         float hMin = std::numeric_limits<float>::max(), hMax = std::numeric_limits<float>::lowest();
         auto view = ctx.registry.view<const ChunkCoordComponent, const ChunkStateComponent, const ChunkGpuResources>();
         for (const entt::entity e : view) {
@@ -134,8 +142,18 @@ public:
                 hMin = std::min(hMin, res.heightRange.x);
                 hMax = std::max(hMax, res.heightRange.y);
             }
+            const std::uint64_t key =
+                mix64(static_cast<std::uint64_t>(static_cast<std::uint32_t>(coord.coord.x)) |
+                      (static_cast<std::uint64_t>(static_cast<std::uint32_t>(coord.coord.y)) << 32)) ^
+                mix64(static_cast<std::uint64_t>(state.generation) |
+                      (static_cast<std::uint64_t>(state.readyMask) << 32)) ^
+                mix64(static_cast<std::uint64_t>(res.heightNormalTex) |
+                      (static_cast<std::uint64_t>(res.biomeHydroTex) << 32)) ^
+                mix64(static_cast<std::uint64_t>(res.foliageInstanceSSBO));
+            chunksHash ^= key;
             chunks_.push_back({e, offset, res.heightRange});
         }
+        chunksHash ^= mix64(static_cast<std::uint64_t>(chunks_.size()));
 
         // --- Y : emprise de 512 m calée sur le relief émergé (indépendante de cam.y) ---
         // Les fonds sous-marins n'ont pas besoin de VXGI : on borne le bas au niveau de l'océan pour
@@ -153,8 +171,46 @@ public:
         const glm::ivec3 originVox(ctx.renderOriginChunk.x * kVoxelsPerChunk, 0, ctx.renderOriginChunk.y * kVoxelsPerChunk);
         currentAbs_ = glm::ivec3(relX, relY, relZ) + originVox;
 
-        const glm::vec3 extent(kDimX * kVoxelSize, kDimY * kVoxelSize, kDimZ * kVoxelSize);
-        params_.gridMin       = glm::vec4(glm::vec3(currentAbs_ - originVox) * kVoxelSize, kVoxelSize);
+        // Détection de changement : on ne reconstruit la grille que si la scène / lumière / origine change
+        // (2 passes pour laisser converger le rebond dans la grille précédente).
+        const glm::vec3 sunNow    = glm::vec3(ctx.environment.sunDirIlluminance);
+        const glm::vec3 moonNow   = glm::vec3(ctx.environment.moonDirPhase);
+        const float     sunLum    = ctx.environment.sunDirIlluminance.w;
+        const float     moonLum   = ctx.environment.moonParams.x;
+        const glm::vec4 weatherNow(ctx.environment.weather.x, ctx.environment.weather.y,
+                                   ctx.environment.weatherExtra.x, ctx.environment.weatherExtra.w);
+        const std::uint32_t progGen = program_ ? program_->Generation() : 0u;
+        const std::uint32_t mipGen  = mipProgram_ ? mipProgram_->Generation() : 0u;
+
+        const bool dirty = !cacheEnabled_ || !prevValid_ || forceRebuild_ ||
+                           currentAbs_ != prevAbs_ || chunksHash != lastChunksHash_ ||
+                           atmoAvailable_ != lastAtmoAvailable_ || injectFoliage_ != lastInjectFoliage_ ||
+                           std::abs(foliageDensity_ - lastFoliageDensity_) > 1e-3f ||
+                           progGen != lastProgGen_ || mipGen != lastMipGen_ ||
+                           glm::length(sunNow - lastSunDir_) > 0.004f ||
+                           glm::length(moonNow - lastMoonDir_) > 0.004f ||
+                           std::abs(sunLum - lastSunLum_) > 0.02f * std::max(1.0f, lastSunLum_) ||
+                           std::abs(moonLum - lastMoonLum_) > 0.02f * std::max(1e-3f, lastMoonLum_) ||
+                           glm::any(glm::greaterThan(glm::abs(weatherNow - lastWeather_), glm::vec4(0.01f)));
+        if (dirty) {
+            rebuildPasses_      = prevValid_ ? 2 : 2;
+            forceRebuild_       = false;
+            lastChunksHash_     = chunksHash;
+            lastAtmoAvailable_  = atmoAvailable_;
+            lastInjectFoliage_  = injectFoliage_;
+            lastFoliageDensity_ = foliageDensity_;
+            lastProgGen_        = progGen;
+            lastMipGen_         = mipGen;
+            lastSunDir_         = sunNow;
+            lastMoonDir_        = moonNow;
+            lastSunLum_         = sunLum;
+            lastMoonLum_        = moonLum;
+            lastWeather_        = weatherNow;
+        }
+
+        const glm::ivec3 activeAbs = (rebuildPasses_ > 0 || !prevValid_) ? currentAbs_ : prevAbs_;
+        const glm::vec3  extent(kDimX * kVoxelSize, kDimY * kVoxelSize, kDimZ * kVoxelSize);
+        params_.gridMin       = glm::vec4(glm::vec3(activeAbs - originVox) * kVoxelSize, kVoxelSize);
         params_.gridExtent    = glm::vec4(extent, 1.0f);
         params_.gridInvExtent = glm::vec4(1.0f / extent, kMaxConeLod);
         params_.prevGridMin   = glm::vec4(glm::vec3(prevAbs_ - originVox) * kVoxelSize, prevValid_ ? 1.0f : 0.0f);
@@ -167,11 +223,17 @@ public:
             return;
         }
 
-        gpu::Texture3D& grid = grids_[current_];
-        gpu::Texture3D& prev = grids_[current_ ^ 1];
-
         ubo_.UploadObject(params_);
         ubo_.BindBase(GL_UNIFORM_BUFFER, env::bind::ubo::VoxelParams);
+
+        if (rebuildPasses_ <= 0 && prevValid_) {
+            rebuiltThisFrame_ = false;
+            return;
+        }
+        rebuiltThisFrame_ = true;
+
+        gpu::Texture3D& grid = grids_[current_];
+        gpu::Texture3D& prev = grids_[current_ ^ 1];
 
         grid.Clear(GL_RGBA, GL_FLOAT, nullptr);  // niveau 0 ; les mips sont régénérés à la fin
         prev.BindUnit(env::bind::tex::VoxelGrid);
@@ -270,6 +332,7 @@ public:
         prevAbs_   = currentAbs_;
         prevValid_ = true;
         current_ ^= 1;
+        if (rebuildPasses_ > 0) --rebuildPasses_;
     }
 
     void Shutdown(EngineContext& ctx) override {
@@ -288,7 +351,11 @@ public:
         ImGui::Text("Origine (voxels absolus) : %d, %d, %d", currentAbs_.x, currentAbs_.y, currentAbs_.z);
         ImGui::Text("Altitudes couvertes : %.0f m -> %.0f m", currentAbs_.y * kVoxelSize,
                     (currentAbs_.y + kDimY) * kVoxelSize);
-        ImGui::Text("Chunks injectes : %d   instances traitees : %u", chunksInjected_, instancesDispatched_);
+        ImGui::Text("Chunks injectes : %d   instances traitees : %u   (%s)", chunksInjected_, instancesDispatched_,
+                    rebuiltThisFrame_ ? "reconstruit" : "en cache");
+        ImGui::Checkbox("Cache VXGI (recalcul si changement)", &cacheEnabled_);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Forcer recalcul")) forceRebuild_ = true;
         ImGui::SeparatorText("Vegetation");
         ImGui::Checkbox("Injecter la vegetation", &injectFoliage_);
         ImGui::SliderFloat("Densite (opacite)", &foliageDensity_, 0.0f, 4.0f);
@@ -354,12 +421,27 @@ private:
     VoxelParamsUBO         params_{};
     glm::ivec3             currentAbs_{0};
     glm::ivec3             prevAbs_{0};
-    bool                   prevValid_     = false;
-    bool                   atmoAvailable_ = false;
+    bool                   prevValid_          = false;
+    bool                   atmoAvailable_      = false;
+    bool                   rebuiltThisFrame_   = false;
+    bool                   forceRebuild_       = false;
+    int                    rebuildPasses_      = 2;
+    std::uint64_t          lastChunksHash_     = 0;
+    bool                   lastAtmoAvailable_  = false;
+    bool                   lastInjectFoliage_  = true;
+    float                  lastFoliageDensity_ = -1.0f;
+    std::uint32_t          lastProgGen_        = 0;
+    std::uint32_t          lastMipGen_         = 0;
+    glm::vec3              lastSunDir_{0.0f};
+    glm::vec3              lastMoonDir_{0.0f};
+    float                  lastSunLum_         = -1.0f;
+    float                  lastMoonLum_        = -1.0f;
+    glm::vec4              lastWeather_{-1.0f};
     int                    chunksInjected_      = 0;
     std::uint32_t          instancesDispatched_ = 0;
 
     // Paramètres (OnGui)
+    bool  cacheEnabled_   = true;
     bool  injectFoliage_  = true;
     float foliageDensity_ = 1.0f;
 };

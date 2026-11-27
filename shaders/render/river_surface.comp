@@ -128,6 +128,8 @@ void main() {
     }
 
     barrier();
-    if (gl_LocalInvocationIndex == 0u && sGroupHasWater != 0u)
-        riverData[uCmdVec4Idx].y = uintBitsToFloat(1u);
+    if (gl_LocalInvocationIndex == 0u && sGroupHasWater != 0u) {
+        riverData[uCmdVec4Idx].y      = uintBitsToFloat(1u);
+        riverData[uCmdVec4Idx + 2u].y = uintBitsToFloat(1u);
+    }
 }

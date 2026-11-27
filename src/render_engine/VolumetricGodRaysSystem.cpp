@@ -887,7 +887,7 @@ private:
     float godRayIntensity_  = 1.0f;
     float godRayMaxDistance_= 2500.0f;
     float godRayAnisotropy_ = 0.8f;
-    int   godRaySteps_      = 32;
+    int   godRaySteps_      = 20;
     float godRaySkyShafts_  = 1.0f;
     float exposureEv_       = 13.0f;  // EV100 manuel (journée ensoleillée ≈ 15)
     bool  autoExposure_     = true;

@@ -47,10 +47,14 @@ uniform int uKind;  // 0 = océan, 1 = rivières / marais
 const float kWaterF0 = 0.02;
 
 // --- Pentes des cartes de l'océan ---------------------------------------------------------------
-// Somme des cascades [c0, c1] : (∂h/∂x, ∂h/∂z, λ∂Dx/∂x, λ∂Dz/∂z), filtrage matériel (mips + anisotrope).
-vec4 OceanSlopes(vec2 xz, int c0, int c1) {
+// Somme des cascades [c0, c1] : (∂h/∂x, ∂h/∂z, λ∂Dx/∂x, λ∂Dz/∂z), filtrage matériel (mips + anisotrope)
+// avec gradients explicites (textureGrad : valide après un discard anticipé sur les rivières).
+vec4 OceanSlopes(vec2 xz, vec2 dx0, vec2 dy0, int c0, int c1) {
     vec4 s = vec4(0.0);
-    for (int c = c0; c <= c1; ++c) s += texture(uOceanMaps, OceanUv(xz, c, OCEAN_CASCADES));
+    for (int c = c0; c <= c1; ++c) {
+        float invL = 1.0 / uWater.cascadeSize[c];
+        s += textureGrad(uOceanMaps, OceanUv(xz, c, OCEAN_CASCADES), dx0 * invL, dy0 * invL);
+    }
     return s;
 }
 
@@ -59,12 +63,14 @@ vec3 SlopesToNormal(vec4 s, float strength) {
     return normalize(vec3(-g.x, 1.0, -g.y));
 }
 
-float OceanFoam(vec2 xz) {
+float OceanFoam(vec2 xz, vec2 dx0, vec2 dy0) {
     float f = 0.0;
     // Moutons portés par les grandes vagues : la cascade fine ne déferle pas, l'intermédiaire à peine
     // (sinon un semis uniforme de petits points blancs).
-    f += texture(uOceanMaps, OceanUv(xz, 0, 0)).w;
-    f += 0.3 * texture(uOceanMaps, OceanUv(xz, 1, 0)).w;
+    float invL0 = 1.0 / uWater.cascadeSize[0];
+    float invL1 = 1.0 / uWater.cascadeSize[1];
+    f += textureGrad(uOceanMaps, OceanUv(xz, 0, 0), dx0 * invL0, dy0 * invL0).w;
+    f += 0.3 * textureGrad(uOceanMaps, OceanUv(xz, 1, 0), dx0 * invL1, dy0 * invL1).w;
     return clamp(f, 0.0, 1.0);
 }
 
@@ -88,8 +94,8 @@ float OceanFilteredSlopeVariance(float footprint, int c0, int c1) {
 // manquer les détails fins d'un pixel à l'autre (scintillement) ; le raffinement binaire corrige la
 // position des impacts trouvés. Longueur du rayon proportionnelle à la distance de l'eau.
 vec4 TraceScreenReflection(vec3 P, vec3 R, float distToCam) {
-    const int kRefine = 4;
-    int   steps   = int(mix(32.0, 12.0, clamp(distToCam / 400.0, 0.0, 1.0)));
+    const int kRefine = 3;
+    int   steps   = int(mix(24.0, 10.0, clamp(distToCam / 400.0, 0.0, 1.0)));
     float maxDist = clamp(2.0 * distToCam + 40.0, 60.0, 600.0);
     vec4  c0 = uEnv.viewProj * vec4(P, 1.0);
     vec4  c1 = uEnv.viewProj * vec4(P + R * maxDist, 1.0);
@@ -136,7 +142,7 @@ float WaterVoxelShadow(vec3 P, vec3 L, float noise) {
     if (!uVoxelShadows || !VoxelGridUsable(P)) return 1.0;
     float voxel = VoxelSize();
     return VoxelConeVisibility(uVoxel.uGridMin.xyz, P + vec3(0.0, 0.5 * voxel, 0.0), L,
-                               max(uVoxelShadowSoftness, 0.07), (1.35 + 0.5 * noise) * voxel, 2000.0, 32, 0.75);
+                               max(uVoxelShadowSoftness, 0.07), (1.35 + 0.5 * noise) * voxel, 2000.0, 12, 1.0);
 }
 
 // Coefficients du milieu (1/m) : eau claire + turbidité (marais), sédiments en rivière.
@@ -155,24 +161,29 @@ void main() {
     // --- Grandeurs à dérivées (avant tout branchement / rejet) ---
     vec3  P         = fsIn.worldPos;
     vec2  screenUv  = gl_FragCoord.xy * uEnv.viewportSize.zw;
-    float footprint = length(fwidth(fsIn.x0));
-    float footMax   = max(length(dFdx(fsIn.x0)), length(dFdy(fsIn.x0)));  // grand axe (incidence rasante)
+    vec2  dx0       = dFdx(fsIn.x0);
+    vec2  dy0       = dFdy(fsIn.x0);
+    float footprint = length(abs(dx0) + abs(dy0));
+    float footMax   = max(length(dx0), length(dy0));  // grand axe (incidence rasante)
     float t         = envTime();
+
+    // --- Rejet anticipé hors de l'eau (rivières / marais) : évite les lectures FFT / pluie inutiles ---
+    if (uKind == 1 && (fsIn.valid < 0.5 || fsIn.waterSdf > uWater.riverParams.z || P.y <= envOceanLevel())) discard;
 
     // --- Normale ---
     vec3 N;
     float foam = 0.0;
     if (uKind == 0) {
-        N    = SlopesToNormal(OceanSlopes(fsIn.x0, 0, OCEAN_CASCADES - 1), 1.0);
-        foam = OceanFoam(fsIn.x0);
+        N    = SlopesToNormal(OceanSlopes(fsIn.x0, dx0, dy0, 0, OCEAN_CASCADES - 1), 1.0);
+        foam = OceanFoam(fsIn.x0, dx0, dy0);
     } else {
         // Flow map : deux phases décalées d'une demi-période, mélangées pour masquer la remise à zéro.
         const float kPeriod = 2.0;
         vec2  flow  = fsIn.flow * uWater.riverParams.x;
         float ph0   = fract(t / kPeriod), ph1 = fract(t / kPeriod + 0.5);
         float blend = abs(2.0 * ph0 - 1.0);
-        vec4  s0 = OceanSlopes(fsIn.x0 - flow * ph0 * kPeriod, 1, 2);
-        vec4  s1 = OceanSlopes(fsIn.x0 - flow * ph1 * kPeriod + vec2(3.7, 1.9), 1, 2);
+        vec4  s0 = OceanSlopes(fsIn.x0 - flow * ph0 * kPeriod, dx0, dy0, 1, 2);
+        vec4  s1 = OceanSlopes(fsIn.x0 - flow * ph1 * kPeriod + vec2(3.7, 1.9), dx0, dy0, 1, 2);
         float speed    = length(flow);
         float strength = uWater.riverParams.y * mix(0.35, 1.0, smoothstep(0.1, 1.5, speed)) * mix(1.0, 0.4, fsIn.marsh);
         N = SlopesToNormal(mix(s0, s1, blend), strength);
@@ -189,12 +200,13 @@ void main() {
             N = normalize(N - vec3(g.x, 0.0, g.y) * 0.5 * resolved);
         }
     }
-    // Anti-crénelage spéculaire (Tokuyoshi & Kaplanyan 2019) : variation de la normale entre pixels.
-    vec3  dndx    = dFdx(N), dndy = dFdy(N);
-    float kernel2 = min(2.0 * kSpecAaSigma2 * (dot(dndx, dndx) + dot(dndy, dndy)), kSpecAaKappa);
-
-    // --- Rejet hors de l'eau (rivières / marais) ou sous le niveau de l'océan ---
-    if (uKind == 1 && (fsIn.valid < 0.5 || fsIn.waterSdf > uWater.riverParams.z || P.y <= envOceanLevel())) discard;
+    // Anti-crénelage spéculaire (Tokuyoshi & Kaplanyan 2019) : océan uniquement (rivières déjà filtrées
+    // par OceanFilteredSlopeVariance ; évite les dérivées sur les bords rejetés).
+    float kernel2 = 0.0;
+    if (uKind == 0) {
+        vec3 dndx = dFdx(N), dndy = dFdy(N);
+        kernel2 = min(2.0 * kSpecAaSigma2 * (dot(dndx, dndx) + dot(dndy, dndy)), kSpecAaKappa);
+    }
 
     vec3  cam    = envCameraPosition();
     vec3  toCam  = cam - P;
@@ -264,11 +276,12 @@ void main() {
             ssrConf = ssr.a * (1.0 - smoothstep(300.0, 400.0, dist)) * (1.0 - smoothstep(0.45, 0.6, Rs.y));
         }
     }
-    // 2) Relief hors écran (collines, rives lointaines) : cône VXGI, inutile si le SSR a trouvé le reflet.
-    if (ssrConf < 0.98 && VoxelGridUsable(P)) {
+    // 2) Relief hors écran (collines, rives lointaines) : cône VXGI (LOD >= 1 -> cache L2) jusqu'à 600 m.
+    if (ssrConf < 0.90 && dist < 600.0 && VoxelGridUsable(P)) {
         float voxel = VoxelSize();
-        vec4  cone  = VoxelConeRadiance(uVoxel.uGridMin.xyz, P, R, 0.08, voxel, 1500.0, 14);
-        env = cone.rgb * uGiIntensity + (1.0 - cone.a) * env;
+        vec4  cone  = VoxelConeRadiance(uVoxel.uGridMin.xyz, P, R, 0.09, 1.5 * voxel, 900.0, 6, 1.0);
+        float wFade = 1.0 - smoothstep(400.0, 600.0, dist);
+        env = mix(env, cone.rgb * uGiIntensity + (1.0 - cone.a) * env, wFade);
     }
     env = mix(env, ssrRgb, ssrConf);
     env *= uIblScale;

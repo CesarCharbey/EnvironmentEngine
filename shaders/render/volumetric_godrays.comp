@@ -41,7 +41,7 @@ uniform bool  uHistoryValid;
 
 const float kHazeScaleHeight = 1200.0;  // m : brume de la couche limite
 const float kHazeTop         = 3000.0;  // m : au-delà, plus de brume utile
-const int   kHazeSteps       = 24;
+const int   kHazeSteps       = 14;
 
 // Visibilité moyenne de l'astre dans la brume le long d'un rayon de ciel (1 = aucun nuage ne l'ombre).
 float HazeVisibility(vec3 cam, vec3 dir, vec3 L, float jitter) {
@@ -58,7 +58,7 @@ float HazeVisibility(vec3 cam, vec3 dir, vec3 L, float jitter) {
     return wsum > 0.0 ? acc / wsum : 1.0;
 }
 
-const int kShadowPoints = 12;
+const int kShadowPoints = 6;
 
 void StoreGodRays(ivec2 id, vec2 uv, vec3 dir, float depth, bool sky, vec4 cur) {
     if (uHistoryValid) {
@@ -131,7 +131,7 @@ void main() {
     for (int k = 0; k < kShadowPoints; ++k) {
         vec3 p = cam + dir * (dist * (float(k) + jitter) / float(kShadowPoints));
         terrainVis[k] = voxel && VoxelUvwInside(VoxelUvw(p, uVoxel.uGridMin.xyz))
-                      ? VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.08, 0.5 * VoxelSize(), 1500.0, 16, 0.85) : 1.0;
+                      ? VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.08, 0.5 * VoxelSize(), 1500.0, 8, 1.0) : 1.0;
     }
 
     float dt      = dist / float(uSteps);

@@ -78,7 +78,7 @@ vec3 InjectedIrradiance(vec3 p, vec3 n, float wrap) {
     vec3  sunDir = normalize(envSunDirection());
     float sunNdl = (dot(n, sunDir) + wrap) / (1.0 + wrap);
     if (sunDir.y > -0.02 && sunNdl > 0.0) {
-        float vis = prevValid ? VoxelConeVisibility(prevMin, origin, sunDir, 0.04, 0.75 * voxel, 2000.0, 40) : 1.0;
+        float vis = prevValid ? VoxelConeVisibility(prevMin, origin, sunDir, 0.04, 0.75 * voxel, 2000.0, 24) : 1.0;
         E += SunIlluminanceTOA() * LightTransmittance(p.y, sunDir, SunAngularRadius()) * sunNdl * vis;
     }
 
@@ -86,7 +86,7 @@ vec3 InjectedIrradiance(vec3 p, vec3 n, float wrap) {
     vec3  moonDir = normalize(envMoonDirection());
     float moonNdl = (dot(n, moonDir) + wrap) / (1.0 + wrap);
     if (sunDir.y < 0.05 && moonDir.y > -0.02 && moonNdl > 0.0) {
-        float vis = prevValid ? VoxelConeVisibility(prevMin, origin, moonDir, 0.04, 0.75 * voxel, 2000.0, 40) : 1.0;
+        float vis = prevValid ? VoxelConeVisibility(prevMin, origin, moonDir, 0.04, 0.75 * voxel, 2000.0, 24) : 1.0;
         E += MoonIlluminanceTOA() * LightTransmittance(p.y, moonDir, MoonAngularRadius()) * moonNdl * vis;
     }
 
