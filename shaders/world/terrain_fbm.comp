@@ -1,0 +1,224 @@
+#version 460 core
+// shaders/world/terrain_fbm.comp
+
+#include "common/global_ubo.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = IMG_HeightNormalOut, rgba32f) writeonly uniform image2D uHeightNormalOut;
+layout(binding = IMG_BiomeHydroOut,   rgba16f) writeonly uniform image2D uBiomeHydroOut;
+
+layout(location = 0)  uniform ivec2 uChunkCoord;
+layout(location = 1)  uniform float uContinentScale;
+layout(location = 2)  uniform float uMountainScale;
+layout(location = 3)  uniform float uHeightAmplitude;
+layout(location = 4)  uniform int   uOctaves;
+layout(location = 5)  uniform float uLacunarity;
+layout(location = 6)  uniform float uGain;
+layout(location = 7)  uniform float uDomainWarp;
+layout(location = 8)  uniform int   uSeed;
+layout(location = 9)  uniform float uMoistureScale;
+layout(location = 10) uniform float uOceanLevel;
+layout(location = 11) uniform float uSwampLevel;
+layout(location = 12) uniform float uBeachMaxHeight;
+layout(location = 13) uniform float uHighMountainHeight;
+layout(location = 14) uniform float uRiverHalfWidth;
+layout(location = 15) uniform float uRiverDepth;
+layout(location = 16) uniform float uBankWidth;
+layout(location = 17) uniform float uMarshSlopeThreshold;
+
+// Cache partagé 16x16 + 1 texel de bordure de chaque côté pour les normales
+shared float sH[18][18];
+
+const int B_OCEAN        = 0;
+const int B_BEACH        = 1;
+const int B_DESERT       = 2;
+const int B_PLAINS       = 3;
+const int B_FOREST       = 4;
+const int B_JUNGLE       = 5;
+const int B_SWAMP        = 6;
+const int B_HIGHMOUNTAIN = 7;
+
+vec2 hash22(vec2 p) {
+    p = p + float(uSeed) * 0.1337;
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy) * 2.0 - 1.0;
+}
+
+float perlin(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(
+        mix(dot(hash22(i + vec2(0.0, 0.0)), f - vec2(0.0, 0.0)),
+            dot(hash22(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+        mix(dot(hash22(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)),
+            dot(hash22(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x),
+        u.y
+    );
+}
+
+// Brique Infinigen B : Voronoi Rocks (F1, F2 - F1)
+vec2 voronoiF1F2(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float f1 = 8.0;
+    float f2 = 8.0;
+
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            vec2 neighbor = vec2(float(x), float(y));
+            vec2 point = hash22(i + neighbor) * 0.5 + 0.5;
+            float d = length(neighbor + point - f);
+            if (d < f1) {
+                f2 = f1;
+                f1 = d;
+            } else if (d < f2) {
+                f2 = d;
+            }
+        }
+    }
+    return vec2(f1, f2 - f1);
+}
+
+// Brique Infinigen A : Domain Warping (Wind-Eroded Rocks)
+vec2 warpCoords(vec2 worldPos) {
+    if (uDomainWarp <= 0.001) return worldPos;
+    vec2 q = worldPos / uMountainScale;
+    vec2 offset = vec2(
+        perlin(q + vec2(5.2, 1.3)),
+        perlin(q + vec2(1.7, 9.2))
+    );
+    return worldPos + offset * uDomainWarp;
+}
+
+float getBaseTerrainHeight(vec2 worldPos) {
+    float continent = perlin(worldPos / uContinentScale) * 0.5 + 0.5;
+    float mountainMask = smoothstep(0.35, 0.78, continent);
+    float baseElevation = pow(continent, 1.8) * uHeightAmplitude;
+
+    vec2 warpedPos = warpCoords(worldPos);
+    vec2 freq = warpedPos / uMountainScale;
+    float amplitude = uHeightAmplitude * 0.45;
+    float detailHeight = 0.0;
+
+    for (int i = 0; i < uOctaves; i++) {
+        float n = perlin(freq);
+        float ridgedN = 1.0 - abs(n);
+        ridgedN = (ridgedN * ridgedN) * 2.0 - 1.0;
+
+        detailHeight += mix(n * 0.25, ridgedN, mountainMask) * amplitude;
+        freq *= uLacunarity;
+        amplitude *= uGain;
+    }
+
+    float h = baseElevation + detailHeight - (uHeightAmplitude * 0.35);
+
+    if (mountainMask > 0.05) {
+        vec2 v = voronoiF1F2(warpedPos / (uMountainScale * 0.18));
+        float rockBlocks = smoothstep(0.02, 0.25, v.y);
+        h += (rockBlocks - 0.5) * (uHeightAmplitude * 0.06) * mountainMask;
+    }
+    return h;
+}
+
+// SDF rivière réellement signée : < 0 dans le lit, 0 sur la berge, > 0 dehors
+float getSignedRiverSDF(vec2 worldPos) {
+    float n = perlin(worldPos / 3000.0) + perlin(worldPos / 600.0) * 0.15;
+    float rawDist = abs(n) * 3000.0;
+    return clamp(rawDist - uRiverHalfWidth, -RIVER_SDF_FAR, RIVER_SDF_FAR);
+}
+
+// Hauteur finale (terrain + creusement rivière) en une seule évaluation
+float evalFinalHeight(vec2 worldPos, out float outRiverSDF) {
+    float h = getBaseTerrainHeight(worldPos);
+    float sdf = getSignedRiverSDF(worldPos);
+
+    // Masque : la rivière naît sous la haute montagne et s'aplatit en rejoignant l'océan
+    float birthMask = 1.0 - smoothstep(uHighMountainHeight * 0.6, uHighMountainHeight, h);
+    float oceanFade = smoothstep(uOceanLevel - 2.0, uOceanLevel + 5.0, h);
+    float intensity = birthMask * oceanFade;
+
+    if (sdf < uBankWidth && intensity > 0.0) {
+        // 1.0 au fond du lit (sdf <= 0), transition douce sur [0, uBankWidth]
+        float carve = 1.0 - smoothstep(0.0, max(uBankWidth, 0.1), sdf);
+        h -= uRiverDepth * carve * intensity;
+    }
+
+    outRiverSDF = (intensity < 0.05) ? RIVER_SDF_FAR : sdf;
+    return h;
+}
+
+float getMoisture(vec2 worldPos) {
+    vec2 freq = worldPos / uMoistureScale;
+    float noise = perlin(freq) + 0.5 * perlin(freq * 2.0);
+    return clamp(noise * 0.5 + 0.5, 0.0, 1.0);
+}
+
+vec2 texelToWorld(ivec2 texel) {
+    float texelSize = CHUNK_SIZE_METERS / float(CHUNK_TEX_RESOLUTION);
+    return vec2(uChunkCoord) * CHUNK_SIZE_METERS + (vec2(texel) + 0.5) * texelSize;
+}
+
+void main() {
+    ivec2 texelCoord = ivec2(gl_GlobalInvocationID.xy);
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+
+    // 1. Évaluation du texel courant (1 seul appel)
+    vec2 worldPos = texelToWorld(texelCoord);
+    float riverSDF;
+    float h = evalFinalHeight(worldPos, riverSDF);
+    sH[ly + 1][lx + 1] = h;
+
+    // 2. Remplissage de la bordure de 1 texel autour du workgroup (4 côtés)
+    float dummySdf;
+    if (lx == 0u)  sH[ly + 1][0]  = evalFinalHeight(texelToWorld(texelCoord + ivec2(-1,  0)), dummySdf);
+    if (lx == 15u) sH[ly + 1][17] = evalFinalHeight(texelToWorld(texelCoord + ivec2( 1,  0)), dummySdf);
+    if (ly == 0u)  sH[0][lx + 1]  = evalFinalHeight(texelToWorld(texelCoord + ivec2( 0, -1)), dummySdf);
+    if (ly == 15u) sH[17][lx + 1] = evalFinalHeight(texelToWorld(texelCoord + ivec2( 0,  1)), dummySdf);
+
+    // Synchronisation du workgroup avant lecture des voisins
+    barrier();
+
+    if (texelCoord.x >= CHUNK_TEX_RESOLUTION || texelCoord.y >= CHUNK_TEX_RESOLUTION) return;
+
+    // 3. Normale par différences centrales sur le cache partagé (zéro bruit supplémentaire)
+    float eps = CHUNK_SIZE_METERS / float(CHUNK_TEX_RESOLUTION);
+    float hL = sH[ly + 1][lx];
+    float hR = sH[ly + 1][lx + 2];
+    float hD = sH[ly][lx + 1];
+    float hU = sH[ly + 2][lx + 1];
+    vec3 normal = normalize(vec3(hL - hR, 2.0 * eps, hD - hU));
+
+    imageStore(uHeightNormalOut, texelCoord, vec4(h, normal));
+
+    // 4. Biomes complets + Marais
+    float moisture = getMoisture(worldPos);
+    if (riverSDF < uBankWidth * 2.0) {
+        moisture += 0.35 * (1.0 - clamp(riverSDF / (uBankWidth * 2.0), 0.0, 1.0));
+    }
+    moisture = clamp(moisture, 0.0, 1.0);
+
+    float slope = 1.0 - normal.y; // 0 = plat, 1 = vertical
+    float marshSDF = RIVER_SDF_FAR;
+    int biome = B_PLAINS;
+
+    if (h < uOceanLevel) {
+        biome = B_OCEAN;
+    } else if (h < uOceanLevel + uBeachMaxHeight) {
+        biome = B_BEACH;
+    } else if (h > uHighMountainHeight) {
+        biome = B_HIGHMOUNTAIN;
+    } else if (h < uSwampLevel && slope < uMarshSlopeThreshold && moisture > 0.5) {
+        biome = B_SWAMP;
+        marshSDF = (h - uSwampLevel); // < 0 dans le marais
+    } else {
+        if (moisture > 0.75)      biome = B_JUNGLE;
+        else if (moisture > 0.55) biome = B_FOREST;
+        else if (moisture < 0.35) biome = B_DESERT;
+    }
+
+    imageStore(uBiomeHydroOut, texelCoord, vec4(float(biome), riverSDF, marshSDF, moisture));
+}
