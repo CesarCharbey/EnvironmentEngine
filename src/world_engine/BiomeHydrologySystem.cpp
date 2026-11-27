@@ -211,7 +211,7 @@ private:
     std::uint32_t       targetGeneration_ = 1;
 
     float oceanLevel_          = 0.0f;
-    float swampLevel_          = 8.4f;
+    float swampLevel_          = 1.0f;
     int   seed_                = 1337;
     float continentScale_      = 6000.0f;
     float mountainScale_       = 900.0f;
