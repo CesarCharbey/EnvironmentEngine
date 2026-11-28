@@ -63,7 +63,7 @@ public:
     bool IsActive() const noexcept { return generated_; }
 
     bool          useMockWorld  = true;
-    bool          drawPreview   = true;
+    bool          drawPreview   = false;  ///< désactivé par défaut (activable en UI pour le debug)
     bool          drawTerrain   = true;
     bool          drawInstances = true;
     bool          wireframe     = false;
