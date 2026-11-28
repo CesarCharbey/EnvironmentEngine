@@ -39,6 +39,7 @@
 #include "core/gpu/ShaderManager.hpp"
 #include "core/gpu/Framebuffer.hpp"
 #include "core/gpu/GpuBuffer.hpp"
+#include "render_engine/LightingShared.hpp"
 
 namespace env::render {
 namespace {
@@ -176,8 +177,10 @@ public:
         const auto      planes = FrustumPlanes(ctx.environment.viewProj);
         const glm::vec3 cam    = glm::vec3(ctx.environment.cameraPosition);
 
+        const bool skipMock = SharedLighting().hideMockWhenWorldReady && HasReadyWorldChunks(ctx.registry);
         auto view = ctx.registry.view<const ChunkCoordComponent, const ChunkStateComponent, const ChunkGpuResources>();
         for (const entt::entity e : view) {
+            if (skipMock && ctx.registry.all_of<MockChunkTag>(e)) continue;
             const auto& [coord, state, res] = view.get(e);
             if (state.state == ChunkState::Evicting) continue;
             if ((state.readyMask & ChunkReady::HeightNormal) == 0 || res.heightNormalTex == 0) continue;
@@ -305,6 +308,7 @@ public:
         ImGui::Checkbox("Vegetation", &drawFoliage_);
         ImGui::SameLine();
         ImGui::Checkbox("Wireframe", &wireframe_);
+        ImGui::Checkbox("Masquer chunk mock si Dev 1 actif", &SharedLighting().hideMockWhenWorldReady);
         ImGui::SliderInt("Resolution grille terrain", &terrainGridResolution_, 16, 256);
         ImGui::SetItemTooltip("Quads par cote au LOD 0 (256 = 1 quad par texel). LOD n = resolution / 2^n.");
         ImGui::DragFloat3("Distances LOD terrain", lodDistances_, 4.0f, 16.0f, 8192.0f, "%.0f m");

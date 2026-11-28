@@ -16,6 +16,7 @@
 
 #include <glad/glad.h>
 #include <glm/glm.hpp>
+#include <entt/entt.hpp>
 
 #include "contracts/GpuBindings.hpp"
 #include "contracts/WorldContracts.hpp"
@@ -97,6 +98,7 @@ struct LightingShared {
     bool      focusAvailable       = false;
     glm::vec3 focusChunkOrigin{0.0f};
     bool      dataView             = false;  ///< vue de debug « données brutes » : pas d'exposition
+    bool      hideMockWhenWorldReady = true; ///< masque le chunk mock (0,0) dès que Dev 1 fournit de vrais chunks
 
     // --- Synchronisation éclairage HDR <-> tonemap (index de frame) ---
     /// Dernière frame où la passe de tonemap a tourné (son Render).
@@ -109,6 +111,21 @@ struct LightingShared {
 inline LightingShared& SharedLighting() {
     static LightingShared shared;
     return shared;
+}
+
+/// true si au moins un vrai chunk (hors MockChunkTag) est prêt pour le rendu (HeightNormal valide).
+inline bool HasReadyWorldChunks(const entt::registry& registry) {
+    auto view = registry.view<const ChunkCoordComponent, const ChunkStateComponent, const ChunkGpuResources>(
+        entt::exclude<MockChunkTag>);
+    for (const entt::entity e : view) {
+        const auto& state = view.get<const ChunkStateComponent>(e);
+        const auto& res   = view.get<const ChunkGpuResources>(e);
+        if (state.state != ChunkState::Evicting && (state.readyMask & ChunkReady::HeightNormal) != 0 &&
+            res.heightNormalTex != 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// true si l'éclairage a écrit scene.color en HDR linéaire pendant la frame `frame`.

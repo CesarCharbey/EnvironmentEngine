@@ -43,6 +43,7 @@
 #include "core/gpu/ShaderManager.hpp"
 #include "core/gpu/Texture3D.hpp"
 #include "core/gpu/GpuBuffer.hpp"
+#include "render_engine/LightingShared.hpp"
 
 namespace env::render {
 namespace {
@@ -128,9 +129,11 @@ public:
             x *= 0x94d049bb133111ebULL;
             return x ^ (x >> 31);
         };
+        const bool skipMock = SharedLighting().hideMockWhenWorldReady && HasReadyWorldChunks(ctx.registry);
         float hMin = std::numeric_limits<float>::max(), hMax = std::numeric_limits<float>::lowest();
         auto view = ctx.registry.view<const ChunkCoordComponent, const ChunkStateComponent, const ChunkGpuResources>();
         for (const entt::entity e : view) {
+            if (skipMock && ctx.registry.all_of<MockChunkTag>(e)) continue;
             const auto& [coord, state, res] = view.get(e);
             if (state.state == ChunkState::Evicting) continue;
             if ((state.readyMask & ChunkReady::HeightNormal) == 0 || res.heightNormalTex == 0) continue;

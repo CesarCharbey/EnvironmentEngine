@@ -85,9 +85,11 @@ public:
         // (fonctionne pour le mock comme pour les vrais chunks de Dev 1).
         sh.focusAvailable = false;
         if (bb.IsPublished(env::bb::WorldFocusHeightNormal)) {
-            const GLuint focusId = bb.GetTexture(env::bb::WorldFocusHeightNormal).id;
+            const GLuint focusId  = bb.GetTexture(env::bb::WorldFocusHeightNormal).id;
+            const bool   skipMock = sh.hideMockWhenWorldReady && HasReadyWorldChunks(ctx.registry);
             auto view = ctx.registry.view<const ChunkCoordComponent, const ChunkStateComponent, const ChunkGpuResources>();
             for (const entt::entity e : view) {
+                if (skipMock && ctx.registry.all_of<MockChunkTag>(e)) continue;
                 const auto& [coord, state, res] = view.get(e);
                 if (state.state == ChunkState::Evicting || res.heightNormalTex != focusId) continue;
                 sh.focusChunkOrigin = ChunkOriginRelative(coord.coord, ctx.renderOriginChunk);

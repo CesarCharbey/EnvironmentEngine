@@ -555,9 +555,11 @@ private:
             float        dist;
             glm::vec3    offset;
         };
+        const bool skipMock = SharedLighting().hideMockWhenWorldReady && HasReadyWorldChunks(ctx.registry);
         std::vector<Candidate> wanted;
         auto view = ctx.registry.view<const ChunkCoordComponent, const ChunkStateComponent, const ChunkGpuResources>();
         for (const entt::entity e : view) {
+            if (skipMock && ctx.registry.all_of<MockChunkTag>(e)) continue;
             const auto& [coord, state, res] = view.get(e);
             const bool ready = state.state != ChunkState::Evicting && (state.readyMask & ChunkReady::HeightNormal) &&
                                (state.readyMask & ChunkReady::BiomeHydro) && res.heightNormalTex != 0 &&
