@@ -142,7 +142,7 @@ float WaterVoxelShadow(vec3 P, vec3 L, float noise) {
     if (!uVoxelShadows || !VoxelGridUsable(P)) return 1.0;
     float voxel = VoxelSize();
     return VoxelConeVisibility(uVoxel.uGridMin.xyz, P + vec3(0.0, 0.5 * voxel, 0.0), L,
-                               max(uVoxelShadowSoftness, 0.07), (1.35 + 0.5 * noise) * voxel, 2000.0, 12, 1.0);
+                               max(uVoxelShadowSoftness, 0.07), (1.35 + 0.5 * noise) * voxel, 2000.0, 20, 1.0);
 }
 
 // Coefficients du milieu (1/m) : eau claire + turbidité (marais), sédiments en rivière.
@@ -279,7 +279,7 @@ void main() {
     // 2) Relief hors écran (collines, rives lointaines) : cône VXGI (LOD >= 1 -> cache L2) jusqu'à 600 m.
     if (ssrConf < 0.90 && dist < 600.0 && VoxelGridUsable(P)) {
         float voxel = VoxelSize();
-        vec4  cone  = VoxelConeRadiance(uVoxel.uGridMin.xyz, P, R, 0.09, 1.5 * voxel, 900.0, 6, 1.0);
+        vec4  cone  = VoxelConeRadiance(uVoxel.uGridMin.xyz, P, R, 0.09, 1.5 * voxel, 900.0, 12, 1.0);
         float wFade = 1.0 - smoothstep(400.0, 600.0, dist);
         env = mix(env, cone.rgb * uGiIntensity + (1.0 - cone.a) * env, wFade);
     }

@@ -41,8 +41,9 @@ float VoxelConeVisibility(vec3 gridMin, vec3 origin, vec3 dir, float tanHalf, fl
         if (t > maxDist || occ > 0.96) break;
         vec3 uvw = VoxelUvw(origin + dir * t, gridMin);
         if (!VoxelUvwInside(uvw)) break;
-        // Diamètre effectif aligné sur minLod (à minLod >= 1, évite le LOD 0 de 32 Mo -> cache L2).
-        float diam = max(max(minDiam, 2.0 * tanHalf * t), minDiam + 0.10 * t);
+        // Diamètre effectif aligné sur minLod (à minLod >= 1, évite le LOD 0 de 32 Mo -> cache L2) ;
+        // sous 80 m la pénombre respecte tanHalf, puis s'élargit progressivement pour atteindre ~1,2 km.
+        float diam = max(minDiam, 2.0 * tanHalf * t + 0.06 * max(t - 80.0, 0.0));
         float lod  = clamp(log2(diam / voxel), minLod, maxLod);
         float a    = clamp(textureLod(uVoxelGrid, uvw, lod).a, 0.0, 0.999);
         if (a <= 1e-4) {

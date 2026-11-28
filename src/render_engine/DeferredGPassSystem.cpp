@@ -246,6 +246,9 @@ public:
         if (drawTerrain_ && terrainProg_->IsValid()) {
             terrainProg_->Use();
             terrainProg_->Set("uSkirtDepth", skirtDepth_);
+            const GLuint tPid             = terrainProg_->Id();
+            const GLint  locTerrainOffset = glGetUniformLocation(tPid, "uChunkOffset");
+            int          boundLod         = -1;
             for (const DrawItem& item : drawList_) {
                 const ChunkGpuResources* res = Resources(ctx, item);
                 if (!res) continue;
@@ -253,10 +256,13 @@ public:
                 const bool hasBiome = (state.readyMask & ChunkReady::BiomeHydro) != 0 && res->biomeHydroTex != 0;
                 glBindTextureUnit(env::bind::tex::HeightNormal, res->heightNormalTex);
                 glBindTextureUnit(env::bind::tex::BiomeHydro, hasBiome ? res->biomeHydroTex : neutralBiome);
-                terrainProg_->Set("uChunkOffset", item.offset);
+                if (locTerrainOffset >= 0) glProgramUniform3fv(tPid, locTerrainOffset, 1, &item.offset.x);
 
+                if (item.lod != boundLod) {
+                    terrainGrids_[static_cast<std::size_t>(item.lod)].vao.Bind();
+                    boundLod = item.lod;
+                }
                 const TerrainGrid& grid = terrainGrids_[static_cast<std::size_t>(item.lod)];
-                grid.vao.Bind();
                 glDrawElements(GL_TRIANGLES, grid.indexCount, GL_UNSIGNED_INT, nullptr);
                 ++chunksDrawn_;
             }
@@ -266,12 +272,14 @@ public:
         if (drawFoliage_ && foliageProg_->IsValid()) {
             foliageProg_->Use();
             foliageProg_->Set("uWindStrength", windStrength_);
+            const GLuint fPid             = foliageProg_->Id();
+            const GLint  locFoliageOffset = glGetUniformLocation(fPid, "uChunkOffset");
             foliageVao_.Bind();
             for (const DrawItem& item : drawList_) {
                 if (!item.foliage) continue;
                 const ChunkGpuResources* res = Resources(ctx, item);
                 if (!res) continue;
-                foliageProg_->Set("uChunkOffset", item.offset);
+                if (locFoliageOffset >= 0) glProgramUniform3fv(fPid, locFoliageOffset, 1, &item.offset.x);
                 glBindBufferBase(GL_SHADER_STORAGE_BUFFER, env::bind::ssbo::FoliageInstances, res->foliageInstanceSSBO);
                 glBindBuffer(GL_DRAW_INDIRECT_BUFFER, res->foliageIndirectCmdBuffer);
                 glMultiDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, nullptr,

@@ -185,13 +185,14 @@ public:
         const std::uint32_t progGen = program_ ? program_->Generation() : 0u;
         const std::uint32_t mipGen  = mipProgram_ ? mipProgram_->Generation() : 0u;
 
+        const float sunTol = (sunNow.y < 0.15f) ? 0.0015f : 0.004f;
         const bool dirty = !cacheEnabled_ || !prevValid_ || forceRebuild_ ||
                            currentAbs_ != prevAbs_ || chunksHash != lastChunksHash_ ||
                            atmoAvailable_ != lastAtmoAvailable_ || injectFoliage_ != lastInjectFoliage_ ||
                            std::abs(foliageDensity_ - lastFoliageDensity_) > 1e-3f ||
                            progGen != lastProgGen_ || mipGen != lastMipGen_ ||
-                           glm::length(sunNow - lastSunDir_) > 0.004f ||
-                           glm::length(moonNow - lastMoonDir_) > 0.004f ||
+                           glm::length(sunNow - lastSunDir_) > sunTol ||
+                           glm::length(moonNow - lastMoonDir_) > sunTol ||
                            std::abs(sunLum - lastSunLum_) > 0.02f * std::max(1.0f, lastSunLum_) ||
                            std::abs(moonLum - lastMoonLum_) > 0.02f * std::max(1e-3f, lastMoonLum_) ||
                            glm::any(glm::greaterThan(glm::abs(weatherNow - lastWeather_), glm::vec4(0.01f)));
@@ -251,6 +252,8 @@ public:
 
         // --- Passe 0 : terrain (une colonne de voxels par thread) ---
         p.Set("uPass", 0);
+        const GLuint pid            = p.Id();
+        const GLint  locChunkOffset = glGetUniformLocation(pid, "uChunkOffset");
         chunksInjected_ = 0;
         for (const ChunkItem& item : chunks_) {
             const ChunkGpuResources* res   = Resources(ctx, item);
@@ -259,7 +262,7 @@ public:
             const bool hasBiome = (state->readyMask & ChunkReady::BiomeHydro) != 0 && res->biomeHydroTex != 0;
             glBindTextureUnit(env::bind::tex::HeightNormal, res->heightNormalTex);
             glBindTextureUnit(env::bind::tex::BiomeHydro, hasBiome ? res->biomeHydroTex : neutralBiome);
-            p.Set("uChunkOffset", item.offset);
+            if (locChunkOffset >= 0) glProgramUniform3fv(pid, locChunkOffset, 1, &item.offset.x);
             p.Dispatch(gpu::ShaderProgram::GroupCount(kColumnsPerChunk, 64));
             ++chunksInjected_;
         }

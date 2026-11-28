@@ -243,7 +243,7 @@ float VoxelShadow(vec3 P, vec3 N, vec3 L, float noise) {
     if (!uVoxelShadows || !VoxelGridUsable(P)) return 1.0;
     float voxel = VoxelSize();
     return VoxelConeVisibility(uVoxel.uGridMin.xyz, P + N * (0.5 * voxel), L, uVoxelShadowSoftness,
-                               (1.35 + 0.5 * noise) * voxel, 2000.0, 14, 1.0);
+                               (1.35 + 0.5 * noise) * voxel, 2000.0, 22, 0.85);
 }
 
 float VoxelShadow(vec3 P, vec3 N, vec3 L) { return VoxelShadow(P, N, L, 0.5); }
@@ -396,7 +396,7 @@ float FogLightVisibility(vec3 rayDir, float startDist, float dist, vec3 L) {
         Tprev    = T1;
         if (w <= 0.0) continue;
         vec3 p = cam + rayDir * tm;
-        acc  += w * VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.12, 0.5 * voxel, 1500.0, 10, 1.0);
+        acc  += w * VoxelConeVisibility(uVoxel.uGridMin.xyz, p, L, 0.12, 0.5 * voxel, 1500.0, 14, 1.0);
         wsum += w;
     }
     return wsum > 0.0 ? acc / wsum : 1.0;
