@@ -67,38 +67,65 @@ void main() {
         vec2  uv = ChunkUv(local);
         float hv = textureLod(uHeightNormal, uv, 0.0).r;
         vec4  bh = textureLod(uBiomeHydro, uv, 0.0);
-        float sw = 0.0, sh = 0.0;
+        float swL = 0.0, shL = 0.0, swR = 0.0, shR = 0.0;
         vec2  across = vec2(1.0, 0.0);
         if (bh.g < 14.0) {  // loin de toute rivière : rien à chercher
             across = AcrossDirection(local);
             vec2 along = vec2(-across.y, across.x);
             // Noyau anisotrope échantillonné dans le repère du lit : 5 rangées le long (±4 m) × 25 taps en
-            // travers, sur ±2,5 σ. σ en travers suit la distance aux berges : rivières larges comprises.
-            float sigmaC = max(kSigmaAcrossMin, 1.2 * max(-bh.g, 0.0));
-            float stepC  = 2.5 * sigmaC / 12.0;
+            // travers, sur ±2,5 σ. bandHalf s'adapte à stepC pour ne jamais sauter la bande de berge sur
+            // les rivières larges, et l'accumulation séparée gauche/droite évite les nappes flottantes sur
+            // pentes raides grâce au minimum doux des deux rives.
+            float sigmaC   = max(kSigmaAcrossMin, 1.2 * max(-bh.g, 0.0));
+            float stepC    = 2.5 * sigmaC / 12.0;
+            float bandHalf = max(2.0, 0.75 * stepC);
             for (int j = -2; j <= 2; ++j) {
                 float da = float(j) * 2.0;
                 float ga = exp(-0.5 * da * da / (kSigmaAlong * kSigmaAlong));
                 for (int i = -12; i <= 12; ++i) {
-                    float dc   = float(i) * stepC;
-                    vec2  uvp  = ChunkUv(local + along * da + across * dc);
-                    float sdf  = textureLod(uBiomeHydro, uvp, 0.0).g;
-                    float bank = smoothstep(-1.0, 0.0, sdf) * (1.0 - smoothstep(2.0, 4.0, sdf));
-                    if (bank <= 0.0) continue;
-                    float w = bank * ga * exp(-0.5 * dc * dc / (sigmaC * sigmaC));
-                    sw += w;
-                    sh += w * textureLod(uHeightNormal, uvp, 0.0).r;
+                    float dc  = float(i) * stepC;
+                    vec2  uvp = ChunkUv(local + along * da + across * dc);
+                    float sdf = textureLod(uBiomeHydro, uvp, 0.0).g;
+                    if (sdf >= 500.0 || sdf <= -1.5 || sdf >= 4.0 + bandHalf) continue;
+                    float dBank = (sdf - 1.0) / bandHalf;
+                    float bank  = exp(-0.5 * dBank * dBank);
+                    float w     = bank * ga * exp(-0.5 * dc * dc / (sigmaC * sigmaC));
+                    float hr    = textureLod(uHeightNormal, uvp, 0.0).r;
+                    if (i < 0) {
+                        swL += w;
+                        shL += w * hr;
+                    } else if (i > 0) {
+                        swR += w;
+                        shR += w * hr;
+                    } else {
+                        swL += 0.5 * w;
+                        shL += 0.5 * w * hr;
+                        swR += 0.5 * w;
+                        shR += 0.5 * w * hr;
+                    }
                 }
             }
         }
-        float level = sw > 1e-4 ? sh / sw - kFreeboard : kNoRiver;
+        float level = kNoRiver;
+        if (swL > 1e-4 && swR > 1e-4) {
+            float hL = shL / swL;
+            float hR = shR / swR;
+            level    = 0.5 * (hL + hR - sqrt((hL - hR) * (hL - hR) + 1.0)) - kFreeboard;
+        } else if (swL > 1e-4 || swR > 1e-4) {
+            float hOne = (swL > 1e-4) ? (shL / swL) : (shR / swR);
+            level      = min(hOne - kFreeboard, hv + 6.0);
+        }
+        if (level > kNoRiver * 0.5) {
+            level = min(level, hv + 14.0);
+            if (bh.g > 4.0 && level < hv - 1.0) level = kNoRiver;
+        }
         // w (provisoire) : direction en travers, remplacée par l'écoulement en passe 1.
         riverData[uDstBase + idx] = vec4(level, hv, uintBitsToFloat(packHalf2x16(bh.gb)),
                                          uintBitsToFloat(packHalf2x16(across)));
         return;
     }
 
-    // --- uPass 1 : écoulement + détection de présence d'eau pour glDrawElementsIndirect ---
+    // --- uPass 1 : lissage 3×3 léger + écoulement + détection d'eau utile pour glDrawElementsIndirect ---
     if (gl_LocalInvocationIndex == 0u) sGroupHasWater = 0u;
     barrier();
 
@@ -106,15 +133,39 @@ void main() {
         vec4  c     = riverData[uSrcBase + idx];
         vec2  sdfs  = unpackHalf2x16(floatBitsToUint(c.z));
         vec2  flow  = vec2(0.0);
-        if (c.x > kNoRiver * 0.5 || sdfs.y < 6.0) sGroupHasWater = 1u;
-        if (c.x > kNoRiver * 0.5 && sdfs.x < 2.0) {
+        float level = c.x;
+        if (level > kNoRiver * 0.5) {
+            float wSum = 4.0;
+            float hSum = 4.0 * level;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    ivec2 nb  = clamp(v + ivec2(dx, dy), ivec2(0), ivec2(kVerts - 1));
+                    float nh  = riverData[uSrcBase + uint(nb.y * kVerts + nb.x)].x;
+                    if (nh > kNoRiver * 0.5 && abs(nh - c.x) < 12.0) {
+                        float w = (dx == 0 || dy == 0) ? 2.0 : 1.0;
+                        wSum += w;
+                        hSum += w * nh;
+                    }
+                }
+            }
+            level = hSum / wSum;
+        }
+
+        float oceanLevel = envOceanLevel();
+        float marshY     = envSwampLevel() + 0.02;
+        bool  hasRiver   = level > kNoRiver * 0.5 && level > oceanLevel + 0.05 && sdfs.x < 4.0;
+        bool  hasMarsh   = sdfs.y < 6.0 && marshY > oceanLevel + 0.05 && c.y > oceanLevel;
+        if (hasRiver || hasMarsh) sGroupHasWater = 1u;
+
+        if (level > kNoRiver * 0.5 && sdfs.x < 2.0) {
             // Pente du niveau : différences centrées sur ±2 sommets (±4 m), bornées au chunk.
             ivec2 a = clamp(v - ivec2(2, 0), ivec2(0), ivec2(kVerts - 1)), b = clamp(v + ivec2(2, 0), ivec2(0), ivec2(kVerts - 1));
             ivec2 e = clamp(v - ivec2(0, 2), ivec2(0), ivec2(kVerts - 1)), f = clamp(v + ivec2(0, 2), ivec2(0), ivec2(kVerts - 1));
             float la = riverData[uSrcBase + uint(a.y * kVerts + a.x)].x, lb = riverData[uSrcBase + uint(b.y * kVerts + b.x)].x;
             float le = riverData[uSrcBase + uint(e.y * kVerts + e.x)].x, lf = riverData[uSrcBase + uint(f.y * kVerts + f.x)].x;
-            la = la > kNoRiver * 0.5 ? la : c.x;  lb = lb > kNoRiver * 0.5 ? lb : c.x;
-            le = le > kNoRiver * 0.5 ? le : c.x;  lf = lf > kNoRiver * 0.5 ? lf : c.x;
+            la = la > kNoRiver * 0.5 ? la : level;  lb = lb > kNoRiver * 0.5 ? lb : level;
+            le = le > kNoRiver * 0.5 ? le : level;  lf = lf > kNoRiver * 0.5 ? lf : level;
             vec2  gLevel = vec2((lb - la) / max(float(b.x - a.x), 1.0), (lf - le) / max(float(f.y - e.y), 1.0)) / kSpacing;
             vec2  across = unpackHalf2x16(floatBitsToUint(c.w));
             vec2  tang   = vec2(-across.y, across.x);
@@ -124,7 +175,7 @@ void main() {
             speed       *= 0.35 + 0.65 * smoothstep(0.0, 4.0, -sdfs.x);  // freiné près des berges
             flow         = tang * speed;
         }
-        riverData[uDstBase + idx] = vec4(c.xyz, uintBitsToFloat(packHalf2x16(flow)));
+        riverData[uDstBase + idx] = vec4(level, c.yzw.xy, uintBitsToFloat(packHalf2x16(flow)));
     }
 
     barrier();

@@ -355,6 +355,9 @@ public:
             // (hors de l'eau). Rivières et marais sont peu profonds : scene.depth garde leur fond.
             glDepthMask(GL_FALSE);
             p.Use();
+            const GLuint pid        = p.Id();
+            const GLint  locSlot    = glGetUniformLocation(pid, "uSlotBase");
+            const GLint  locOffset  = glGetUniformLocation(pid, "uChunkOffset");
             int boundLod = -1;
             for (const RiverDraw& d : riverDraws_) {
                 const auto it = riverChunks_.find(d.entity);
@@ -364,8 +367,9 @@ public:
                     (lod == 0 ? riverGrid_ : riverGridFar_).vao.Bind();
                     boundLod = lod;
                 }
-                p.Set("uSlotBase", static_cast<std::uint32_t>(kRiverCmdVec4s + it->second.slot * kRiverVerts * kRiverVerts));
-                p.Set("uChunkOffset", d.offset);
+                const auto slotBase = static_cast<std::uint32_t>(kRiverCmdVec4s + it->second.slot * kRiverVerts * kRiverVerts);
+                if (locSlot >= 0) glProgramUniform1ui(pid, locSlot, slotBase);
+                if (locOffset >= 0) glProgramUniform3fv(pid, locOffset, 1, &d.offset.x);
                 glDrawElementsIndirect(
                     GL_TRIANGLES, GL_UNSIGNED_INT,
                     reinterpret_cast<const void*>(static_cast<std::uintptr_t>(it->second.slot * 64 + lod * 32)));
@@ -437,13 +441,14 @@ public:
 
 private:
     struct RiverChunk {
-        int           slot       = -1;
-        bool          baked      = false;
-        std::uint32_t generation = 0;
-        GLuint        heightTex  = 0;
-        GLuint        biomeTex   = 0;
+        int           slot          = -1;
+        bool          baked         = false;
+        std::uint32_t generation    = 0;
+        std::uint64_t lastSeenFrame = 0;
+        GLuint        heightTex     = 0;
+        GLuint        biomeTex      = 0;
         glm::ivec2    coord{0};
-        float         heightMin  = 0.0f, heightMax = 0.0f;
+        float         heightMin     = 0.0f, heightMax = 0.0f;
     };
     struct RiverDraw {
         entt::entity entity = entt::null;
@@ -571,19 +576,18 @@ private:
             if (dist > riverDistance_) continue;
             wanted.push_back({e, dist, offset});
         }
+        const float oceanLevel = ctx.environment.waterTime.x;
+        const float swampLevel = ctx.environment.waterTime.y;
+        if (std::abs(oceanLevel - lastBakedOceanLevel_) > 1e-3f ||
+            std::abs(swampLevel - lastBakedSwampLevel_) > 1e-3f) {
+            for (auto& [e, rc] : riverChunks_) rc.baked = false;
+            lastBakedOceanLevel_ = oceanLevel;
+            lastBakedSwampLevel_ = swampLevel;
+        }
+        ++poolFrame_;
+
         std::sort(wanted.begin(), wanted.end(), [](const Candidate& a, const Candidate& b) { return a.dist < b.dist; });
         if (wanted.size() > static_cast<std::size_t>(kRiverSlots)) wanted.resize(kRiverSlots);
-
-        // Libère les emplacements des chunks disparus ou trop loin.
-        for (auto it = riverChunks_.begin(); it != riverChunks_.end();) {
-            const bool keep = std::any_of(wanted.begin(), wanted.end(), [&](const Candidate& c) { return c.e == it->first; });
-            if (!keep) {
-                freeSlots_.push_back(it->second.slot);
-                it = riverChunks_.erase(it);
-            } else {
-                ++it;
-            }
-        }
 
         for (const Candidate& c : wanted) {
             const auto& state = ctx.registry.get<ChunkStateComponent>(c.e);
@@ -597,6 +601,7 @@ private:
                 it = riverChunks_.emplace(c.e, rc).first;
             }
             RiverChunk& rc = it->second;
+            rc.lastSeenFrame = poolFrame_;
             if (rc.generation != state.generation || rc.heightTex != res.heightNormalTex || rc.biomeTex != res.biomeHydroTex)
                 rc.baked = false;
             rc.generation = state.generation;
@@ -616,6 +621,21 @@ private:
                                                       kChunkSizeMeters);
             if (AabbInFrustum(planes, mn, mx)) riverDraws_.push_back({c.e, c.offset, c.dist});
         }
+
+        // Libère en O(N) les emplacements des chunks disparus ou trop loin.
+        for (auto it = riverChunks_.begin(); it != riverChunks_.end();) {
+            if (it->second.lastSeenFrame != poolFrame_) {
+                freeSlots_.push_back(it->second.slot);
+                it = riverChunks_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        std::sort(riverDraws_.begin(), riverDraws_.end(), [](const RiverDraw& a, const RiverDraw& b) {
+            const int lodA = a.dist >= 350.0f ? 1 : 0;
+            const int lodB = b.dist >= 350.0f ? 1 : 0;
+            return lodA != lodB ? lodA < lodB : a.dist < b.dist;
+        });
     }
 
     void BakeRiverChunks(EngineContext& ctx) {
@@ -686,6 +706,9 @@ private:
     float     spectrumWindSpeed_ = -1.0f;
     float     originMod_[2][kCascades] = {};
     std::unordered_map<entt::entity, RiverChunk> riverChunks_;
+    std::uint64_t             poolFrame_ = 0;
+    float                     lastBakedOceanLevel_ = -1.0e6f;
+    float                     lastBakedSwampLevel_ = -1.0e6f;
     std::vector<int>          freeSlots_;
     std::vector<entt::entity> riverJobs_;
     std::vector<RiverDraw>    riverDraws_;
